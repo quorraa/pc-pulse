@@ -6,11 +6,11 @@
 [![Latest release](https://img.shields.io/github/v/release/quorraa/pc-pulse?display_name=tag)](https://github.com/quorraa/pc-pulse/releases/latest)
 [![License: MIT](https://img.shields.io/badge/license-MIT-70e1c1.svg)](LICENSE)
 
-> Windows 11 x64 only. PC Pulse is designed for technical users investigating sustained workstation slowdowns and runaway agent workloads.
+> Windows 11 x64 only. Built for technical users investigating sustained workstation slowdowns and runaway agent workloads.
 
-PC Pulse is a keyboard-first Windows 11 performance attribution tool for finding the process, agent tree, application, or driver-level condition making a workstation slow. A low-overhead Rust service collects ETW, PDH, Win32, and high-signal Windows Event Log evidence, keeps bounded SQLite history, and serves local clients over a secured named pipe. The primary client is a Ratatui terminal interface; a separate tiny native helper provides Windows tray notifications.
+PC Pulse is a keyboard-first Windows 11 performance attribution tool for finding the process, agent tree, application, or driver-level condition making a workstation slow. A low-overhead Rust service collects ETW, PDH, Win32, and high-signal Windows Event Log evidence, keeps bounded SQLite history, and serves local clients over a secured named pipe. The primary client is a Ratatui terminal interface; a tiny native helper provides Windows tray notifications.
 
-PC Pulse uses sustained conditions and learned baseline deviations instead of alerting on isolated spikes. It never terminates a process automatically. A manual termination request requires typing the selected process's exact PID, and the service independently enforces confirmation and refuses protected targets.
+PC Pulse alerts on sustained conditions and learned baseline deviations, not isolated spikes. It never terminates a process automatically: a manual termination request requires typing the selected process's exact PID, and the service independently enforces confirmation and refuses protected targets.
 
 ## Quick start
 
@@ -19,42 +19,45 @@ PC Pulse uses sustained conditions and learned baseline deviations instead of al
 3. Install the MSI from an elevated terminal or Explorer.
 4. Open **PC Pulse** from Start. The collector runs as the `PcPulseCollector` Windows service.
 
-Release binaries are currently unsigned. Windows may show an unknown-publisher warning; verify the published checksum before installing. The installed application does not require .NET—the SDK is used only to build the WiX installer.
+Release binaries are currently unsigned; Windows may show an unknown-publisher warning, so verify the published checksum before installing.
 
 ## What it monitors
 
 - System and per-process CPU, working set, private bytes, handles, threads, and read/write I/O.
 - Physical-disk transfer latency, DPC rate, interrupt rate, paged pool, and nonpaged pool.
 - Hung top-level windows, ETW process starts, time to first visible window, parent/child trees, and detached idle agent processes.
-- The collector's own working set, CPU, and handles against the 25 MB / 0.2% / 250-handle absolute budgets. Working-set growth is evaluated separately only after startup warm-up and a mature multi-segment trend.
+- Its own collector against absolute budgets (25 MB working set, 0.2% CPU, 250 handles) plus mature working-set growth.
+- Redacted warning/error/critical Application and System events, classified and fingerprinted (hardware, storage, graphics, crashes, hangs, resource exhaustion, power, services, networking, agent runtimes).
 - Active and resolved finding history with responsible process where attribution is defensible, supporting evidence, explanation, and safe next actions.
-- Redacted warning/error/critical Application and System events, classified and fingerprinted for hardware, storage, graphics, crashes, hangs, resource exhaustion, power, services, networking, and agent runtimes.
-- A bounded machine-readable evidence bundle and an embedded systems-analyzer chat that answers questions and proposes validated, display-only optimization actions.
 
-ETW supplies process lifecycle timing, PDH supplies localized system performance counters, and Win32 supplies authoritative process, window, and system snapshots. If policy denies ETW session creation, the collector continues with PDH and Win32, marks ETW as degraded, and retries every minute. The installed LocalSystem service normally has the required ETW privilege.
+If policy denies ETW session creation, the collector continues with PDH and Win32, marks ETW degraded, and retries every minute. See [detector details](docs/detectors.md) for every finding's ownership, evidence, and thresholds, and the [named-pipe protocol](docs/protocol.md) for the IPC contract.
 
 ## Terminal interface
 
-The TUI ships two presentation profiles: **vitals** (default), a patient-monitor identity with top header, tabs, and a bottom footer, and **avionics**, an amber-CRT multi-function display with a left bezel-key rail, a top annunciator strip that keeps one lamp per finding class lit from every page, and an Observe canvas rebuilt around a custom pressure-map treemap — every major process becomes a clickable tile sized by working set and colored/heated by its dominant pressure channel. Start with `PcPulse.exe --theme vitals|avionics` or cycle live with `t`.
+The TUI ships two presentation profiles: **vitals** (default), a patient-monitor identity, and **avionics**, an amber-CRT multi-function display with a bezel-key rail, an annunciator strip that keeps one lamp per finding class lit from every page, and a pressure-map treemap where every major process is a clickable tile sized by working set and heated by its dominant pressure channel. Start with `PcPulse.exe --theme vitals|avionics` or cycle live with `t`.
 
 | Vitals (default) | Avionics |
 |---|---|
 | ![Observe — pressure field, suspect ranking, load ribbon](docs/media/vitals-observe.png) | ![Observe — the pressure-map treemap under the annunciator strip](docs/media/avionics-observe.png) |
 | ![Process hunt — sortable spectrum and process lens](docs/media/vitals-hunt.png) | ![Findings — annunciator lamps and the finding archive](docs/media/avionics-incidents.png) |
 
+| Vitals tour | Avionics tour |
+|---|---|
+| ![Vitals profile tour](docs/media/demo-vitals.gif) | ![Avionics profile tour](docs/media/demo-avionics.gif) |
+
 ![Oracle — the embedded systems-analyzer chat](docs/media/vitals-oracle.png)
 
-Screenshots are captured from the deterministic render gallery (`cargo test -p pcpulse-tui --lib dev_render_gallery -- --ignored` with `PCPULSE_GALLERY_DIR` set), which renders every page in both profiles at four terminal sizes from synthetic fixture data.
+*Screenshots come from the deterministic render gallery (`cargo test -p pcpulse-tui --lib dev_render_gallery -- --ignored` with `PCPULSE_GALLERY_DIR` set).*
 
-The TUI has eight views:
+Eight views:
 
-1. **Observe** — an asymmetric runtime-forensics canvas with a shared CPU/memory pressure field, multi-resource suspect ranking, system threshold vectors, a CPU load-composition ribbon on tall terminals, parallel-agent footprint, collector budget, and an owner/evidence incident tape.
-2. **Processes** — dense sortable process table, filtering by name/path/PID, and a full process inspector.
-3. **Tree** — parent/child ownership for identifying abandoned agent descendants and runaway parallel jobs.
+1. **Observe** — shared CPU/memory pressure field, multi-resource suspect ranking, threshold vectors, load ribbon, agent footprint, collector budget, incident tape.
+2. **Processes** — dense sortable process table, name/path/PID filtering, full process inspector.
+3. **Tree** — parent/child ownership for abandoned agent descendants and runaway parallel jobs.
 4. **Findings** — active/resolved history with ownership, explanation, evidence, and recommendations.
 5. **Timeline** — persisted CPU, memory, and disk-latency charts over configurable windows.
-6. **Oracle** — an internal evidence-aware chat with the dedicated systems analyzer, its proposed safe actions, and the live Windows diagnostic feed.
-7. **Settings** — all detector thresholds, sustained-sample rules, baseline deviation, agent patterns, and notification state, each explained in a plain-language strip under the table, plus a local CLIENT section (theme, motion effects, Oracle time budget) saved per user rather than through the service.
+6. **Oracle** — evidence-aware chat with the dedicated systems analyzer and the live Windows diagnostic feed.
+7. **Settings** — all detector thresholds and notification state, plain-language explanations, plus per-user CLIENT settings (theme, motion effects, Oracle time budget).
 8. **Keys** — the complete keyboard reference.
 
 Important keys:
@@ -87,73 +90,24 @@ Important keys:
 | `t` | Cycle presentation profiles (vitals / avionics); the choice is saved per user |
 | `?` | Open the keys overlay on top of any page; `Esc`, `?`, or a click closes it (the Keys page itself stays on `8`) |
 | `q` / `Ctrl-C` | Exit the TUI; the collector continues |
-| Left-click | Select tabs, process/tree/finding rows, settings, or the Oracle prompt |
+| Left-click | Select tabs, process/tree/finding rows, settings, Chat Vault rows, or the Oracle prompt; double-click a Chat Vault row to restore it |
 | Click any table header | Sort the overview suspects, processes, lineage rows, findings, or settings by that column |
 | Mouse wheel | Scroll the active table, finding list, or Oracle conversation; zoom Timeline history |
 | Right-click a process | Open the existing typed-PID termination confirmation; never terminate directly |
 
-The process table highlights unresponsive applications and suspected agent processes. The active sort header is highlighted. The footer reserves one line for contextual shortcuts and a separate line for status/error messages, so analyzer completion and collector messages never hide controls. [TachyonFX](https://docs.rs/tachyonfx/latest/tachyonfx/fx/index.html) motion is finite and event-scoped: startup, navigation, focus, connection changes, new sustained findings, input modes, and confirmations use distinct compositions. Each new telemetry frame produces only a bounded chromatic scan across signal-colored cells; it never hides or recreates incident rows. Effects reset their clock after idle periods, clamp delayed frames, and return to the event-driven loop when complete. Start with `PcPulse.exe --no-effects` or press `m` for reduced motion.
+[TachyonFX](https://docs.rs/tachyonfx/latest/tachyonfx/fx/index.html) motion is finite and event-scoped; start with `PcPulse.exe --no-effects` or press `m` for reduced motion.
 
-## Native notification helper
+`PcPulse.Notify.exe` is a small per-user tray helper that watches the same pipe and notifies only when a new sustained finding appears; the MSI starts it at logon, and notifications can be disabled from Settings. Double-click its tray icon to open `PcPulse.exe`; right-click to exit the helper.
 
-`PcPulse.Notify.exe` is a small Rust/Win32 per-user process. It owns only a notification-area icon and polls the same local named pipe. It primes its alert state at startup, so existing findings are not replayed; it notifies only when a new sustained finding appears. Notifications can be disabled from the TUI settings.
+## Oracle
 
-- Double-click the tray icon to open `PcPulse.exe` in a new console.
-- Right-click the tray icon to exit the helper.
-- The MSI registers the helper in the machine Run key, so it starts for interactive users at their next logon.
+Oracle is a chatbot inside the TUI — press `Enter` on view `6`, type a question, and submit. Every turn receives a fresh, bounded, redacted evidence bundle; answers must cite exact collected references, and no proposed action is ever executed. The collector never invokes AI: the client runs `pcpulse-systems-analyzer` through the user's Codex CLI in an ephemeral read-only sandbox, and requires `codex login status` to report ChatGPT authentication (API-key sessions are refused rather than silently billed). Press `y` to copy the latest answer, `i` on a finding to investigate it in a new chat, and `r`/`d` in Chat Vault to rename or delete sessions. Analyzer failures are logged to `%LOCALAPPDATA%\PcPulse\analyzer-last-error.log` (overwritten on each failure).
 
-The helper is deliberately separate from the LocalSystem collector because Windows services run in session 0 and must not try to display UI in user sessions.
-
-## Detection behavior
-
-A condition must remain true for `sustainedSamples`—five samples, roughly ten seconds by default. CPU, memory, and I/O detectors also compare against an exponentially weighted per-process baseline and deviation band after warm-up. Memory, handle, and thread growth use bounded multi-minute histories. Process identity includes creation time to avoid PID-reuse errors.
-
-| Finding | Ownership and evidence |
-|---|---|
-| Sustained CPU | Process, current CPU, learned baseline, configured limit |
-| Memory / handle / thread growth | Process, absolute growth, observation window |
-| Heavy I/O / disk latency | Highest current I/O process, read/write rate, system latency |
-| Unresponsive app | Process with a visible window hung for the configured duration |
-| Slow launch | ETW process-start time to first visible window |
-| Abandoned agent | Pattern match, missing parent, minimum age, sustained low CPU/I/O |
-| Kernel-pool growth | System/driver scope, paged/nonpaged evidence, PoolMon guidance |
-| DPC / interrupts | System/driver scope; no false blame assigned to a user process |
-| Collector budget | Collector process, working set, CPU, handles, observed growth |
-
-See [detector details](docs/detectors.md) and the [named-pipe protocol](docs/protocol.md).
-
-## Embedded systems-analyzer chat
-
-Oracle is a chatbot inside the TUI—no companion command or external chat is needed. Press `Enter`, type a question, and submit it. Every turn receives a fresh, bounded, redacted evidence bundle plus at most 16 local conversation turns. Snapshot collection and screen updates continue while the answer is generated; `Esc` cancels the child analyzer. Chat Vault keeps up to 24 previous sessions: click one to restore it, press `h` for keyboard selection, or press `n`/`c` to begin a new chat. With the vault focused, `r` (or `F2`) renames the selected session inline and `d` (pressed twice) deletes it; `e` recalls your latest question into the input for editing and resubmission. While an answer is generated, the transcript's wait line animates through what is actually happening — evidence reading, correlation, then the model consult — driven purely by elapsed time.
-
-The collector never invokes AI. The interactive `PcPulse.exe` client runs `pcpulse-systems-analyzer` through the user's saved Codex login in an ephemeral read-only sandbox. PC Pulse requires `codex login status` to report ChatGPT authentication, so Oracle uses ChatGPT subscription access and refuses API-key sessions instead of silently changing billing. The structured answer must cite exact collected references. Direct termination commands and unconfirmed mutations are rejected, and no proposed action is executed.
-
-The older one-shot plan interface remains available for automation and external-agent integration:
-
-```powershell
-PcPulse.exe analyze 1
-```
-
-Other agents can consume the same contract through `agent-context`, `plan-schema`, `agent-prompt`, and `import-plan`. See the complete [systems-analyzer integration guide](docs/agent-integration.md).
-
-## Repository layout
-
-- `src/PcPulse.Service` — Rust service, ETW/PDH/Win32 collectors, detector engine, SQLite, and named-pipe server.
-- `src/PcPulse.Tui` — Ratatui client, shared pipe client, CLI JSON commands, and native Windows notification helper.
-- `installer/PcPulse.Installer` — per-machine WiX MSI with automatic service start/recovery, Start Menu shortcut, and notifier logon registration.
-- `scripts` — release, setup, IPC smoke test, and collector-budget measurement.
-- Rust unit tests live beside the service and TUI modules.
-
-There is no WinUI, Windows App SDK, C# client, or .NET application runtime in the product.
-
-## Prerequisites
-
-- Windows 11 x64.
-- Rust stable 1.94 or newer with the MSVC x64 target.
-- Visual Studio Build Tools with the Windows 11 SDK and C++ build tools, needed for bundled SQLite.
-- .NET SDK 10.0.100 or newer only to run the WiX MSBuild project when creating the MSI. The installed application itself does not use .NET.
+For automation, `PcPulse.exe analyze 1` produces a one-shot plan, and `agent-context`, `plan-schema`, `agent-prompt`, and `import-plan` expose the same contract to other agents — see the [systems-analyzer integration guide](docs/agent-integration.md).
 
 ## Build and test
+
+Prerequisites: Windows 11 x64; Rust stable 1.94+ with the MSVC x64 target; Visual Studio Build Tools with the Windows 11 SDK and C++ build tools (for bundled SQLite); .NET SDK 10.0.100+ only to build the WiX MSI — the installed application does not use .NET.
 
 ```powershell
 cargo test --workspace
@@ -161,103 +115,50 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo build --workspace --release
 ```
 
-Create the three Rust executables, MSI, and SHA-256 manifest:
+Build the three executables, MSI, and SHA-256 manifest (add `-CertificateThumbprint YOUR_SHA1_THUMBPRINT` for a signed release):
 
 ```powershell
 .\scripts\Build-Release.ps1 -Architecture x64 -Version 1.5.4
 ```
 
-For a signed release:
+Outputs land in `artifacts`. `scripts\Measure-CollectorBudget.ps1` validates the collector's resource budgets from an elevated terminal.
 
-```powershell
-.\scripts\Build-Release.ps1 -Version 1.5.4 -CertificateThumbprint YOUR_SHA1_THUMBPRINT
-```
+Repository layout:
 
-Outputs are placed in `artifacts`, including `PcPulse-1.5.4-x64.msi`, `SHA256SUMS.txt`, and:
-
-```text
-artifacts\publish\PcPulse.Service.exe
-artifacts\publish\PcPulse.exe
-artifacts\publish\PcPulse.Notify.exe
-```
+- `src/PcPulse.Service` — Rust service: ETW/PDH/Win32 collectors, detector engine, SQLite, named-pipe server.
+- `src/PcPulse.Tui` — Ratatui client, shared pipe client, CLI JSON commands, tray notification helper.
+- `installer/PcPulse.Installer` — per-machine WiX MSI.
+- `scripts` — release, setup, IPC smoke test, and collector-budget measurement.
 
 ## Install and run
-
-Install or upgrade from an elevated terminal:
 
 ```powershell
 msiexec.exe /i .\artifacts\PcPulse-1.5.4-x64.msi
 ```
 
-Open **PC Pulse** from Start, or run:
-
-```powershell
-& "$env:ProgramFiles\PC Pulse\PcPulse.exe"
-```
-
-Useful noninteractive commands for scripts and agent runs:
-
-```powershell
-PcPulse.exe ping
-PcPulse.exe snapshot
-PcPulse.exe alerts
-PcPulse.exe logs 24
-PcPulse.exe agent-context 1
-PcPulse.exe analyze 1
-PcPulse.exe plan
-PcPulse.exe settings
-```
-
-All commands emit formatted JSON and tolerate downstream pipe closure. The equivalent development service setup is `scripts\Install-Service.ps1`.
-
-Verify the installed service and IPC:
+Open **PC Pulse** from Start, or run `& "$env:ProgramFiles\PC Pulse\PcPulse.exe"`. Verify the service and IPC:
 
 ```powershell
 Get-Service PcPulseCollector
 .\scripts\Test-Pipe.ps1
 ```
 
-Run the collector interactively when debugging it directly:
+For scripts and agent runs, `PcPulse.exe ping | snapshot | alerts | logs 24 | agent-context 1 | analyze 1 | plan | settings` all emit formatted JSON. The development-equivalent service setup is `scripts\Install-Service.ps1`.
 
-```powershell
-.\target\release\pcpulse-collector.exe --console --data-dir .\artifacts\dev-data
-```
-
-ETW may be degraded in a non-elevated console.
-
-## Resource-budget validation
-
-Run from an elevated terminal so the service-equivalent ETW path is measured:
-
-```powershell
-.\scripts\Measure-CollectorBudget.ps1 -DurationSeconds 600
-```
-
-The script samples every two seconds and fails if average normalized collector CPU reaches 0.2%, maximum working set reaches 25 MB, handles reach 250, or working set grows by at least 1 MB across the run.
-
-## Storage, privacy, and security
-
-History and settings remain local:
-
-```text
-%ProgramData%\PcPulse\history.db
-%ProgramData%\PcPulse\settings.json
-%LOCALAPPDATA%\PcPulse\chat-history.json
-%LOCALAPPDATA%\PcPulse\ui-prefs.json
-```
-
-SQLite uses WAL mode, normal durability, bounded sample persistence, daily cleanup, and configurable 1–365 day retention. Client preferences (`ui-prefs.json`: theme, motion effects, Oracle time budget) are per-user and atomically replaced; `--theme` and `--no-effects` override them for one run without rewriting them. Chat history is per-user, atomically replaced, and bounded to 24 sessions with 16 messages per session. It stores the conversation and validated response—not raw evidence bundles or Windows event records. The collector itself has no network path; only an explicit Oracle/analyze request sends its redacted evidence bundle to the authenticated Codex session.
-
-Diagnostic event fields are bounded and redacted before persistence. User-profile segments become `%USERPROFILE%`; credential-like fields and inline secret arguments are removed. PC Pulse does not collect the Security event log, process command lines, environment variables, file contents, browser data, or keystrokes. The optional systems analyzer sends only the explicit redacted evidence bundle and bounded conversation to the user's ChatGPT-authenticated Codex session when the user submits a question or runs `analyze`.
-
-The named pipe rejects remote clients, caps messages at one MiB, and grants access only to LocalSystem, administrators, and interactive users. Settings are validated by the service. Termination requires `confirmed: true`; PID 0, PID 4, and the collector itself are always refused.
-
-## Uninstall
-
-Use Apps > Installed apps, or:
+Uninstall via Apps > Installed apps, or:
 
 ```powershell
 msiexec.exe /x .\artifacts\PcPulse-1.5.4-x64.msi
 ```
 
-For development installs, `scripts\Uninstall-Service.ps1` removes the service, notifier startup entry, binaries, settings, and history. Pass `-KeepHistory` to retain `%ProgramData%\PcPulse`.
+For development installs, `scripts\Uninstall-Service.ps1` removes everything; pass `-KeepHistory` to retain `%ProgramData%\PcPulse`.
+
+## Storage, privacy, and security
+
+Everything stays local: bounded SQLite history and service settings in `%ProgramData%\PcPulse` (`history.db`, `settings.json`; configurable 1–365 day retention), per-user chat history and UI preferences in `%LOCALAPPDATA%\PcPulse` (`chat-history.json`, `ui-prefs.json`). Diagnostic event fields are bounded and redacted before persistence — user-profile paths become `%USERPROFILE%` and credential-like values are removed. PC Pulse never collects the Security event log, process command lines, environment variables, file contents, browser data, or keystrokes. The collector has no network path; only an explicit Oracle question or `analyze` run sends the redacted evidence bundle to the user's ChatGPT-authenticated Codex session. The named pipe rejects remote clients, caps messages at 1 MiB, and grants access only to LocalSystem, administrators, and interactive users; termination requires `confirmed: true` and always refuses PID 0, PID 4, and the collector itself.
+
+## Documentation
+
+- [Detector design](docs/detectors.md) — sustained streaks, baselines, growth windows, attribution limits.
+- [Named-pipe protocol](docs/protocol.md) — commands, payloads, and limits.
+- [Systems-analyzer integration](docs/agent-integration.md) — Oracle internals, schemas, and external-agent workflow.

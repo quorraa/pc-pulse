@@ -6377,4 +6377,357 @@ mod tests {
         std::fs::write(std::path::Path::new(&directory).join("gallery.html"), html)
             .expect("write gallery");
     }
+
+    // ---- README demo recorder ------------------------------------------
+    //
+    // `dev_record_demo` scripts one guided tour per presentation profile and
+    // dumps every rendered frame as compact JSON for
+    // `scripts/Make-Demo.py`, which rasterizes the dumps into
+    // `docs/media/demo-<theme>.gif`. The tour drives the real `draw` +
+    // `MotionSystem` pipeline exactly like `main.rs` does, with a scripted
+    // clock instead of wall time.
+
+    const DEMO_PROMPT: &str = "What has made the performance worse?";
+    const DEMO_ANSWER: &str = "Firefox PID 50784 shows sustained handle growth; interrupts are elevated — likely driver-level. CPU, memory, and disk otherwise healthy.";
+
+    /// A scripted state change applied to the demo [`App`] before a step's
+    /// frames render.
+    type DemoAct = Box<dyn FnOnce(&mut App)>;
+
+    /// One scripted beat of the demo tour.
+    struct DemoStep {
+        /// State change applied (then observed by the motion system) before
+        /// this step's frames render. `None` keeps the current animation
+        /// rolling.
+        act: Option<DemoAct>,
+        /// Frames captured for this step.
+        frames: usize,
+        /// Motion-clock advance per captured frame; split into <=50 ms
+        /// chunks to respect the effect manager's elapsed clamp.
+        step_ms: u64,
+        /// GIF hold per captured frame, written into the dump.
+        delay_ms: u64,
+    }
+
+    fn act(
+        apply: impl FnOnce(&mut App) + 'static,
+        frames: usize,
+        step_ms: u64,
+        delay_ms: u64,
+    ) -> DemoStep {
+        DemoStep {
+            act: Some(Box::new(apply)),
+            frames,
+            step_ms,
+            delay_ms,
+        }
+    }
+
+    /// Keep animating: capture `frames` frames without touching state.
+    fn roll(frames: usize, step_ms: u64, delay_ms: u64) -> DemoStep {
+        DemoStep {
+            act: None,
+            frames,
+            step_ms,
+            delay_ms,
+        }
+    }
+
+    /// A single long-hold frame on the current screen.
+    fn hold(delay_ms: u64) -> DemoStep {
+        roll(1, 50, delay_ms)
+    }
+
+    /// Fake an in-flight analyzer submission that started `elapsed_ms` ago,
+    /// the same way the ticker tests do, so the wait-line phases render at
+    /// scripted elapsed values.
+    fn backdate_analyzer(app: &mut App, elapsed_ms: u64) {
+        app.analyzer_started_at = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_millis(elapsed_ms));
+    }
+
+    /// The gallery fixture plus a populated Chat Vault so the Oracle page
+    /// shows saved conversations beside the transcript.
+    fn demo_app() -> App {
+        let mut app = gallery_app();
+        for (index, title) in ["Tuesday slowdown hunt", "Chrome tab leak triage"]
+            .iter()
+            .enumerate()
+        {
+            app.chat_sessions.push(crate::chat_history::ChatSession {
+                conversation_id: format!("demo-{index}"),
+                created_at_ms: 1_799_990_000_000 + index as i64 * 3_600_000,
+                updated_at_ms: 1_799_993_600_000 + index as i64 * 3_600_000,
+                title: (*title).to_string(),
+                title_pinned: true,
+                messages: Vec::new(),
+                latest_response: None,
+            });
+        }
+        app
+    }
+
+    /// The scripted tour, shared by both profiles (theme is per-GIF).
+    fn demo_script() -> Vec<DemoStep> {
+        let mut steps = vec![
+            // a. Startup: the monitor-boot sweep plus the header signature.
+            roll(10, 100, 90),
+            hold(1_000),
+            // b. Observe: a fresh sample triggers the telemetry shimmer.
+            act(
+                |app| {
+                    app.snapshot
+                        .as_mut()
+                        .expect("demo snapshot")
+                        .system
+                        .timestamp_ms += 2_000;
+                },
+                3,
+                80,
+                100,
+            ),
+            hold(900),
+            // c. Page tour: Processes -> Tree -> Findings.
+            act(|app| app.page = Page::Processes, 4, 70, 80),
+            hold(1_100),
+            act(|app| app.page = Page::Tree, 4, 70, 80),
+            hold(1_000),
+            act(|app| app.page = Page::Alerts, 4, 70, 80),
+            act(|app| app.alert_state.select(Some(1)), 2, 80, 120),
+            hold(1_200),
+            // d. Oracle: vault visible, then the scripted interrogation.
+            act(|app| app.page = Page::Analyzer, 4, 70, 80),
+            hold(900),
+        ];
+        for length in [3usize, 8, 13, 21, 29, DEMO_PROMPT.chars().count()] {
+            steps.push(act(
+                move |app| {
+                    app.mode = InputMode::Chat(DEMO_PROMPT.chars().take(length).collect());
+                },
+                1,
+                50,
+                150,
+            ));
+        }
+        steps.push(act(
+            |app| {
+                app.mode = InputMode::Normal;
+                app.chat_messages.push_back(crate::analyzer::ChatMessage {
+                    role: ChatRole::User,
+                    timestamp_ms: 1_800_000_000_000,
+                    text: DEMO_PROMPT.into(),
+                    evidence_refs: Vec::new(),
+                    is_error: false,
+                });
+                app.analyzer_running = true;
+                backdate_analyzer(app, 300);
+            },
+            1,
+            50,
+            420,
+        ));
+        // Reading: the 4-char scanner window sweeps the phrase (0-3 s).
+        for elapsed in [700_u64, 1_600, 2_500] {
+            steps.push(act(move |app| backdate_analyzer(app, elapsed), 1, 50, 460));
+        }
+        // Correlating: the evidence segments take turns pulsing (3-8 s).
+        for elapsed in [3_300_u64, 4_500, 5_100, 6_300] {
+            steps.push(act(move |app| backdate_analyzer(app, elapsed), 1, 50, 450));
+        }
+        // Consulting: the phrase breathes with the elapsed ticker (8 s+).
+        for elapsed in [8_400_u64, 9_600, 10_800, 21_000] {
+            steps.push(act(move |app| backdate_analyzer(app, elapsed), 1, 50, 500));
+        }
+        steps.push(act(
+            |app| {
+                app.analyzer_running = false;
+                app.analyzer_started_at = None;
+                app.chat_messages.push_back(crate::analyzer::ChatMessage {
+                    role: ChatRole::Assistant,
+                    timestamp_ms: 1_800_000_021_000,
+                    text: DEMO_ANSWER.into(),
+                    evidence_refs: vec![
+                        "process:firefox.exe/50784".into(),
+                        "detector:interruptRate".into(),
+                    ],
+                    is_error: false,
+                });
+            },
+            1,
+            50,
+            1_400,
+        ));
+        steps.push(hold(1_200));
+        // e. Settings: select a detector row and open the edit band.
+        steps.push(act(|app| app.page = Page::Settings, 4, 70, 80));
+        steps.push(act(
+            |app| {
+                app.setting_state.select(
+                    SettingField::ALL
+                        .iter()
+                        .position(|field| *field == SettingField::Sustained),
+                );
+            },
+            2,
+            70,
+            200,
+        ));
+        steps.push(act(
+            |app| {
+                app.mode = InputMode::EditSetting {
+                    field: SettingField::Sustained,
+                    typed: "9".into(),
+                };
+            },
+            2,
+            60,
+            350,
+        ));
+        steps.push(act(
+            |app| {
+                app.mode = InputMode::EditSetting {
+                    field: SettingField::Sustained,
+                    typed: "90".into(),
+                };
+            },
+            1,
+            50,
+            700,
+        ));
+        // f. Keys overlay.
+        steps.push(act(
+            |app| {
+                app.mode = InputMode::Normal;
+                app.help_overlay = Some(0);
+            },
+            1,
+            50,
+            1_000,
+        ));
+        steps.push(act(|app| app.help_overlay = Some(4), 1, 50, 800));
+        // g. End the tour back on Observe with a final hold.
+        steps.push(act(
+            |app| {
+                app.help_overlay = None;
+                app.page = Page::Overview;
+            },
+            4,
+            70,
+            80,
+        ));
+        steps.push(hold(1_600));
+        steps
+    }
+
+    /// Serialize one rendered frame as `{ms, rows}`: each row is a
+    /// run-length-encoded list of `[text, fg, bg, bold]` runs, mirroring the
+    /// HTML gallery serializer in JSON for the GIF rasterizer.
+    fn frame_json(buffer: &Buffer, delay_ms: u64) -> serde_json::Value {
+        fn hex(color: Color, fallback: Color) -> String {
+            let resolved = match color {
+                Color::Rgb(..) => color,
+                _ => fallback,
+            };
+            match resolved {
+                Color::Rgb(r, g, b) => format!("#{r:02x}{g:02x}{b:02x}"),
+                _ => "#000000".into(),
+            }
+        }
+        fn flush(
+            runs: &mut Vec<serde_json::Value>,
+            style: Option<&(String, String, bool)>,
+            text: &mut String,
+        ) {
+            if let Some((fg, bg, bold)) = style
+                && !text.is_empty()
+            {
+                runs.push(serde_json::json!([
+                    std::mem::take(text),
+                    fg,
+                    bg,
+                    u8::from(*bold)
+                ]));
+            }
+        }
+        let area = *buffer.area();
+        let content = buffer.content();
+        let mut rows = Vec::new();
+        let mut populated = false;
+        for y in 0..area.height {
+            let mut runs = Vec::new();
+            let mut text = String::new();
+            let mut style: Option<(String, String, bool)> = None;
+            for x in 0..area.width {
+                let cell = &content[usize::from(y) * usize::from(area.width) + usize::from(x)];
+                let next = (
+                    hex(cell.fg, palette().text),
+                    hex(cell.bg, palette().bg),
+                    cell.modifier.contains(ratatui::style::Modifier::BOLD),
+                );
+                if style.as_ref() != Some(&next) {
+                    flush(&mut runs, style.as_ref(), &mut text);
+                    style = Some(next);
+                }
+                let symbol = cell.symbol();
+                populated |= !symbol.trim().is_empty();
+                // Wide-glyph continuation cells carry an empty symbol; keep
+                // the column count exact for the rasterizer's grid.
+                text.push_str(if symbol.is_empty() { " " } else { symbol });
+            }
+            flush(&mut runs, style.as_ref(), &mut text);
+            rows.push(serde_json::Value::Array(runs));
+        }
+        assert!(populated, "demo frame must not be empty");
+        serde_json::json!({ "ms": delay_ms, "rows": rows })
+    }
+
+    #[test]
+    #[ignore = "dev harness: set PCPULSE_DEMO_DIR to dump the scripted README demo tours as frame JSON for scripts/Make-Demo.py"]
+    fn dev_record_demo() {
+        let Ok(directory) = std::env::var("PCPULSE_DEMO_DIR") else {
+            return;
+        };
+        for theme_id in [theme::ThemeId::Vitals, theme::ThemeId::Avionics] {
+            let _guard = theme::test_support::activate(theme_id);
+            let mut app = demo_app();
+            let mut terminal =
+                Terminal::new(TestBackend::new(120, 36)).expect("demo terminal");
+            let mut motion = crate::effects::MotionSystem::new(&app, true);
+            let mut frames = Vec::new();
+            for step in demo_script() {
+                if let Some(apply) = step.act {
+                    apply(&mut app);
+                    motion.observe(&app);
+                }
+                for _ in 0..step.frames {
+                    let mut remaining = step.step_ms.max(1);
+                    while remaining > 0 {
+                        let chunk = remaining.min(50);
+                        terminal
+                            .draw(|frame| {
+                                draw(frame, &mut app);
+                                motion.render(frame, std::time::Duration::from_millis(chunk));
+                            })
+                            .expect("demo draw");
+                        remaining -= chunk;
+                    }
+                    let _ = motion.take_cleanup_frame();
+                    frames.push(frame_json(terminal.backend().buffer(), step.delay_ms));
+                }
+            }
+            assert!(
+                frames.len() >= 60,
+                "{theme_id:?}: tour is too thin ({} frames)",
+                frames.len()
+            );
+            let payload = serde_json::to_string(&serde_json::Value::Array(frames))
+                .expect("serialize demo frames");
+            std::fs::write(
+                std::path::Path::new(&directory)
+                    .join(format!("frames-{}.json", theme_id.name())),
+                payload,
+            )
+            .expect("write demo frames");
+        }
+    }
 }
