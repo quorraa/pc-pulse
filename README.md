@@ -12,7 +12,7 @@ PC Pulse uses sustained conditions and learned baseline deviations instead of al
 
 ## Quick start
 
-1. Download `PcPulse-1.5.1-x64.msi` and `SHA256SUMS.txt` from the [latest release](https://github.com/quorraa/pc-pulse/releases/latest).
+1. Download `PcPulse-1.5.2-x64.msi` and `SHA256SUMS.txt` from the [latest release](https://github.com/quorraa/pc-pulse/releases/latest).
 2. Verify the MSI's SHA-256 hash against the manifest.
 3. Install the MSI from an elevated terminal or Explorer.
 4. Open **PC Pulse** from Start. The collector runs as the `PcPulseCollector` Windows service.
@@ -157,16 +157,16 @@ cargo build --workspace --release
 Create the three Rust executables, MSI, and SHA-256 manifest:
 
 ```powershell
-.\scripts\Build-Release.ps1 -Architecture x64 -Version 1.5.1
+.\scripts\Build-Release.ps1 -Architecture x64 -Version 1.5.2
 ```
 
 For a signed release:
 
 ```powershell
-.\scripts\Build-Release.ps1 -Version 1.5.1 -CertificateThumbprint YOUR_SHA1_THUMBPRINT
+.\scripts\Build-Release.ps1 -Version 1.5.2 -CertificateThumbprint YOUR_SHA1_THUMBPRINT
 ```
 
-Outputs are placed in `artifacts`, including `PcPulse-1.5.1-x64.msi`, `SHA256SUMS.txt`, and:
+Outputs are placed in `artifacts`, including `PcPulse-1.5.2-x64.msi`, `SHA256SUMS.txt`, and:
 
 ```text
 artifacts\publish\PcPulse.Service.exe
@@ -179,7 +179,7 @@ artifacts\publish\PcPulse.Notify.exe
 Install or upgrade from an elevated terminal:
 
 ```powershell
-msiexec.exe /i .\artifacts\PcPulse-1.5.1-x64.msi
+msiexec.exe /i .\artifacts\PcPulse-1.5.2-x64.msi
 ```
 
 Open **PC Pulse** from Start, or run:
@@ -249,7 +249,7 @@ The named pipe rejects remote clients, caps messages at one MiB, and grants acce
 Use Apps > Installed apps, or:
 
 ```powershell
-msiexec.exe /x .\artifacts\PcPulse-1.5.1-x64.msi
+msiexec.exe /x .\artifacts\PcPulse-1.5.2-x64.msi
 ```
 
 For development installs, `scripts\Uninstall-Service.ps1` removes the service, notifier startup entry, binaries, settings, and history. Pass `-KeepHistory` to retain `%ProgramData%\PcPulse`.
