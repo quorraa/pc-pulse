@@ -38,6 +38,16 @@ pub enum ThemeId {
     Avionics = 1,
 }
 
+impl ThemeId {
+    /// The CLI/prefs name of this profile, identical to [`Theme::name`].
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Vitals => "vitals",
+            Self::Avionics => "avionics",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LayoutKind {
     /// Top header / top tabs / bottom footer (the current structure).

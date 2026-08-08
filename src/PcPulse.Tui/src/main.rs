@@ -4,7 +4,7 @@ use pcpulse_tui::{
     app::{App, InputMode},
     client::PipeClient,
     effects::MotionSystem,
-    theme, ui,
+    prefs, theme, ui,
 };
 use ratatui::{
     crossterm::{
@@ -104,10 +104,13 @@ fn entry() -> Result<()> {
     }
 }
 
+/// CLI flags override the stored per-user preferences for one run without
+/// rewriting them, so both are optional here: `None` / `false` means "let
+/// the preference decide".
 #[derive(Debug, Clone, Copy)]
 struct TuiOptions {
-    effects_enabled: bool,
-    theme: theme::ThemeId,
+    effects_off: bool,
+    theme: Option<theme::ThemeId>,
 }
 
 fn is_tui_flag(argument: &str) -> bool {
@@ -117,23 +120,23 @@ fn is_tui_flag(argument: &str) -> bool {
 
 fn parse_tui_flags(arguments: &[String]) -> Result<TuiOptions> {
     let mut options = TuiOptions {
-        effects_enabled: true,
-        theme: theme::ThemeId::Vitals,
+        effects_off: false,
+        theme: None,
     };
     let mut index = 0;
     while index < arguments.len() {
         match arguments[index].as_str() {
-            "--no-effects" | "--reduced-motion" => options.effects_enabled = false,
+            "--no-effects" | "--reduced-motion" => options.effects_off = true,
             "--theme" => {
                 index += 1;
                 let name = arguments
                     .get(index)
                     .ok_or_else(|| anyhow::anyhow!("--theme requires a value{THEME_USAGE}"))?;
-                options.theme = parse_theme(name)?;
+                options.theme = Some(parse_theme(name)?);
             }
             other => {
                 if let Some(name) = other.strip_prefix("--theme=") {
-                    options.theme = parse_theme(name)?;
+                    options.theme = Some(parse_theme(name)?);
                 } else {
                     bail!("unknown option \"{other}\"{THEME_USAGE}");
                 }
@@ -186,7 +189,27 @@ fn print_text(value: &str) -> Result<()> {
 }
 
 fn run_tui(options: TuiOptions) -> Result<()> {
-    theme::set_active(options.theme);
+    // First thing, before any thread exists: load the per-user preferences
+    // and feed the analyzer's existing env-var budget. An explicit
+    // PCPULSE_ANALYZER_TIMEOUT_SECS in the environment always wins.
+    let store = prefs::PrefsStore::discover();
+    let saved = store
+        .as_ref()
+        .map(prefs::PrefsStore::load)
+        .unwrap_or_default();
+    if std::env::var_os("PCPULSE_ANALYZER_TIMEOUT_SECS").is_none() {
+        // SAFETY: run_tui is called from `main` before `App::new` spawns the
+        // worker/analyzer threads, so no other thread can be reading the
+        // environment concurrently.
+        unsafe {
+            std::env::set_var(
+                "PCPULSE_ANALYZER_TIMEOUT_SECS",
+                saved.analyzer_timeout_secs.to_string(),
+            );
+        }
+    }
+    let effective = saved.overridden(options.theme, options.effects_off);
+    theme::set_active(effective.theme);
     let mut terminal = ratatui::try_init()?;
     if let Err(error) = execute!(std::io::stdout(), EnableMouseCapture) {
         let _ = ratatui::try_restore();
@@ -195,16 +218,24 @@ fn run_tui(options: TuiOptions) -> Result<()> {
     let result = terminal
         .clear()
         .map_err(anyhow::Error::from)
-        .and_then(|_| run_loop(&mut terminal, options.effects_enabled));
+        .and_then(|_| run_loop(&mut terminal, effective, store));
     let mouse_restore =
         execute!(std::io::stdout(), DisableMouseCapture).map_err(anyhow::Error::from);
     let restore = ratatui::try_restore().map_err(anyhow::Error::from);
     result.and(mouse_restore).and(restore)
 }
 
-fn run_loop(terminal: &mut ratatui::DefaultTerminal, effects_enabled: bool) -> Result<()> {
+fn run_loop(
+    terminal: &mut ratatui::DefaultTerminal,
+    effective: prefs::UiPrefs,
+    store: Option<prefs::PrefsStore>,
+) -> Result<()> {
     let mut app = App::new();
-    let mut motion = MotionSystem::new(&app, effects_enabled);
+    app.adopt_client_prefs(effective, store);
+    let mut motion = MotionSystem::new(&app, effective.effects);
+    // MotionSystem does not expose its enabled state; mirror it so TUNE
+    // toggles can be reconciled through `toggle()`.
+    let mut motion_enabled = effective.effects;
     let mut dirty = true;
     let mut last_frame = Instant::now();
     let mut terminal_area = Rect::default();
@@ -229,13 +260,20 @@ fn run_loop(terminal: &mut ratatui::DefaultTerminal, effects_enabled: bool) -> R
                     if key.kind != KeyEventKind::Release
                         && key.code == KeyCode::Char('m')
                         && matches!(app.mode, InputMode::Normal)
+                        && app.help_overlay.is_none()
                     {
-                        let enabled = motion.toggle();
+                        motion_enabled = motion.toggle();
                         app.status = format!(
-                            "Motion effects {}",
-                            if enabled { "enabled" } else { "disabled" }
+                            "Motion effects {} · saved for your user",
+                            if motion_enabled {
+                                "enabled"
+                            } else {
+                                "disabled"
+                            }
                         );
                         app.status_is_error = false;
+                        app.client_prefs.effects = motion_enabled;
+                        app.persist_client_prefs();
                         motion.observe(&app);
                         dirty = true;
                         continue;
@@ -243,10 +281,13 @@ fn run_loop(terminal: &mut ratatui::DefaultTerminal, effects_enabled: bool) -> R
                     if key.kind != KeyEventKind::Release
                         && key.code == KeyCode::Char('t')
                         && matches!(app.mode, InputMode::Normal)
+                        && app.help_overlay.is_none()
                     {
                         let active = theme::cycle();
-                        app.status = format!("Theme: {}", active.name);
+                        app.status = format!("Theme: {} · saved for your user", active.name);
                         app.status_is_error = false;
+                        app.client_prefs.theme = active.id;
+                        app.persist_client_prefs();
                         // The base draw repaints every cell, but clear the
                         // backend diff so no stale-bg cell survives the swap.
                         terminal.clear()?;
@@ -256,6 +297,16 @@ fn run_loop(terminal: &mut ratatui::DefaultTerminal, effects_enabled: bool) -> R
                     }
                     if app.handle_key(key) {
                         break;
+                    }
+                    // A TUNE client-row edit may have cycled the theme or
+                    // asked for a motion-effects state this loop owns.
+                    if let Some(enabled) = app.take_effects_request()
+                        && enabled != motion_enabled
+                    {
+                        motion_enabled = motion.toggle();
+                    }
+                    if app.take_terminal_clear() {
+                        terminal.clear()?;
                     }
                     motion.observe(&app);
                     dirty = true;

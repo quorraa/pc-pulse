@@ -2,6 +2,8 @@ use crate::{
     analyzer::{ChatMessage, ChatResponse, ChatRole},
     chat_history::{ChatHistoryStore, ChatSession},
     client::PipeClient,
+    prefs::{self, PrefsStore, UiPrefs},
+    theme,
 };
 use chrono::Utc;
 use crossbeam_channel::{Receiver, Sender, bounded, select};
@@ -193,6 +195,9 @@ pub enum InputMode {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingField {
+    ClientTheme,
+    ClientEffects,
+    ClientTimeout,
     SampleInterval,
     Retention,
     Sustained,
@@ -214,7 +219,12 @@ pub enum SettingField {
 }
 
 impl SettingField {
-    pub const ALL: [Self; 18] = [
+    /// Local terminal preferences: stored per user in `ui-prefs.json` and
+    /// never sent to (or validated by) the collector service.
+    pub const CLIENT: [Self; 3] = [Self::ClientTheme, Self::ClientEffects, Self::ClientTimeout];
+
+    /// Service-validated detector settings, saved through the pipe with `s`.
+    pub const SERVICE: [Self; 18] = [
         Self::SampleInterval,
         Self::Retention,
         Self::Sustained,
@@ -235,8 +245,42 @@ impl SettingField {
         Self::AgentPatterns,
     ];
 
+    pub const ALL: [Self; 21] = [
+        Self::ClientTheme,
+        Self::ClientEffects,
+        Self::ClientTimeout,
+        Self::SampleInterval,
+        Self::Retention,
+        Self::Sustained,
+        Self::BaselineSigma,
+        Self::Cpu,
+        Self::MemoryGrowth,
+        Self::HandleGrowth,
+        Self::ThreadGrowth,
+        Self::DiskLatency,
+        Self::Io,
+        Self::KernelPool,
+        Self::Dpc,
+        Self::Interrupt,
+        Self::Unresponsive,
+        Self::SlowLaunch,
+        Self::AgentAge,
+        Self::Notifications,
+        Self::AgentPatterns,
+    ];
+
+    pub const fn is_client(self) -> bool {
+        matches!(
+            self,
+            Self::ClientTheme | Self::ClientEffects | Self::ClientTimeout
+        )
+    }
+
     pub const fn label(self) -> &'static str {
         match self {
+            Self::ClientTheme => "Theme profile",
+            Self::ClientEffects => "Motion effects",
+            Self::ClientTimeout => "Oracle time budget",
             Self::SampleInterval => "Sample interval",
             Self::Retention => "History retention",
             Self::Sustained => "Sustained samples",
@@ -260,6 +304,8 @@ impl SettingField {
 
     pub const fn unit(self) -> &'static str {
         match self {
+            Self::ClientTheme | Self::ClientEffects => "local",
+            Self::ClientTimeout => "seconds",
             Self::SampleInterval | Self::SlowLaunch => "ms",
             Self::Retention => "days",
             Self::BaselineSigma => "sigma",
@@ -274,8 +320,102 @@ impl SettingField {
         }
     }
 
+    /// One plain-language sentence per row: what changing this value means
+    /// for the person at the keyboard, not how the detector implements it.
+    pub const fn description(self) -> &'static str {
+        match self {
+            Self::ClientTheme => {
+                "Which look this terminal uses — vitals (green patient monitor) or avionics \
+                 (amber cockpit display). Enter switches immediately and remembers your choice."
+            }
+            Self::ClientEffects => {
+                "Whether brief motion effects play on page changes and new findings. Enter \
+                 toggles; off is the reduced-motion mode."
+            }
+            Self::ClientTimeout => {
+                "How many seconds one Oracle analysis may run before it is cancelled. Saved \
+                 for your user and applied the next time PC Pulse starts."
+            }
+            Self::SampleInterval => {
+                "How often PC Pulse measures the whole machine, in milliseconds. Shorter \
+                 intervals notice problems sooner but check more often."
+            }
+            Self::Retention => {
+                "How many days of history and findings are kept on disk before old records \
+                 are cleaned up."
+            }
+            Self::Sustained => {
+                "How many checks in a row a problem must fail before PC Pulse reports it — \
+                 higher means fewer, more certain findings."
+            }
+            Self::BaselineSigma => {
+                "How far a process must drift from its own normal behavior before it counts \
+                 as abnormal. Higher tolerates more natural variation."
+            }
+            Self::Cpu => {
+                "A process holding at least this share of the CPU for the sustained streak \
+                 becomes a finding."
+            }
+            Self::MemoryGrowth => {
+                "How much a process's memory must keep growing over recent minutes before it \
+                 is flagged as a possible leak."
+            }
+            Self::HandleGrowth => {
+                "How many extra Windows handles a process must accumulate before it is \
+                 flagged — handles that only ever grow usually mean a leak."
+            }
+            Self::ThreadGrowth => {
+                "How many extra threads a process must accumulate before it is flagged — \
+                 runaway thread creation often precedes a hang."
+            }
+            Self::DiskLatency => {
+                "The average disk response time that counts as slow. The busiest process is \
+                 named as the likely cause, not proven."
+            }
+            Self::Io => {
+                "A process reading or writing the disk at least this fast, sustained, \
+                 becomes a finding."
+            }
+            Self::KernelPool => {
+                "How much growth in Windows kernel (driver) memory is tolerated before a \
+                 finding — pool leaks usually point at a driver, not an app."
+            }
+            Self::Dpc => {
+                "How much deferred driver work per second counts as excessive — sustained \
+                 high rates usually mean a misbehaving driver."
+            }
+            Self::Interrupt => {
+                "How many hardware interrupts per second count as excessive — sustained \
+                 storms usually point at a device or its driver."
+            }
+            Self::Unresponsive => {
+                "How long an application window may stay frozen (not responding) before \
+                 PC Pulse reports it."
+            }
+            Self::SlowLaunch => {
+                "How long an app may take from launch to its first visible window before it \
+                 is reported as a slow start."
+            }
+            Self::AgentAge => {
+                "How old an idle, orphaned AI-agent process must be before it is reported \
+                 as abandoned."
+            }
+            Self::Notifications => {
+                "Whether the tray helper pops a Windows notification when a new sustained \
+                 finding appears. Enter on or off."
+            }
+            Self::AgentPatterns => {
+                "Comma-separated name or path fragments that identify AI-agent processes, \
+                 used by agent focus and abandoned-agent findings."
+            }
+        }
+    }
+
     pub fn value(self, settings: &Settings) -> String {
         match self {
+            // Client preferences live outside the service `Settings`; the
+            // TUNE page reads them through `App::setting_value`.
+            Self::ClientTheme | Self::ClientEffects | Self::ClientTimeout => String::new(),
             Self::SampleInterval => settings.sample_interval_ms.to_string(),
             Self::Retention => settings.retention_days.to_string(),
             Self::Sustained => settings.sustained_samples.to_string(),
@@ -304,6 +444,9 @@ impl SettingField {
 
     pub fn assign(self, settings: &mut Settings, input: &str) -> Result<(), String> {
         match self {
+            Self::ClientTheme | Self::ClientEffects | Self::ClientTimeout => {
+                return Err("local client preference — edited through its own handler".into());
+            }
             Self::SampleInterval => {
                 settings.sample_interval_ms = parse_range(input, 1_000, 60_000)?
             }
@@ -552,6 +695,10 @@ fn error_text(error: anyhow::Error) -> String {
     format!("{error:#}")
 }
 
+/// Where the Oracle `y` copy writes its text; swappable so tests never
+/// spawn `clip.exe`.
+pub(crate) type ClipboardSink = Box<dyn Fn(&str) -> Result<(), String>>;
+
 pub struct App {
     pub page: Page,
     pub snapshot: Option<Snapshot>,
@@ -595,6 +742,23 @@ pub struct App {
     pub agents_only: bool,
     pub timeline_hours: u32,
     pub mode: InputMode,
+    /// The '?' keys overlay: `Some(scroll)` while open. Deliberately not an
+    /// [`InputMode`] variant — the effects layer diffs `InputMode` through
+    /// its own `ModeKind`, and the overlay is chrome, not an input state.
+    pub help_overlay: Option<u16>,
+    /// The client preferences in force for this run (CLI flags already
+    /// folded in). `t` / `m` / TUNE edits update and persist them.
+    pub client_prefs: UiPrefs,
+    pub prefs_store: Option<PrefsStore>,
+    /// Set when a theme change needs `terminal.clear()` on the next loop
+    /// turn; drained by `take_terminal_clear`.
+    needs_terminal_clear: bool,
+    /// Set when the TUNE client section toggles motion effects; drained by
+    /// the main loop, which owns the `MotionSystem`.
+    effects_request: Option<bool>,
+    /// Clipboard sink for the Oracle `y` copy. The real path pipes UTF-16LE
+    /// into `clip.exe`; tests substitute a recorder.
+    pub(crate) clipboard: ClipboardSink,
     pub process_state: TableState,
     pub tree_state: TableState,
     pub alert_state: TableState,
@@ -677,6 +841,12 @@ impl App {
             agents_only: false,
             timeline_hours: 3,
             mode: InputMode::Normal,
+            help_overlay: None,
+            client_prefs: UiPrefs::default(),
+            prefs_store: None,
+            needs_terminal_clear: false,
+            effects_request: None,
+            clipboard: Box::new(write_clipboard_via_clip),
             process_state: TableState::default().with_selected(0),
             tree_state: TableState::default().with_selected(0),
             alert_state: TableState::default().with_selected(0),
@@ -822,11 +992,29 @@ impl App {
     }
 
     fn handle_normal_key(&mut self, key: KeyEvent) -> bool {
+        // While the keys overlay is up it owns the keyboard: the page below
+        // must not react to navigation or action keys.
+        if let Some(scroll) = self.help_overlay {
+            match key.code {
+                KeyCode::Char('q') => return true,
+                KeyCode::Char('?') | KeyCode::Esc => self.help_overlay = None,
+                KeyCode::Char('j') | KeyCode::Down => {
+                    self.help_overlay = Some(scroll.saturating_add(1));
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    self.help_overlay = Some(scroll.saturating_sub(1));
+                }
+                KeyCode::PageDown => self.help_overlay = Some(scroll.saturating_add(10)),
+                KeyCode::PageUp => self.help_overlay = Some(scroll.saturating_sub(10)),
+                _ => {}
+            }
+            return false;
+        }
         match key.code {
             KeyCode::Char('q') => return true,
             KeyCode::Tab | KeyCode::Right if self.page != Page::Settings => self.change_page(1),
             KeyCode::BackTab | KeyCode::Left if self.page != Page::Settings => self.change_page(-1),
-            KeyCode::Char('?') => self.select_page(Page::Help),
+            KeyCode::Char('?') => self.help_overlay = Some(0),
             KeyCode::Char(value @ '1'..='8') => {
                 self.select_page(Page::ALL[(value as u8 - b'1') as usize]);
             }
@@ -847,6 +1035,7 @@ impl App {
             KeyCode::Char('n' | 'c') if self.page == Page::Analyzer && !self.analyzer_running => {
                 self.begin_new_chat();
             }
+            KeyCode::Char('y') if self.page == Page::Analyzer => self.copy_latest_answer(),
             KeyCode::Char('r') if self.page == Page::Tree => {
                 self.tree_sort = TreeSort::Lineage;
                 self.refresh_page();
@@ -1092,6 +1281,27 @@ impl App {
                 typed.push(character);
                 self.mode = InputMode::EditSetting { field, typed };
             }
+            KeyCode::Enter if field == SettingField::ClientTimeout => {
+                match parse_range(
+                    &typed,
+                    prefs::MIN_ANALYZER_TIMEOUT_SECS,
+                    prefs::MAX_ANALYZER_TIMEOUT_SECS,
+                ) {
+                    Ok(seconds) => {
+                        self.client_prefs.analyzer_timeout_secs = seconds;
+                        self.mode = InputMode::Normal;
+                        self.status =
+                            "Oracle time budget saved for your user · applies at next launch"
+                                .into();
+                        self.status_is_error = false;
+                        self.persist_client_prefs();
+                    }
+                    Err(error) => {
+                        self.set_error(error);
+                        self.mode = InputMode::EditSetting { field, typed };
+                    }
+                }
+            }
             KeyCode::Enter => match field.assign(&mut self.settings, &typed) {
                 Ok(()) => {
                     self.settings_dirty = true;
@@ -1172,11 +1382,106 @@ impl App {
 
     pub(crate) fn begin_setting_edit(&mut self) {
         let index = self.setting_state.selected().unwrap_or(0);
-        if let Some(field) = self.visible_setting_fields().get(index).copied() {
-            self.mode = InputMode::EditSetting {
-                field,
-                typed: field.value(&self.settings),
-            };
+        let Some(field) = self.visible_setting_fields().get(index).copied() else {
+            return;
+        };
+        match field {
+            // The theme row is a two-position switch: Enter flips it and
+            // persists immediately — no typed input to get wrong.
+            SettingField::ClientTheme => {
+                let active = theme::cycle();
+                self.client_prefs.theme = active.id;
+                self.needs_terminal_clear = true;
+                self.status = format!("Theme: {} · saved for your user", active.name);
+                self.status_is_error = false;
+                self.persist_client_prefs();
+            }
+            SettingField::ClientEffects => {
+                self.client_prefs.effects = !self.client_prefs.effects;
+                self.effects_request = Some(self.client_prefs.effects);
+                self.status = format!(
+                    "Motion effects {} · saved for your user",
+                    if self.client_prefs.effects {
+                        "enabled"
+                    } else {
+                        "disabled"
+                    }
+                );
+                self.status_is_error = false;
+                self.persist_client_prefs();
+            }
+            _ => {
+                self.mode = InputMode::EditSetting {
+                    field,
+                    typed: self.setting_value(field),
+                };
+            }
+        }
+    }
+
+    /// The display value for a TUNE row: client preferences come from this
+    /// process's runtime state, everything else from the service settings.
+    pub fn setting_value(&self, field: SettingField) -> String {
+        match field {
+            SettingField::ClientTheme => theme::active().name.into(),
+            SettingField::ClientEffects => if self.client_prefs.effects {
+                "on"
+            } else {
+                "off"
+            }
+            .into(),
+            SettingField::ClientTimeout => self.client_prefs.analyzer_timeout_secs.to_string(),
+            _ => field.value(&self.settings),
+        }
+    }
+
+    /// Adopt the startup preferences (CLI flags already folded in) and the
+    /// store that future choices persist through.
+    pub fn adopt_client_prefs(&mut self, prefs: UiPrefs, store: Option<PrefsStore>) {
+        self.client_prefs = prefs;
+        self.prefs_store = store;
+    }
+
+    /// Write the current client preferences to disk; without a store (tests,
+    /// no %LOCALAPPDATA%) this is a no-op.
+    pub fn persist_client_prefs(&mut self) {
+        if let Some(store) = &self.prefs_store
+            && let Err(error) = store.save(&self.client_prefs)
+        {
+            self.set_error(format!("Failed to save client preferences: {error:#}"));
+        }
+    }
+
+    /// True exactly once after a theme change from inside the App: the main
+    /// loop must clear the backend diff so no stale-bg cell survives.
+    pub fn take_terminal_clear(&mut self) -> bool {
+        std::mem::take(&mut self.needs_terminal_clear)
+    }
+
+    /// The desired motion-effects state, once, after a TUNE toggle; the main
+    /// loop reconciles its `MotionSystem` with it.
+    pub fn take_effects_request(&mut self) -> Option<bool> {
+        self.effects_request.take()
+    }
+
+    /// `y` on Oracle: copy the latest successful analyzer answer.
+    fn copy_latest_answer(&mut self) {
+        let Some(answer) = self
+            .chat_messages
+            .iter()
+            .rev()
+            .find(|message| message.role == ChatRole::Assistant && !message.is_error)
+            .map(|message| message.text.clone())
+        else {
+            self.set_error("No analyzer answer to copy yet".into());
+            return;
+        };
+        match (self.clipboard)(&answer) {
+            Ok(()) => {
+                self.status = "Answer copied to clipboard".into();
+                self.status_is_error = false;
+            }
+            Err(error) => self.set_error(format!("Clipboard copy failed: {error}")),
         }
     }
 
@@ -1451,8 +1756,10 @@ impl App {
         alerts
     }
 
+    /// TUNE rows: the local CLIENT section stays pinned at the top in its
+    /// declared order; the service settings below it obey the active sort.
     pub fn visible_setting_fields(&self) -> Vec<SettingField> {
-        let mut fields = SettingField::ALL.to_vec();
+        let mut fields = SettingField::SERVICE.to_vec();
         fields.sort_by(|left, right| match self.setting_sort {
             SettingSort::Name => left.label().cmp(right.label()),
             SettingSort::Value => left
@@ -1464,7 +1771,9 @@ impl App {
                 .cmp(right.unit())
                 .then_with(|| left.label().cmp(right.label())),
         });
-        fields
+        let mut rows = SettingField::CLIENT.to_vec();
+        rows.extend(fields);
+        rows
     }
 
     pub fn selected_alert(&self) -> Option<&Alert> {
@@ -1586,6 +1895,46 @@ fn clamp_table(state: &mut TableState, length: usize) {
 fn clamp_list(state: &mut ListState, length: usize) {
     let selected = state.selected().unwrap_or(0).min(length.saturating_sub(1));
     state.select((length > 0).then_some(selected));
+}
+
+/// Copy `text` to the Windows clipboard by piping UTF-16LE with a BOM into
+/// `clip.exe`. clip.exe sniffs the `FF FE` BOM and stores the payload as
+/// Unicode text, which preserves non-ASCII characters end to end (verified
+/// empirically: accents, symbols, and CJK round-trip); without the BOM it
+/// would reinterpret the bytes in the console codepage and mangle them.
+fn write_clipboard_via_clip(text: &str) -> Result<(), String> {
+    use std::io::Write as _;
+    use std::process::{Command, Stdio};
+    let mut child = Command::new("clip.exe")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| format!("failed to start clip.exe: {error}"))?;
+    let mut payload: Vec<u8> = Vec::with_capacity(2 + text.len() * 2);
+    payload.extend_from_slice(&[0xFF, 0xFE]);
+    for unit in text.encode_utf16() {
+        payload.extend_from_slice(&unit.to_le_bytes());
+    }
+    // Write, then drop stdin so clip.exe sees EOF before we wait on it.
+    let written = child
+        .stdin
+        .take()
+        .ok_or_else(|| "clip.exe stdin unavailable".to_string())
+        .and_then(|mut stdin| {
+            stdin
+                .write_all(&payload)
+                .map_err(|error| format!("failed to write to clip.exe: {error}"))
+        });
+    let status = child
+        .wait()
+        .map_err(|error| format!("clip.exe did not finish: {error}"));
+    written?;
+    let status = status?;
+    if !status.success() {
+        return Err(format!("clip.exe exited with {status}"));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1928,6 +2277,229 @@ mod tests {
                 .try_iter()
                 .any(|command| matches!(command, WorkerCommand::RunChat { .. }))
         );
+    }
+
+    fn scratch_prefs_store(tag: &str) -> (PrefsStore, std::path::PathBuf) {
+        let path = std::env::temp_dir().join(format!(
+            "pcpulse-app-prefs-{tag}-{}-{}.json",
+            std::process::id(),
+            Utc::now().timestamp_millis()
+        ));
+        (PrefsStore::at(path.clone()), path)
+    }
+
+    #[test]
+    fn y_copies_the_latest_successful_answer_to_the_clipboard() {
+        use std::{cell::RefCell, rc::Rc};
+        let mut app = App::new_inert();
+        app.page = Page::Analyzer;
+        let captured: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+        let sink = Rc::clone(&captured);
+        app.clipboard = Box::new(move |text| {
+            sink.borrow_mut().push(text.to_string());
+            Ok(())
+        });
+        for (role, text, is_error) in [
+            (ChatRole::User, "Why is the disk slow?", false),
+            (
+                ChatRole::Assistant,
+                "Disk latency is fine — 1.8 ms average.",
+                false,
+            ),
+            (ChatRole::Assistant, "Analysis failed: timed out", true),
+        ] {
+            app.chat_messages.push_back(ChatMessage {
+                role,
+                timestamp_ms: 0,
+                text: text.into(),
+                evidence_refs: Vec::new(),
+                is_error,
+            });
+        }
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+
+        // The failed turn is skipped: the latest *successful* answer wins.
+        assert_eq!(
+            captured.borrow().as_slice(),
+            ["Disk latency is fine — 1.8 ms average.".to_string()]
+        );
+        assert_eq!(app.status, "Answer copied to clipboard");
+        assert!(!app.status_is_error);
+    }
+
+    #[test]
+    fn y_with_no_answer_sets_an_error_and_never_touches_the_clipboard() {
+        use std::{cell::Cell, rc::Rc};
+        let mut app = App::new_inert();
+        app.page = Page::Analyzer;
+        let called = Rc::new(Cell::new(false));
+        let flag = Rc::clone(&called);
+        app.clipboard = Box::new(move |_| {
+            flag.set(true);
+            Ok(())
+        });
+        // Only a failed turn exists — nothing copyable.
+        app.chat_messages.push_back(ChatMessage {
+            role: ChatRole::Assistant,
+            timestamp_ms: 0,
+            text: "Analysis failed: timed out".into(),
+            evidence_refs: Vec::new(),
+            is_error: true,
+        });
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+
+        assert!(!called.get(), "clipboard must not run without an answer");
+        assert!(app.status_is_error);
+        assert!(app.status.contains("No analyzer answer"));
+    }
+
+    #[test]
+    fn question_mark_toggles_the_keys_overlay_without_leaving_the_page() {
+        let mut app = App::new_inert();
+        assert_eq!(app.page, Page::Overview);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE));
+        assert_eq!(app.help_overlay, Some(0));
+        assert_eq!(app.page, Page::Overview, "the page below must not change");
+
+        // The overlay owns the keyboard: navigation keys scroll or are inert.
+        app.handle_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE));
+        assert_eq!(app.page, Page::Overview);
+        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_eq!(app.help_overlay, Some(1));
+        app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
+        assert_eq!(app.help_overlay, Some(0));
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.help_overlay, None);
+        assert_eq!(app.page, Page::Overview);
+
+        // '?' also closes it, including on the Keys page itself.
+        app.select_page(Page::Help);
+        app.handle_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE));
+        assert_eq!(app.help_overlay, Some(0));
+        app.handle_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE));
+        assert_eq!(app.help_overlay, None);
+        assert_eq!(app.page, Page::Help);
+    }
+
+    #[test]
+    fn question_mark_stays_literal_text_inside_input_modes() {
+        let mut app = App::new_inert();
+        app.page = Page::Processes;
+        app.mode = InputMode::Search("cpu".into());
+        app.handle_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE));
+        assert!(matches!(app.mode, InputMode::Search(ref value) if value == "cpu?"));
+        assert_eq!(app.help_overlay, None);
+
+        app.mode = InputMode::Chat("what".into());
+        app.handle_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE));
+        assert!(matches!(app.mode, InputMode::Chat(ref value) if value == "what?"));
+        assert_eq!(app.help_overlay, None);
+
+        app.mode = InputMode::EditSetting {
+            field: SettingField::AgentPatterns,
+            typed: "codex".into(),
+        };
+        app.handle_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE));
+        assert!(matches!(app.mode, InputMode::EditSetting { ref typed, .. } if typed == "codex?"));
+        assert_eq!(app.help_overlay, None);
+    }
+
+    #[test]
+    fn client_rows_stay_pinned_above_the_sorted_service_settings() {
+        let mut app = App::new_inert();
+        for sort in [SettingSort::Name, SettingSort::Value, SettingSort::Unit] {
+            app.setting_sort = sort;
+            let fields = app.visible_setting_fields();
+            assert_eq!(&fields[..3], &SettingField::CLIENT, "{sort:?}");
+            assert_eq!(fields.len(), SettingField::ALL.len());
+        }
+        assert!(SettingField::ClientTheme.is_client());
+        assert!(!SettingField::Sustained.is_client());
+        // Every row has a real plain-language description.
+        for field in SettingField::ALL {
+            assert!(
+                field.description().len() > 40,
+                "{field:?} needs a description"
+            );
+        }
+    }
+
+    #[test]
+    fn enter_on_the_client_theme_row_cycles_and_persists_locally() {
+        let _guard = theme::test_support::activate(theme::ThemeId::Vitals);
+        let (store, path) = scratch_prefs_store("theme");
+        let mut app = App::new_inert();
+        app.adopt_client_prefs(UiPrefs::default(), Some(store.clone()));
+        app.page = Page::Settings;
+        app.setting_state.select(Some(0));
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(theme::active().id, theme::ThemeId::Avionics);
+        assert_eq!(app.client_prefs.theme, theme::ThemeId::Avionics);
+        assert_eq!(app.setting_value(SettingField::ClientTheme), "avionics");
+        assert!(matches!(app.mode, InputMode::Normal), "no typed edit opens");
+        assert!(app.take_terminal_clear(), "theme swap needs a repaint");
+        assert!(!app.take_terminal_clear(), "the flag drains");
+        assert_eq!(store.load().theme, theme::ThemeId::Avionics);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn enter_on_the_client_effects_row_toggles_and_hands_the_state_to_the_loop() {
+        let mut app = App::new_inert();
+        app.page = Page::Settings;
+        app.setting_state.select(Some(1));
+        assert!(app.client_prefs.effects);
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(!app.client_prefs.effects);
+        assert_eq!(app.setting_value(SettingField::ClientEffects), "off");
+        assert_eq!(app.take_effects_request(), Some(false));
+        assert_eq!(app.take_effects_request(), None, "the request drains");
+        assert!(matches!(app.mode, InputMode::Normal));
+    }
+
+    #[test]
+    fn client_timeout_edits_validate_and_save_per_user() {
+        let (store, path) = scratch_prefs_store("timeout");
+        let mut app = App::new_inert();
+        app.adopt_client_prefs(UiPrefs::default(), Some(store.clone()));
+        app.page = Page::Settings;
+        app.setting_state.select(Some(2));
+
+        // Enter opens the ordinary typed edit, prefilled with the current value.
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(
+            app.mode,
+            InputMode::EditSetting { field: SettingField::ClientTimeout, ref typed } if typed == "300"
+        ));
+
+        app.mode = InputMode::EditSetting {
+            field: SettingField::ClientTimeout,
+            typed: "600".into(),
+        };
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.client_prefs.analyzer_timeout_secs, 600);
+        assert_eq!(store.load().analyzer_timeout_secs, 600);
+        assert!(app.status.contains("next launch"));
+        assert!(!app.status_is_error);
+
+        // Out-of-range input re-arms the edit with an error.
+        app.mode = InputMode::EditSetting {
+            field: SettingField::ClientTimeout,
+            typed: "10".into(),
+        };
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.status_is_error);
+        assert!(matches!(app.mode, InputMode::EditSetting { .. }));
+        assert_eq!(app.client_prefs.analyzer_timeout_secs, 600);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

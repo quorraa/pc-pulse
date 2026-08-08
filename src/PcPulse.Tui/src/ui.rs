@@ -1,6 +1,9 @@
 use crate::{
     analyzer::ChatRole,
-    app::{AlertSort, App, InputMode, Page, ProcessSort, SettingSort, SuspectSort, TreeSort},
+    app::{
+        AlertSort, App, InputMode, Page, ProcessSort, SettingField, SettingSort, SuspectSort,
+        TreeSort,
+    },
     format,
     theme::{self, LayoutKind, palette},
 };
@@ -103,6 +106,26 @@ fn statusline_regions(area: Rect) -> UiRegions {
 }
 
 pub fn handle_mouse(app: &mut App, event: MouseEvent, area: Rect) -> bool {
+    // The keys overlay owns the mouse exactly as it owns the keyboard:
+    // the wheel scrolls it, any click dismisses it, nothing reaches the
+    // page underneath.
+    if let Some(scroll) = app.help_overlay {
+        return match event.kind {
+            MouseEventKind::ScrollUp => {
+                app.help_overlay = Some(scroll.saturating_sub(3));
+                true
+            }
+            MouseEventKind::ScrollDown => {
+                app.help_overlay = Some(scroll.saturating_add(3));
+                true
+            }
+            MouseEventKind::Down(_) => {
+                app.help_overlay = None;
+                true
+            }
+            _ => false,
+        };
+    }
     let mut chat_dismissed = false;
     if matches!(app.mode, InputMode::Chat(_)) {
         if let MouseEventKind::Down(MouseButton::Left) = event.kind {
@@ -330,7 +353,7 @@ fn mouse_body_click(
             false
         }
         Page::Settings if button == MouseButton::Left => {
-            let table = inset(body);
+            let table = inset(settings_regions(body).0);
             if point.1 == table.y.saturating_add(1)
                 && let Some(sort) = setting_sort_at(table, point.0)
             {
@@ -780,6 +803,72 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
         render_footer(frame, app, regions.footer);
     }
     render_modal(frame, app);
+    render_help_overlay(frame, app, regions.body);
+}
+
+/// The '?' overlay rect: a centered panel filling ~80% of the page body.
+fn help_overlay_region(body: Rect) -> Rect {
+    let width = (body.width * 4 / 5).clamp(40.min(body.width), body.width);
+    let height = (body.height * 4 / 5).clamp(10.min(body.height), body.height);
+    centered_rect(width, height, body)
+}
+
+/// The keys reference as a popup over whatever page is active: the same
+/// content the Keys page shows, in one scrollable column, without leaving
+/// the page. `j`/`k` or the wheel scroll it; Esc, `?`, or a click closes it.
+fn render_help_overlay(frame: &mut Frame<'_>, app: &App, body: Rect) {
+    let Some(scroll) = app.help_overlay else {
+        return;
+    };
+    let area = help_overlay_region(body);
+    frame.render_widget(Clear, area);
+    let inner_width = area.width.saturating_sub(4);
+    let mut lines = vec![Line::styled(
+        "◈ NAVIGATION RUNES",
+        Style::default().fg(palette().ok).bold(),
+    )];
+    for (key, description) in HELP_GLOBAL {
+        lines.extend(help_lines(key, description, inner_width));
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(
+        "◇ CONTEXT RITES",
+        Style::default().fg(palette().alt).bold(),
+    ));
+    for (key, description) in HELP_CONTEXTUAL {
+        lines.extend(help_lines(key, description, inner_width));
+    }
+    lines.push(Line::raw(""));
+    for row in wrap_words(
+        "PC Pulse never terminates a process automatically.",
+        usize::from(inner_width).max(8),
+    ) {
+        lines.push(Line::styled(
+            row,
+            Style::default().fg(palette().warn).bold(),
+        ));
+    }
+    let visible = area.height.saturating_sub(2);
+    let max_scroll = (lines.len().min(u16::MAX as usize) as u16).saturating_sub(visible);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .scroll((scroll.min(max_scroll), 0))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Double)
+                    .border_style(Style::default().fg(palette().info))
+                    .style(
+                        Style::default()
+                            .fg(palette().text)
+                            .bg(palette().surface_raised),
+                    )
+                    .title(" ? KEYS · j/k scroll · Esc or ? close ")
+                    .title_style(Style::default().fg(palette().info).bold())
+                    .padding(Padding::horizontal(1)),
+            ),
+        area,
+    );
 }
 
 /// The full-height avionics rail: brand block, stacked bezel page keys, and
@@ -945,8 +1034,8 @@ fn rail_mode_line(app: &App) -> Line<'static> {
             Style::default().fg(palette().bg).bg(palette().crit).bold(),
         ),
         InputMode::EditSetting { .. } => Line::styled(
-            " EDIT ",
-            Style::default().fg(palette().bg).bg(palette().alt).bold(),
+            " EDITING ",
+            Style::default().fg(palette().bg).bg(palette().warn).bold(),
         ),
     }
 }
@@ -962,7 +1051,7 @@ fn rail_input_line(app: &App) -> Line<'static> {
                 Page::Tree => "j/k r x",
                 Page::Alerts => "j/k a i r",
                 Page::Timeline => "[ ] r",
-                Page::Analyzer => "↵ ask n h",
+                Page::Analyzer => "↵ ask n h y",
                 Page::Settings => "↵ edit s",
                 Page::Help => "1–8 Tab",
             };
@@ -1878,7 +1967,10 @@ fn pool_line(system: &SystemMetric, area: Rect) -> Line<'static> {
     ];
     let full_width = 6 + pool_text.chars().count() + 7 + rw_text.chars().count();
     if usize::from(area.width.saturating_sub(1)) >= full_width {
-        spans.push(Span::styled("   R/W ", Style::default().fg(palette().faint)));
+        spans.push(Span::styled(
+            "   R/W ",
+            Style::default().fg(palette().faint),
+        ));
         spans.push(Span::styled(rw_text, Style::default().fg(palette().muted)));
     }
     Line::from(spans)
@@ -2114,7 +2206,10 @@ fn render_agent_swarm(frame: &mut Frame<'_>, app: &App, area: Rect) {
         );
         // Same rule as the summary: whole stat segments or none at all.
         if content >= 29 + stats_full.chars().count() {
-            spans.push(Span::styled(stats_full, Style::default().fg(palette().muted)));
+            spans.push(Span::styled(
+                stats_full,
+                Style::default().fg(palette().muted),
+            ));
         } else if content >= 29 + 7 {
             spans.push(Span::styled(
                 format!(" {:>5.1}%", process.cpu_percent),
@@ -2325,13 +2420,14 @@ fn render_processes(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     header_cells.truncate(column_count);
     let table = Table::new(rows, process_constraints(column_count))
         .header(
-            Row::new(header_cells).style(
-                Style::default()
-                    .fg(palette().alt)
-                    .bg(palette().surface_raised)
-                    .bold(),
-            )
-            .bottom_margin(1),
+            Row::new(header_cells)
+                .style(
+                    Style::default()
+                        .fg(palette().alt)
+                        .bg(palette().surface_raised)
+                        .bold(),
+                )
+                .bottom_margin(1),
         )
         .block(accent_panel(
             &title,
@@ -2540,13 +2636,14 @@ fn render_tree(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     header_cells.truncate(column_count);
     let table = Table::new(rows, tree_constraints(column_count))
         .header(
-            Row::new(header_cells).style(
-                Style::default()
-                    .fg(palette().info)
-                    .bg(palette().surface_raised)
-                    .bold(),
-            )
-            .bottom_margin(1),
+            Row::new(header_cells)
+                .style(
+                    Style::default()
+                        .fg(palette().info)
+                        .bg(palette().surface_raised)
+                        .bold(),
+                )
+                .bottom_margin(1),
         )
         .block(accent_panel(&title, palette().info))
         .row_highlight_style(row_highlight_style())
@@ -3630,7 +3727,10 @@ fn render_timeline(frame: &mut Frame<'_>, app: &App, area: Rect) {
                 .bounds([0.0, latency_max])
                 .labels(vec![
                     Line::styled("0", Style::default().fg(palette().faint)),
-                    Line::styled(format_axis_ms(latency_mid), Style::default().fg(palette().muted)),
+                    Line::styled(
+                        format_axis_ms(latency_mid),
+                        Style::default().fg(palette().muted),
+                    ),
                     Line::styled(
                         format!("{} ms", format_axis_ms(latency_max)),
                         Style::default().fg(palette().warn).bold(),
@@ -3650,19 +3750,81 @@ fn format_axis_ms(value: f64) -> String {
     }
 }
 
+/// TUNE body split: the settings table above, the plain-language detail
+/// strip below. Shared with the mouse hit-tests so clicks in the strip can
+/// never masquerade as table rows.
+fn settings_regions(body: Rect) -> (Rect, Rect) {
+    let sections = Layout::vertical([Constraint::Min(8), Constraint::Length(5)]).split(body);
+    (sections[0], sections[1])
+}
+
 fn render_settings(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
+    let editing = match &app.mode {
+        InputMode::EditSetting { field, typed } => Some((*field, typed.clone())),
+        _ => None,
+    };
+    let (table_area, detail_area) = settings_regions(area);
     let rows = app
         .visible_setting_fields()
         .into_iter()
         .enumerate()
         .map(|(index, field)| {
+            let is_edited = editing.as_ref().is_some_and(|(edited, _)| *edited == field);
+            // While one row is being edited, the rest recede so the eye
+            // lands on the input band.
+            let dimmed = editing.is_some() && !is_edited;
+            let (marker, marker_color) = if field.is_client() {
+                ("◆ ", palette().info)
+            } else {
+                ("◇ ", palette().alt)
+            };
+            let text_color = if dimmed {
+                palette().faint
+            } else {
+                palette().text
+            };
+            let value_cell = if let (true, Some((_, typed))) = (is_edited, editing.as_ref()) {
+                Cell::from(Line::from(vec![
+                    Span::styled(
+                        format!(" {typed}"),
+                        Style::default()
+                            .fg(palette().text)
+                            .bg(palette().select_bg)
+                            .bold(),
+                    ),
+                    Span::styled(
+                        "▏",
+                        Style::default()
+                            .fg(palette().warn)
+                            .bg(palette().select_bg)
+                            .bold(),
+                    ),
+                ]))
+            } else {
+                Cell::from(app.setting_value(field)).style(Style::default().fg(if dimmed {
+                    palette().faint
+                } else {
+                    palette().ok
+                }))
+            };
             Row::new([
                 Cell::from(Line::from(vec![
-                    Span::styled("◇ ", Style::default().fg(palette().alt)),
-                    Span::styled(field.label(), Style::default().fg(palette().text)),
+                    Span::styled(
+                        marker,
+                        Style::default().fg(if dimmed {
+                            palette().faint
+                        } else {
+                            marker_color
+                        }),
+                    ),
+                    Span::styled(field.label(), Style::default().fg(text_color)),
                 ])),
-                Cell::from(field.value(&app.settings)).style(Style::default().fg(palette().ok)),
-                Cell::from(field.unit()).style(Style::default().fg(palette().muted)),
+                value_cell,
+                Cell::from(field.unit()).style(Style::default().fg(if dimmed {
+                    palette().faint
+                } else {
+                    palette().muted
+                })),
             ])
             .style(Style::default().bg(if index.is_multiple_of(2) {
                 palette().surface
@@ -3671,10 +3833,21 @@ fn render_settings(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             }))
         })
         .collect::<Vec<_>>();
-    let title = if app.settings_dirty {
-        " ⚙ DETECTOR MATRIX · UNSAVED CHANGES · Enter edit · s save · r discard/reload "
+    let (title, accent) = if editing.is_some() {
+        (
+            " ⚙ DETECTOR MATRIX · ✎ EDITING · Enter apply · Esc cancel ",
+            palette().warn,
+        )
+    } else if app.settings_dirty {
+        (
+            " ⚙ DETECTOR MATRIX · UNSAVED CHANGES · Enter edit · s save · r discard/reload ",
+            palette().warn,
+        )
     } else {
-        " ⚙ DETECTOR MATRIX · Enter edit · s save · r reload "
+        (
+            " ⚙ DETECTOR MATRIX · Enter edit · s save · r reload ",
+            palette().alt,
+        )
     };
     let table = Table::new(rows, setting_constraints())
         .header(
@@ -3693,7 +3866,7 @@ fn render_settings(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             ])
             .style(
                 Style::default()
-                    .fg(if app.settings_dirty {
+                    .fg(if app.settings_dirty || editing.is_some() {
                         palette().warn
                     } else {
                         palette().alt
@@ -3703,17 +3876,54 @@ fn render_settings(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             )
             .bottom_margin(1),
         )
-        .block(accent_panel(
-            title,
-            if app.settings_dirty {
-                palette().warn
-            } else {
-                palette().alt
-            },
-        ))
+        .block(accent_panel(title, accent))
         .row_highlight_style(row_highlight_style())
         .highlight_symbol("▌ ");
-    frame.render_stateful_widget(table, inset(area), &mut app.setting_state);
+    frame.render_stateful_widget(table, inset(table_area), &mut app.setting_state);
+    render_setting_detail(frame, app, editing.map(|(field, _)| field), detail_area);
+}
+
+/// The plain-language strip under the TUNE table: what the selected (or
+/// edited) setting means for the user, plus whether it is a local client
+/// preference or a service-validated detector setting.
+fn render_setting_detail(
+    frame: &mut Frame<'_>,
+    app: &App,
+    edited: Option<SettingField>,
+    area: Rect,
+) {
+    let selected = app.setting_state.selected().unwrap_or(0);
+    let Some(field) = edited.or_else(|| app.visible_setting_fields().get(selected).copied()) else {
+        return;
+    };
+    let scope = if field.is_client() {
+        Span::styled(
+            "  · local client preference — saved per user, not service-validated",
+            Style::default().fg(palette().info),
+        )
+    } else {
+        Span::styled(
+            "  · service setting — press s to save",
+            Style::default().fg(palette().muted),
+        )
+    };
+    let mut lines = vec![Line::from(vec![
+        Span::styled(field.label(), Style::default().fg(palette().text).bold()),
+        scope,
+    ])];
+    let width = usize::from(area.width.saturating_sub(4)).max(16);
+    for row in wrap_words(field.description(), width) {
+        lines.push(Line::styled(row, Style::default().fg(palette().muted)));
+    }
+    let (title, accent) = if edited.is_some() {
+        (" ✎ EDITING · Enter apply · Esc cancel ", palette().warn)
+    } else {
+        (" ◈ WHAT THIS MEANS ", palette().info)
+    };
+    frame.render_widget(
+        Paragraph::new(lines).block(accent_panel(title, accent)),
+        inset(area),
+    );
 }
 
 /// Key/description rows for both help panes. Descriptions are short enough
@@ -3731,9 +3941,9 @@ const HELP_GLOBAL: [(&str, &str); 11] = [
     ("m", "toggle motion effects"),
     ("t", "vitals / avionics profile"),
     ("q / Ctrl-C", "quit"),
-    ("?", "this page"),
+    ("?", "keys overlay on any page"),
 ];
-const HELP_CONTEXTUAL: [(&str, &str); 15] = [
+const HELP_CONTEXTUAL: [(&str, &str); 16] = [
     ("/", "filter name / path / PID"),
     ("o", "cycle process sort"),
     ("g", "agent-only process focus"),
@@ -3743,6 +3953,7 @@ const HELP_CONTEXTUAL: [(&str, &str); 15] = [
     ("[ / ]", "shorter / longer timeline"),
     ("Enter on Oracle", "ask the systems analyzer"),
     ("h / n on Oracle", "chat history / new chat"),
+    ("y on Oracle", "copy the latest answer"),
     ("[ / ] on Oracle", "fresh evidence window"),
     ("table header click", "sort by clicked column"),
     ("process right-click", "typed-PID confirmation"),
@@ -3763,6 +3974,7 @@ fn render_help(frame: &mut Frame<'_>, area: Rect) {
     global.push(Line::raw(""));
     for hint in [
         "Launch with --theme vitals|avionics to pick a profile.",
+        "t / m choices persist per user; CLI flags override one run.",
         "The collector continues when the TUI exits.",
     ] {
         for row in wrap_words(hint, usize::from(global_width).max(8)) {
@@ -3834,7 +4046,11 @@ fn render_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
         ]),
         InputMode::EditSetting { field, typed } => Line::from(vec![
             Span::styled(
-                format!("{}  ", field.label().to_ascii_uppercase()),
+                " ✎ EDITING  ",
+                Style::default().fg(palette().bg).bg(palette().warn).bold(),
+            ),
+            Span::styled(
+                format!("  {}  ", field.label().to_ascii_uppercase()),
                 Style::default().fg(palette().alt).bold(),
             ),
             Span::raw(typed),
@@ -3913,7 +4129,9 @@ fn normal_footer(page: Page) -> Line<'static> {
         Page::Tree => "j/k trace  ·  r rebuild  ·  x terminate",
         Page::Alerts => "j/k inspect  ·  a acknowledge  ·  i investigate  ·  r refresh",
         Page::Timeline => "[ ] window  ·  r reload",
-        Page::Analyzer => "Enter ask  ·  n new  ·  h history  ·  [ ] evidence  ·  j/k scroll",
+        Page::Analyzer => {
+            "Enter ask  ·  n new  ·  h history  ·  y copy  ·  [ ] evidence  ·  j/k scroll"
+        }
         Page::Settings => "Enter edit  ·  s commit  ·  r revert",
         Page::Help => "1–8 route  ·  Tab cycle",
     };
@@ -3935,7 +4153,7 @@ fn normal_footer(page: Page) -> Line<'static> {
         key_badge("m"),
         Span::styled(" motion  ", Style::default().fg(palette().muted)),
         key_badge("?"),
-        Span::styled(" manual  ", Style::default().fg(palette().muted)),
+        Span::styled(" keys  ", Style::default().fg(palette().muted)),
         key_badge("q"),
         Span::styled(" exit", Style::default().fg(palette().muted)),
     ])
@@ -4375,8 +4593,9 @@ mod tests {
                 .content()
                 .iter()
                 .enumerate()
-                .any(|(index, cell)| (index / width) as u16 == user_row
-                    && cell.fg == palette().text)
+                .any(
+                    |(index, cell)| (index / width) as u16 == user_row && cell.fg == palette().text
+                )
         );
     }
 
@@ -4666,8 +4885,8 @@ mod tests {
             Some(ProcessSort::Threads | ProcessSort::Age)
         )));
         assert!(
-            (table.x..table.right()).any(|x| process_sort_at(table, x)
-                == Some(ProcessSort::Handles))
+            (table.x..table.right())
+                .any(|x| process_sort_at(table, x) == Some(ProcessSort::Handles))
         );
     }
 
@@ -4917,6 +5136,116 @@ mod tests {
                 assert_ne!(row.trim(), orphan, "orphan row {orphan:?} at y={y}");
             }
         }
+    }
+
+    #[test]
+    fn settings_edit_mode_renders_band_badge_cursor_and_dims_the_rest() {
+        for theme_id in [theme::ThemeId::Vitals, theme::ThemeId::Avionics] {
+            let _theme = theme::test_support::activate(theme_id);
+            let mut app = sample_app();
+            app.page = Page::Settings;
+            let index = app
+                .visible_setting_fields()
+                .iter()
+                .position(|field| *field == SettingField::Sustained)
+                .expect("Sustained row");
+            app.setting_state.select(Some(index));
+            app.mode = InputMode::EditSetting {
+                field: SettingField::Sustained,
+                typed: "7".into(),
+            };
+            let backend = render(&mut app);
+            let text = buffer_text(backend.buffer());
+            // The EDITING badge and the apply/cancel hint are unmissable.
+            assert!(text.contains("✎ EDITING"), "{theme_id:?}");
+            assert!(text.contains("Enter apply · Esc cancel"), "{theme_id:?}");
+            let width = usize::from(backend.buffer().area.width);
+            let edited_row = (0..backend.buffer().area.height)
+                .find(|y| row_text(backend.buffer(), *y).contains("Sustained samples"))
+                .expect("edited row visible");
+            // The VALUE cell is an input band: typed text on select_bg with a
+            // visible caret glyph. (The row-highlight patch owns the fg on
+            // the selected row, so the glyph and band bg are the contract.)
+            assert!(
+                backend
+                    .buffer()
+                    .content()
+                    .iter()
+                    .enumerate()
+                    .any(|(index, cell)| (index / width) as u16 == edited_row
+                        && cell.symbol() == "▏"
+                        && cell.bg == palette().select_bg),
+                "{theme_id:?}: caret missing from the value band"
+            );
+            // Unedited rows recede so the eye lands on the edit.
+            let dim_row = (0..backend.buffer().area.height)
+                .find(|y| row_text(backend.buffer(), *y).contains("Sample interval"))
+                .expect("unedited row visible");
+            assert!(
+                backend
+                    .buffer()
+                    .content()
+                    .iter()
+                    .enumerate()
+                    .any(|(index, cell)| (index / width) as u16 == dim_row
+                        && cell.fg == palette().faint),
+                "{theme_id:?}: unedited rows must dim"
+            );
+        }
+    }
+
+    #[test]
+    fn settings_detail_strip_translates_the_selected_setting() {
+        let _theme = theme::test_support::activate(theme::ThemeId::Vitals);
+        let mut app = sample_app();
+        app.page = Page::Settings;
+        let index = app
+            .visible_setting_fields()
+            .iter()
+            .position(|field| *field == SettingField::Sustained)
+            .expect("Sustained row");
+        app.setting_state.select(Some(index));
+        let text = buffer_text(render(&mut app).buffer());
+        assert!(text.contains("WHAT THIS MEANS"));
+        assert!(text.contains("checks in a row"));
+        assert!(text.contains("service setting"));
+        // Client rows announce that they are local, not service-validated.
+        app.setting_state.select(Some(0));
+        let text = buffer_text(render(&mut app).buffer());
+        assert!(text.contains("Theme profile"));
+        assert!(text.contains("local client preference"));
+        assert!(text.contains("not service-validated"));
+    }
+
+    #[test]
+    fn keys_overlay_floats_above_the_page_without_replacing_it() {
+        let _theme = theme::test_support::activate(theme::ThemeId::Vitals);
+        let mut app = sample_app();
+        assert_eq!(app.page, Page::Overview);
+        app.help_overlay = Some(0);
+        let backend = render(&mut app);
+        let text = buffer_text(backend.buffer());
+        // The overlay shows the same keys content the Keys page carries…
+        assert!(text.contains("? KEYS"));
+        assert!(text.contains("jump to a page"));
+        assert!(text.contains("copy the latest answer"));
+        // …while the page beneath is unchanged and still peeking out.
+        assert_eq!(app.page, Page::Overview);
+        assert!(text.contains("PRESSURE FIELD"));
+        // A click dismisses it instead of reaching the page.
+        let area = Rect::new(0, 0, 150, 46);
+        assert!(handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 5,
+                row: 5,
+                modifiers: ratatui::crossterm::event::KeyModifiers::NONE,
+            },
+            area,
+        ));
+        assert_eq!(app.help_overlay, None);
+        assert_eq!(app.page, Page::Overview);
     }
 
     #[test]

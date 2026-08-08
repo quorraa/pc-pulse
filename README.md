@@ -54,7 +54,7 @@ The TUI has eight views:
 4. **Findings** — active/resolved history with ownership, explanation, evidence, and recommendations.
 5. **Timeline** — persisted CPU, memory, and disk-latency charts over configurable windows.
 6. **Oracle** — an internal evidence-aware chat with the dedicated systems analyzer, its proposed safe actions, and the live Windows diagnostic feed.
-7. **Settings** — all detector thresholds, sustained-sample rules, baseline deviation, agent patterns, and notification state.
+7. **Settings** — all detector thresholds, sustained-sample rules, baseline deviation, agent patterns, and notification state, each explained in a plain-language strip under the table, plus a local CLIENT section (theme, motion effects, Oracle time budget) saved per user rather than through the service.
 8. **Keys** — the complete keyboard reference.
 
 Important keys:
@@ -75,12 +75,14 @@ Important keys:
 | `[` / `]` on Oracle | Change the fresh evidence window (1–24 hours) |
 | `n` or `c` on Oracle | Begin a new chat while retaining the previous session in Chat Vault |
 | `h` on Oracle | Focus Chat Vault; use `j`/`k` and `Enter` to restore a previous chat |
+| `y` on Oracle | Copy the latest analyzer answer to the Windows clipboard |
 | `Esc` while analyzing | Cancel the current Codex run |
 | `Enter` / `e` | Edit the selected setting |
 | `s` | Save settings |
 | `r` | Refresh the current view |
-| `m` | Toggle finite TachyonFX motion effects |
-| `t` | Cycle presentation profiles (vitals / avionics) |
+| `m` | Toggle finite TachyonFX motion effects; the choice is saved per user |
+| `t` | Cycle presentation profiles (vitals / avionics); the choice is saved per user |
+| `?` | Open the keys overlay on top of any page; `Esc`, `?`, or a click closes it (the Keys page itself stays on `8`) |
 | `q` / `Ctrl-C` | Exit the TUI; the collector continues |
 | Left-click | Select tabs, process/tree/finding rows, settings, or the Oracle prompt |
 | Click any table header | Sort the overview suspects, processes, lineage rows, findings, or settings by that column |
@@ -238,9 +240,10 @@ History and settings remain local:
 %ProgramData%\PcPulse\history.db
 %ProgramData%\PcPulse\settings.json
 %LOCALAPPDATA%\PcPulse\chat-history.json
+%LOCALAPPDATA%\PcPulse\ui-prefs.json
 ```
 
-SQLite uses WAL mode, normal durability, bounded sample persistence, daily cleanup, and configurable 1–365 day retention. Chat history is per-user, atomically replaced, and bounded to 24 sessions with 16 messages per session. It stores the conversation and validated response—not raw evidence bundles or Windows event records. The collector itself has no network path; only an explicit Oracle/analyze request sends its redacted evidence bundle to the authenticated Codex session.
+SQLite uses WAL mode, normal durability, bounded sample persistence, daily cleanup, and configurable 1–365 day retention. Client preferences (`ui-prefs.json`: theme, motion effects, Oracle time budget) are per-user and atomically replaced; `--theme` and `--no-effects` override them for one run without rewriting them. Chat history is per-user, atomically replaced, and bounded to 24 sessions with 16 messages per session. It stores the conversation and validated response—not raw evidence bundles or Windows event records. The collector itself has no network path; only an explicit Oracle/analyze request sends its redacted evidence bundle to the authenticated Codex session.
 
 Diagnostic event fields are bounded and redacted before persistence. User-profile segments become `%USERPROFILE%`; credential-like fields and inline secret arguments are removed. PC Pulse does not collect the Security event log, process command lines, environment variables, file contents, browser data, or keystrokes. The optional systems analyzer sends only the explicit redacted evidence bundle and bounded conversation to the user's ChatGPT-authenticated Codex session when the user submits a question or runs `analyze`.
 

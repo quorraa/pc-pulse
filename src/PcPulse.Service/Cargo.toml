@@ -25,6 +25,9 @@ serde_json = "1.0"
 uuid = { version = "1.18", features = ["v4"] }
 windows-service = "0.8"
 
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
+
 [dependencies.windows]
 version = "0.62"
 features = [

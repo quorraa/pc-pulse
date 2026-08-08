@@ -23,9 +23,10 @@ use windows::{
             },
             WindowsAndMessaging::{
                 CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW, DispatchMessageW,
-                GetMessageW, HWND_MESSAGE, IDI_INFORMATION, LoadIconW, MSG, PostQuitMessage,
-                RegisterClassW, TranslateMessage, WINDOW_EX_STYLE, WM_APP, WM_CLOSE, WM_DESTROY,
-                WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_RBUTTONUP, WNDCLASSW, WS_OVERLAPPED,
+                GetMessageW, GetSystemMetrics, HICON, HWND_MESSAGE, IDI_INFORMATION, IMAGE_ICON,
+                LR_DEFAULTCOLOR, LoadIconW, LoadImageW, MSG, PostQuitMessage, RegisterClassW,
+                SM_CXSMICON, SM_CYSMICON, TranslateMessage, WINDOW_EX_STYLE, WM_APP, WM_CLOSE,
+                WM_DESTROY, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_RBUTTONUP, WNDCLASSW, WS_OVERLAPPED,
             },
         },
     },
@@ -33,6 +34,10 @@ use windows::{
 };
 
 const ICON_ID: u32 = 1;
+/// Resource id of the icon embedded by build.rs: winresource registers
+/// docs/media/pcpulse.ico as the executable's first icon resource with the
+/// numeric id 1 (`1 ICON "pcpulse.ico"` in its generated resource script).
+const TRAY_ICON_RESOURCE_ID: usize = 1;
 const CALLBACK_MESSAGE: u32 = WM_APP + 42;
 static EXITING: AtomicBool = AtomicBool::new(false);
 
@@ -121,10 +126,33 @@ unsafe extern "system" fn window_proc(
     }
 }
 
+fn load_tray_icon() -> Result<HICON> {
+    // Prefer the PC Pulse badge icon embedded in this executable's resources.
+    if let Ok(module) = unsafe { GetModuleHandleW(None) } {
+        let embedded = unsafe {
+            LoadImageW(
+                Some(HINSTANCE(module.0)),
+                PCWSTR(TRAY_ICON_RESOURCE_ID as *const u16),
+                IMAGE_ICON,
+                GetSystemMetrics(SM_CXSMICON),
+                GetSystemMetrics(SM_CYSMICON),
+                LR_DEFAULTCOLOR,
+            )
+        };
+        if let Ok(handle) = embedded
+            && !handle.is_invalid()
+        {
+            return Ok(HICON(handle.0));
+        }
+    }
+    // Fallback: the stock information icon, as before branding.
+    unsafe { LoadIconW(None, IDI_INFORMATION) }.context("LoadIconW failed")
+}
+
 fn add_icon(window: HWND) -> Result<()> {
     let mut data = base_icon_data(window);
     data.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
-    data.hIcon = unsafe { LoadIconW(None, IDI_INFORMATION) }.context("LoadIconW failed")?;
+    data.hIcon = load_tray_icon()?;
     copy_wide(
         &mut data.szTip,
         "PC Pulse — double-click to open; right-click to exit",

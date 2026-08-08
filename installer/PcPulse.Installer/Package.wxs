@@ -5,6 +5,11 @@
     <MajorUpgrade DowngradeErrorMessage="A newer version of PC Pulse is already installed." />
     <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
 
+    <!-- Icon Id carries an .exe suffix so ICE50 accepts it on the advertised
+         Start Menu shortcut, whose key file is PcPulse.exe. -->
+    <Icon Id="PcPulseIcon.exe" SourceFile="..\..\docs\media\pcpulse.ico" />
+    <Property Id="ARPPRODUCTICON" Value="PcPulseIcon.exe" />
+
     <Feature Id="MainFeature" Title="PC Pulse" Level="1">
       <ComponentGroupRef Id="ProductComponents" />
     </Feature>
@@ -31,7 +36,8 @@
       <Component Id="TuiComponent" Guid="1E774D95-3925-423E-9060-F4D49AFB1952" Bitness="always64">
         <File Id="TuiExe" Source="..\..\artifacts\publish\PcPulse.exe" KeyPath="yes">
           <Shortcut Id="StartMenuShortcut" Directory="ProgramsFolder" Name="PC Pulse"
-                    Description="Keyboard-first Windows performance monitor" WorkingDirectory="INSTALLFOLDER" Advertise="yes" />
+                    Description="Keyboard-first Windows performance monitor" WorkingDirectory="INSTALLFOLDER"
+                    Icon="PcPulseIcon.exe" Advertise="yes" />
         </File>
         <RegistryValue Root="HKLM" Key="Software\PC Pulse" Name="InstallPath"
                        Type="string" Value="[INSTALLFOLDER]" />
