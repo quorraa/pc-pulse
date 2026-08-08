@@ -261,6 +261,7 @@ fn run_loop(
                         && key.code == KeyCode::Char('m')
                         && matches!(app.mode, InputMode::Normal)
                         && app.help_overlay.is_none()
+                        && app.vault_rename.is_none()
                     {
                         motion_enabled = motion.toggle();
                         app.status = format!(
@@ -282,6 +283,7 @@ fn run_loop(
                         && key.code == KeyCode::Char('t')
                         && matches!(app.mode, InputMode::Normal)
                         && app.help_overlay.is_none()
+                        && app.vault_rename.is_none()
                     {
                         let active = theme::cycle();
                         app.status = format!("Theme: {} · saved for your user", active.name);

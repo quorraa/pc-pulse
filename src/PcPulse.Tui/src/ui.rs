@@ -126,6 +126,17 @@ pub fn handle_mouse(app: &mut App, event: MouseEvent, area: Rect) -> bool {
             _ => false,
         };
     }
+    // The vault rename band owns input the same way: a click dismisses it
+    // like Esc, and nothing reaches the page underneath.
+    if app.vault_rename.is_some() {
+        return match event.kind {
+            MouseEventKind::Down(_) => {
+                app.vault_rename = None;
+                true
+            }
+            _ => false,
+        };
+    }
     let mut chat_dismissed = false;
     if matches!(app.mode, InputMode::Chat(_)) {
         if let MouseEventKind::Down(MouseButton::Left) = event.kind {
@@ -1072,7 +1083,7 @@ fn rail_input_line(app: &App) -> Line<'static> {
                 Page::Tree => "j/k r x",
                 Page::Alerts => "j/k a i r",
                 Page::Timeline => "[ ] r",
-                Page::Analyzer => "↵ ask n h y",
+                Page::Analyzer => "↵ ask e n h y",
                 Page::Settings => "↵ edit s",
                 Page::Help => "1–8 Tab",
             };
@@ -2884,9 +2895,38 @@ fn render_chat_history(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     } else {
         palette().alt
     };
+    let title = if app.vault_rename.is_some() {
+        " ◇ CHAT VAULT · ✎ rename "
+    } else if app.chat_history_focused {
+        " ◇ CHAT VAULT "
+    } else {
+        " ◇ CHAT VAULT · h focus · n new "
+    };
+    let mut block = accent_panel(title, accent);
+    if let Some(typed) = &app.vault_rename {
+        // Inline rename band, pinned to the panel's bottom edge next to the
+        // selected row — the same edit-band grammar as the TUNE editor.
+        block = block.title_bottom(Line::from(vec![
+            Span::styled(
+                " ✎ ",
+                Style::default().fg(palette().bg).bg(palette().warn).bold(),
+            ),
+            Span::styled(
+                format!(" {typed}"),
+                Style::default().fg(palette().text).bold(),
+            ),
+            Span::styled("█", Style::default().fg(palette().warn)),
+            Span::styled(" ↵ apply · Esc ", Style::default().fg(palette().muted)),
+        ]));
+    } else if app.chat_history_focused {
+        block = block.title_bottom(Line::styled(
+            " ↵ restore · r rename · d delete ",
+            Style::default().fg(palette().muted),
+        ));
+    }
     frame.render_stateful_widget(
         List::new(items)
-            .block(accent_panel(" ◇ CHAT VAULT · h focus · n new ", accent))
+            .block(block)
             .highlight_style(Style::default().fg(palette().bg).bg(accent).bold())
             .highlight_symbol("▌ "),
         area,
@@ -3036,6 +3076,209 @@ fn analyst_core_stats(app: &App, width: u16) -> String {
         .unwrap_or_else(|| candidates[candidates.len() - 1].clone())
 }
 
+/// What the analyzer wait line claims to be doing right now. The phases stay
+/// honest about the pipeline: evidence is collected first, then correlated
+/// into the bundle, then the model is consulted for the rest of the run.
+/// `Writing` exists for the final compose step, but its start is not knowable
+/// client-side, so [`analyzer_phase`] keeps `Consulting` as the terminal
+/// loop and `Writing` stays available to callers that do know.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnalyzerPhase {
+    Reading,
+    Correlating,
+    Consulting,
+    Writing,
+}
+
+const READING_PHRASE: &str = "reading fresh evidence: samples, findings, and event logs…";
+const CORRELATING_PHRASE: &str =
+    "correlating processes, incidents, baselines, and event logs…";
+const CONSULTING_PHRASE: &str = "consulting the analyst over your Codex session…";
+const WRITING_PHRASE: &str = "writing the validated answer…";
+
+/// Bright scanner window width (chars) and sweep step for the reading phase.
+const SCANNER_WINDOW: usize = 4;
+const SCANNER_STEP_MS: u64 = 150;
+/// One correlating segment holds its pulse for this long.
+const PULSE_BEAT_MS: u64 = 600;
+/// Full muted→bright→muted breath while consulting.
+const BREATH_PERIOD_MS: u64 = 2400;
+/// Typewriter cadence and the full-reveal pause (in character steps).
+const TYPE_STEP_MS: u64 = 90;
+const TYPE_HOLD_STEPS: u64 = 14;
+
+/// The wait-line phase for a given elapsed time. Purely elapsed-driven: the
+/// evidence bundle is built during the first seconds, correlated next, and
+/// the model consult dominates the remainder of the budget.
+pub fn analyzer_phase(elapsed_ms: u64) -> AnalyzerPhase {
+    match elapsed_ms {
+        0..3_000 => AnalyzerPhase::Reading,
+        3_000..8_000 => AnalyzerPhase::Correlating,
+        _ => AnalyzerPhase::Consulting,
+    }
+}
+
+/// The animated wait-line body: pure function of phase, elapsed milliseconds,
+/// the timeout budget (consulting ticker only), and the columns available for
+/// the phrase. Every frame keeps the phrase legible — only the typewriter's
+/// not-yet-revealed tail is hidden — and derives deterministically from
+/// `elapsed_ms`, so tests can assert exact frames.
+pub fn analyzer_pending_spans(
+    phase: AnalyzerPhase,
+    elapsed_ms: u64,
+    budget_secs: u64,
+    width: u16,
+) -> Vec<Span<'static>> {
+    match phase {
+        AnalyzerPhase::Reading => scanner_spans(READING_PHRASE, elapsed_ms, width),
+        AnalyzerPhase::Correlating => pulse_spans(CORRELATING_PHRASE, elapsed_ms, width),
+        AnalyzerPhase::Consulting => {
+            breathing_spans(CONSULTING_PHRASE, elapsed_ms, budget_secs, width)
+        }
+        AnalyzerPhase::Writing => typewriter_spans(WRITING_PHRASE, elapsed_ms, width),
+    }
+}
+
+/// The phrase, bounded to the pane so the animation reads on one row.
+fn fit_phrase(phrase: &str, width: u16) -> Vec<char> {
+    format::truncate(phrase, usize::from(width).max(12))
+        .chars()
+        .collect()
+}
+
+/// Group consecutive same-styled characters into spans.
+fn styled_runs(chars: &[char], style_at: impl Fn(usize) -> Style) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    let mut run = String::new();
+    let mut current: Option<Style> = None;
+    for (index, character) in chars.iter().enumerate() {
+        let style = style_at(index);
+        if current != Some(style) {
+            if let Some(style) = current.take()
+                && !run.is_empty()
+            {
+                spans.push(Span::styled(std::mem::take(&mut run), style));
+            }
+            current = Some(style);
+        }
+        run.push(*character);
+    }
+    if let Some(style) = current
+        && !run.is_empty()
+    {
+        spans.push(Span::styled(run, style));
+    }
+    spans
+}
+
+/// Reading: a 4-char bright window sweeps left-to-right across the phrase —
+/// a scanner passing over the evidence. Outside the window the words stay
+/// muted but fully readable.
+fn scanner_spans(phrase: &str, elapsed_ms: u64, width: u16) -> Vec<Span<'static>> {
+    let chars = fit_phrase(phrase, width);
+    let period = (chars.len() + SCANNER_WINDOW).max(1) as u64;
+    let head = ((elapsed_ms / SCANNER_STEP_MS) % period) as usize;
+    styled_runs(&chars, |index| {
+        if index < head && index + SCANNER_WINDOW >= head {
+            Style::default().fg(palette().info).bold()
+        } else {
+            Style::default().fg(palette().muted)
+        }
+    })
+}
+
+/// Correlating: the comma-separated evidence sources take turns holding a
+/// bold ok-colored beat while the rest stay muted — cross-referencing.
+fn pulse_spans(phrase: &str, elapsed_ms: u64, width: u16) -> Vec<Span<'static>> {
+    let text: String = fit_phrase(phrase, width).into_iter().collect();
+    let segments: Vec<&str> = text.split(", ").collect();
+    let active = ((elapsed_ms / PULSE_BEAT_MS) as usize) % segments.len().max(1);
+    let mut spans = Vec::new();
+    for (index, segment) in segments.iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::styled(
+                ", ".to_string(),
+                Style::default().fg(palette().muted),
+            ));
+        }
+        let style = if index == active {
+            Style::default().fg(palette().ok).bold()
+        } else {
+            Style::default().fg(palette().muted)
+        };
+        spans.push(Span::styled((*segment).to_string(), style));
+    }
+    spans
+}
+
+/// Blend two palette RGB colors; `level` 0 is `from`, 1 is `to`.
+fn mix_rgb(from: Color, to: Color, level: f64) -> Color {
+    let level = level.clamp(0.0, 1.0);
+    match (from, to) {
+        (Color::Rgb(r0, g0, b0), Color::Rgb(r1, g1, b1)) => {
+            let mix = |a: u8, b: u8| {
+                (f64::from(a) + (f64::from(b) - f64::from(a)) * level).round() as u8
+            };
+            Color::Rgb(mix(r0, r1), mix(g0, g1), mix(b0, b1))
+        }
+        _ => to,
+    }
+}
+
+/// Consulting: the whole phrase breathes between muted and full text
+/// brightness on a cosine ease, with the elapsed/budget ticker beside it —
+/// the slow wait on the model, clock in view.
+fn breathing_spans(
+    phrase: &str,
+    elapsed_ms: u64,
+    budget_secs: u64,
+    width: u16,
+) -> Vec<Span<'static>> {
+    let text: String = fit_phrase(phrase, width).into_iter().collect();
+    let turn = (elapsed_ms % BREATH_PERIOD_MS) as f64 / BREATH_PERIOD_MS as f64;
+    let level = 0.5 - 0.5 * (turn * std::f64::consts::TAU).cos();
+    let elapsed_secs = elapsed_ms / 1_000;
+    vec![
+        Span::styled(
+            text,
+            Style::default().fg(mix_rgb(palette().muted, palette().text, level)),
+        ),
+        Span::styled(
+            format!(
+                " · {}m{}s / {}m{}s",
+                elapsed_secs / 60,
+                elapsed_secs % 60,
+                budget_secs / 60,
+                budget_secs % 60
+            ),
+            Style::default().fg(palette().faint),
+        ),
+    ]
+}
+
+/// Writing: characters reveal progressively behind a block caret; revealed
+/// text is fully readable, only the not-yet-revealed tail is hidden. Loops
+/// after a pause at full reveal.
+fn typewriter_spans(phrase: &str, elapsed_ms: u64, width: u16) -> Vec<Span<'static>> {
+    let chars = fit_phrase(phrase, width);
+    let cycle = (chars.len() as u64 + TYPE_HOLD_STEPS).max(1);
+    let revealed = (((elapsed_ms / TYPE_STEP_MS) % cycle) as usize).min(chars.len());
+    let mut spans = Vec::new();
+    if revealed > 0 {
+        spans.push(Span::styled(
+            chars[..revealed].iter().collect::<String>(),
+            Style::default().fg(palette().text),
+        ));
+    }
+    if revealed < chars.len() {
+        spans.push(Span::styled(
+            "▌".to_string(),
+            Style::default().fg(palette().info).bold(),
+        ));
+    }
+    spans
+}
+
 fn render_chat_transcript(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let mut lines = Vec::new();
     if app.chat_messages.is_empty() {
@@ -3088,16 +3331,25 @@ fn render_chat_transcript(frame: &mut Frame<'_>, app: &App, area: Rect) {
         }
     }
     if app.analyzer_running {
-        lines.push(Line::from(vec![
+        // The wait line mimics the pipeline phase it is in; every frame is a
+        // pure function of the elapsed time, redrawn by the main loop's
+        // ~4 fps analyzer repaint. The ANALYST badge itself stays static.
+        let elapsed_ms = app.analyzer_elapsed_ms().unwrap_or(0);
+        let budget_secs = app.analyzer_progress().map_or(0, |(_, budget)| budget);
+        let mut pending = vec![
             Span::styled(
                 " ANALYST ",
                 Style::default().fg(palette().bg).bg(palette().warn).bold(),
             ),
-            Span::styled(
-                "  ░ correlating processes, incidents, baselines, and event logs…",
-                Style::default().fg(palette().warn),
-            ),
-        ]));
+            Span::styled("  ░ ", Style::default().fg(palette().warn)),
+        ];
+        pending.extend(analyzer_pending_spans(
+            analyzer_phase(elapsed_ms),
+            elapsed_ms,
+            budget_secs,
+            area.width.saturating_sub(16),
+        ));
+        lines.push(Line::from(pending));
     }
     let mut block = accent_panel(" ◈ INTERROGATION CHANNEL ", palette().alt);
     if let Some(error) = &app.analyzer_last_error {
@@ -3964,7 +4216,7 @@ const HELP_GLOBAL: [(&str, &str); 11] = [
     ("q / Ctrl-C", "quit"),
     ("?", "keys overlay on any page"),
 ];
-const HELP_CONTEXTUAL: [(&str, &str); 16] = [
+const HELP_CONTEXTUAL: [(&str, &str); 19] = [
     ("/", "filter name / path / PID"),
     ("o", "cycle process sort"),
     ("g", "agent-only process focus"),
@@ -3973,7 +4225,10 @@ const HELP_CONTEXTUAL: [(&str, &str); 16] = [
     ("i", "investigate the selected finding in Oracle"),
     ("[ / ]", "shorter / longer timeline"),
     ("Enter on Oracle", "ask the systems analyzer"),
+    ("e on Oracle", "edit + resubmit your last question"),
     ("h / n on Oracle", "chat history / new chat"),
+    ("r / F2 in Chat Vault", "rename the selected chat"),
+    ("d / Del in Chat Vault", "delete the selected chat (press twice)"),
     ("y on Oracle", "copy the latest answer"),
     ("[ / ] on Oracle", "fresh evidence window"),
     ("table header click", "sort by clicked column"),
@@ -4151,7 +4406,7 @@ fn normal_footer(page: Page) -> Line<'static> {
         Page::Alerts => "j/k inspect  ·  a acknowledge  ·  i investigate  ·  r refresh",
         Page::Timeline => "[ ] window  ·  r reload",
         Page::Analyzer => {
-            "Enter ask  ·  n new  ·  h history  ·  y copy  ·  [ ] evidence  ·  j/k scroll"
+            "Enter ask  ·  e edit last  ·  n new  ·  h vault (r rename · d delete)  ·  y copy  ·  [ ] evidence"
         }
         Page::Settings => "Enter edit  ·  s commit  ·  r revert",
         Page::Help => "1–8 route  ·  Tab cycle",
@@ -4670,6 +4925,165 @@ mod tests {
         let text = buffer_text(render(&mut app).buffer());
         assert!(!text.contains("analyzing 0m0s"));
         assert!(text.contains("saved"));
+    }
+
+    fn spans_text(spans: &[Span<'_>]) -> String {
+        spans.iter().map(|span| span.content.as_ref()).collect()
+    }
+
+    fn text_with_fg(spans: &[Span<'_>], color: Color) -> String {
+        spans
+            .iter()
+            .filter(|span| span.style.fg == Some(color))
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    #[test]
+    fn analyzer_phases_advance_by_elapsed_and_hold_at_consulting() {
+        assert_eq!(analyzer_phase(0), AnalyzerPhase::Reading);
+        assert_eq!(analyzer_phase(2_999), AnalyzerPhase::Reading);
+        assert_eq!(analyzer_phase(3_000), AnalyzerPhase::Correlating);
+        assert_eq!(analyzer_phase(7_999), AnalyzerPhase::Correlating);
+        assert_eq!(analyzer_phase(8_000), AnalyzerPhase::Consulting);
+        // Terminal loop: writing is not knowable client-side.
+        assert_eq!(analyzer_phase(600_000), AnalyzerPhase::Consulting);
+    }
+
+    #[test]
+    fn reading_scanner_window_sweeps_while_the_phrase_stays_whole() {
+        let _theme = theme::test_support::activate(theme::ThemeId::Vitals);
+        let early = analyzer_pending_spans(AnalyzerPhase::Reading, 600, 300, 80);
+        let later = analyzer_pending_spans(AnalyzerPhase::Reading, 1_500, 300, 80);
+        // The full phrase is present in every frame.
+        assert_eq!(spans_text(&early), READING_PHRASE);
+        assert_eq!(spans_text(&later), READING_PHRASE);
+        // 600 ms / 150 ms-per-step puts the 4-char window over "read";
+        // 1500 ms has swept it forward to "g fr".
+        assert_eq!(text_with_fg(&early, palette().info), "read");
+        assert_eq!(text_with_fg(&later, palette().info), "g fr");
+        // Everything outside the window stays muted-readable.
+        assert_eq!(
+            text_with_fg(&early, palette().muted),
+            &READING_PHRASE[4..]
+        );
+    }
+
+    #[test]
+    fn correlating_segments_take_turns_pulsing() {
+        let _theme = theme::test_support::activate(theme::ThemeId::Vitals);
+        let beat0 = analyzer_pending_spans(AnalyzerPhase::Correlating, 0, 300, 80);
+        let beat1 = analyzer_pending_spans(AnalyzerPhase::Correlating, 600, 300, 80);
+        let beat2 = analyzer_pending_spans(AnalyzerPhase::Correlating, 1_200, 300, 80);
+        for frame in [&beat0, &beat1, &beat2] {
+            assert_eq!(spans_text(frame), CORRELATING_PHRASE);
+        }
+        assert_eq!(text_with_fg(&beat0, palette().ok), "correlating processes");
+        assert_eq!(text_with_fg(&beat1, palette().ok), "incidents");
+        assert_eq!(text_with_fg(&beat2, palette().ok), "baselines");
+        // The pulse wraps back to the first segment after the last one.
+        let wrapped = analyzer_pending_spans(AnalyzerPhase::Correlating, 2_400, 300, 80);
+        assert_eq!(
+            text_with_fg(&wrapped, palette().ok),
+            "correlating processes"
+        );
+    }
+
+    #[test]
+    fn consulting_breathes_between_muted_and_text_with_the_ticker_beside() {
+        let _theme = theme::test_support::activate(theme::ThemeId::Vitals);
+        // Cycle start rests at muted; mid-cycle peaks at full text brightness.
+        let rest = analyzer_pending_spans(AnalyzerPhase::Consulting, 0, 300, 80);
+        assert_eq!(rest[0].style.fg, Some(palette().muted));
+        let peak = analyzer_pending_spans(AnalyzerPhase::Consulting, 1_200, 300, 80);
+        assert_eq!(peak[0].style.fg, Some(palette().text));
+        // The words never change, and the elapsed/budget ticker rides along.
+        assert_eq!(rest[0].content.as_ref(), CONSULTING_PHRASE);
+        assert_eq!(spans_text(&peak), format!("{CONSULTING_PHRASE} · 0m1s / 5m0s"));
+        let deep = analyzer_pending_spans(AnalyzerPhase::Consulting, 154_000, 300, 80);
+        assert!(spans_text(&deep).ends_with(" · 2m34s / 5m0s"));
+    }
+
+    #[test]
+    fn writing_typewriter_reveals_monotonically_and_pauses_at_full() {
+        let _theme = theme::test_support::activate(theme::ThemeId::Vitals);
+        let phrase_len = WRITING_PHRASE.chars().count();
+        let mut previous = 0;
+        for elapsed in (0..2_700).step_by(450) {
+            let frame = analyzer_pending_spans(AnalyzerPhase::Writing, elapsed, 300, 80);
+            let revealed: String = text_with_fg(&frame, palette().text);
+            // Only ever a prefix of the phrase — never garbled tail text.
+            assert!(WRITING_PHRASE.starts_with(&revealed), "{elapsed}ms");
+            assert!(revealed.chars().count() >= previous, "{elapsed}ms");
+            previous = revealed.chars().count();
+            if previous < phrase_len {
+                assert_eq!(spans_text(&frame), format!("{revealed}▌"));
+                let caret = frame.last().expect("caret span");
+                assert_eq!(caret.style.fg, Some(palette().info));
+            }
+        }
+        // Fully revealed: the caret rests and the whole phrase reads.
+        let held = analyzer_pending_spans(
+            AnalyzerPhase::Writing,
+            phrase_len as u64 * TYPE_STEP_MS + 90,
+            300,
+            80,
+        );
+        assert_eq!(spans_text(&held), WRITING_PHRASE);
+        // The loop restarts after the hold.
+        let cycle_ms = (phrase_len as u64 + TYPE_HOLD_STEPS) * TYPE_STEP_MS;
+        let looped = analyzer_pending_spans(AnalyzerPhase::Writing, cycle_ms + 450, 300, 80);
+        assert!(spans_text(&looped).chars().count() < phrase_len);
+    }
+
+    #[test]
+    fn vault_focus_hints_and_rename_band_render_in_the_vault_panel() {
+        let _theme = theme::test_support::activate(theme::ThemeId::Vitals);
+        let mut app = sample_app();
+        app.page = Page::Analyzer;
+        // Unfocused: the original focus hint; no vault action hints yet.
+        let text = buffer_text(render(&mut app).buffer());
+        assert!(text.contains("h focus"));
+        assert!(!text.contains("↵ restore"));
+        // Focused: restore/rename/delete hints appear on the panel.
+        app.chat_history_focused = true;
+        let text = buffer_text(render(&mut app).buffer());
+        assert!(text.contains("↵ restore · r rename · d delete"));
+        // Renaming: the edit band with the typed title and caret takes over.
+        app.vault_rename = Some("Morning hunt".into());
+        let text = buffer_text(render(&mut app).buffer());
+        assert!(text.contains("✎ rename"));
+        assert!(text.contains("Morning hunt█"));
+        assert!(text.contains("↵ apply · Esc"));
+        // A click anywhere dismisses the band without reaching the page.
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 2,
+            row: 2,
+            modifiers: ratatui::crossterm::event::KeyModifiers::NONE,
+        };
+        assert!(handle_mouse(&mut app, click, Rect::new(0, 0, 150, 46)));
+        assert!(app.vault_rename.is_none());
+        assert_eq!(app.page, Page::Analyzer);
+    }
+
+    #[test]
+    fn running_transcript_animates_the_reading_phase_behind_a_static_badge() {
+        let _theme = theme::test_support::activate(theme::ThemeId::Vitals);
+        let mut app = sample_app();
+        app.page = Page::Analyzer;
+        app.analyzer_running = true;
+        app.analyzer_started_at = Some(std::time::Instant::now());
+        let backend = render(&mut app);
+        let text = buffer_text(backend.buffer());
+        // Fresh submission: the wait line is in the reading phase, and the
+        // static ANALYST badge introduces it.
+        assert!(text.contains("reading fresh evidence"));
+        assert!(!text.contains("correlating processes"));
+        let badge_row = (0..backend.buffer().area.height)
+            .find(|y| row_text(backend.buffer(), *y).contains("reading fresh evidence"))
+            .expect("pending line row");
+        assert!(row_text(backend.buffer(), badge_row).contains("ANALYST"));
     }
 
     #[test]
@@ -5724,7 +6138,7 @@ mod tests {
         app.live_history.push_back(system.clone());
         app.snapshot = Some(Snapshot {
             protocol_version: 1,
-            service_version: "1.4.3".into(),
+            service_version: env!("CARGO_PKG_VERSION").into(),
             system,
             processes: vec![process],
             active_alerts: Vec::new(),

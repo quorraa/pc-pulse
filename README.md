@@ -75,6 +75,9 @@ Important keys:
 | `[` / `]` on Oracle | Change the fresh evidence window (1–24 hours) |
 | `n` or `c` on Oracle | Begin a new chat while retaining the previous session in Chat Vault |
 | `h` on Oracle | Focus Chat Vault; use `j`/`k` and `Enter` to restore a previous chat |
+| `e` on Oracle | Recall your latest question into the input for editing; `Enter` resubmits it |
+| `r` or `F2` in Chat Vault | Rename the selected chat inline; an explicit title is kept even as the conversation grows |
+| `d` or `Del` in Chat Vault | Delete the selected chat — press twice to confirm; deleting the active chat starts a fresh one |
 | `y` on Oracle | Copy the latest analyzer answer to the Windows clipboard |
 | `Esc` while analyzing | Cancel the current Codex run |
 | `Enter` / `e` | Edit the selected setting |
@@ -121,7 +124,7 @@ See [detector details](docs/detectors.md) and the [named-pipe protocol](docs/pro
 
 ## Embedded systems-analyzer chat
 
-Oracle is a chatbot inside the TUI—no companion command or external chat is needed. Press `Enter`, type a question, and submit it. Every turn receives a fresh, bounded, redacted evidence bundle plus at most 16 local conversation turns. Snapshot collection and screen updates continue while the answer is generated; `Esc` cancels the child analyzer. Chat Vault keeps up to 24 previous sessions: click one to restore it, press `h` for keyboard selection, or press `n`/`c` to begin a new chat.
+Oracle is a chatbot inside the TUI—no companion command or external chat is needed. Press `Enter`, type a question, and submit it. Every turn receives a fresh, bounded, redacted evidence bundle plus at most 16 local conversation turns. Snapshot collection and screen updates continue while the answer is generated; `Esc` cancels the child analyzer. Chat Vault keeps up to 24 previous sessions: click one to restore it, press `h` for keyboard selection, or press `n`/`c` to begin a new chat. With the vault focused, `r` (or `F2`) renames the selected session inline and `d` (pressed twice) deletes it; `e` recalls your latest question into the input for editing and resubmission. While an answer is generated, the transcript's wait line animates through what is actually happening — evidence reading, correlation, then the model consult — driven purely by elapsed time.
 
 The collector never invokes AI. The interactive `PcPulse.exe` client runs `pcpulse-systems-analyzer` through the user's saved Codex login in an ephemeral read-only sandbox. PC Pulse requires `codex login status` to report ChatGPT authentication, so Oracle uses ChatGPT subscription access and refuses API-key sessions instead of silently changing billing. The structured answer must cite exact collected references. Direct termination commands and unconfirmed mutations are rejected, and no proposed action is executed.
 

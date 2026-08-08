@@ -728,6 +728,14 @@ pub struct App {
     pub chat_sessions: Vec<ChatSession>,
     pub chat_history_focused: bool,
     pub chat_session_state: ListState,
+    /// Inline Chat Vault rename: `Some(typed)` while the rename band owns the
+    /// keyboard. Like [`Self::help_overlay`], deliberately not an
+    /// [`InputMode`] variant — the effects layer diffs `InputMode` and this
+    /// band is vault chrome, not a page input state.
+    pub vault_rename: Option<String>,
+    /// Two-step vault delete: the conversation id armed by the first `d`.
+    /// Any other key disarms it.
+    pub vault_delete_armed: Option<String>,
     pub codex_auth_status: Option<String>,
     pub codex_auth_error: Option<String>,
     pub tree: Vec<TreeRow>,
@@ -827,6 +835,8 @@ impl App {
             chat_sessions,
             chat_history_focused: false,
             chat_session_state: ListState::default().with_selected(Some(0)),
+            vault_rename: None,
+            vault_delete_armed: None,
             codex_auth_status: None,
             codex_auth_error: None,
             tree: Vec::new(),
@@ -992,6 +1002,30 @@ impl App {
     }
 
     fn handle_normal_key(&mut self, key: KeyEvent) -> bool {
+        // While the vault rename band is open it owns the keyboard, exactly
+        // like the keys overlay below: every character is title text.
+        if let Some(mut typed) = self.vault_rename.take() {
+            match key.code {
+                KeyCode::Esc => {}
+                KeyCode::Enter => self.commit_vault_rename(&typed),
+                KeyCode::Backspace => {
+                    typed.pop();
+                    self.vault_rename = Some(typed);
+                }
+                KeyCode::Char(character)
+                    if !key.modifiers.contains(KeyModifiers::CONTROL)
+                        && typed.chars().count() < 60 =>
+                {
+                    typed.push(character);
+                    self.vault_rename = Some(typed);
+                }
+                _ => self.vault_rename = Some(typed),
+            }
+            return false;
+        }
+        // Two-step delete: the armed id survives only an immediate second
+        // `d`/`Delete`; every other key path leaves it taken (disarmed).
+        let delete_armed = self.vault_delete_armed.take();
         // While the keys overlay is up it owns the keyboard: the page below
         // must not react to navigation or action keys.
         if let Some(scroll) = self.help_overlay {
@@ -1034,6 +1068,27 @@ impl App {
             }
             KeyCode::Char('n' | 'c') if self.page == Page::Analyzer && !self.analyzer_running => {
                 self.begin_new_chat();
+            }
+            KeyCode::Char('r') | KeyCode::F(2)
+                if self.page == Page::Analyzer
+                    && self.chat_history_focused
+                    && !self.analyzer_running =>
+            {
+                self.begin_vault_rename();
+            }
+            KeyCode::Char('d') | KeyCode::Delete
+                if self.page == Page::Analyzer
+                    && self.chat_history_focused
+                    && !self.analyzer_running =>
+            {
+                self.vault_delete_step(delete_armed);
+            }
+            KeyCode::Char('e')
+                if self.page == Page::Analyzer
+                    && !self.chat_history_focused
+                    && !self.analyzer_running =>
+            {
+                self.edit_last_question();
             }
             KeyCode::Char('y') if self.page == Page::Analyzer => self.copy_latest_answer(),
             KeyCode::Char('r') if self.page == Page::Tree => {
@@ -1547,6 +1602,14 @@ impl App {
         })
     }
 
+    /// Milliseconds since the in-flight analyzer submission; `None` when no
+    /// analysis is running. Drives the transcript's phase animation, which
+    /// derives every frame deterministically from this value.
+    pub fn analyzer_elapsed_ms(&self) -> Option<u64> {
+        self.analyzer_started_at
+            .map(|started| u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX))
+    }
+
     /// The conversation turns sent to Codex: failed-turn records stay local to
     /// the transcript and are excluded from the analyzer prompt.
     fn outgoing_chat_history(&self) -> Vec<ChatMessage> {
@@ -1585,16 +1648,22 @@ impl App {
             return Ok(());
         }
         let now_ms = Utc::now().timestamp_millis();
-        let created_at_ms = self
+        let existing = self
             .chat_sessions
             .iter()
-            .find(|session| session.conversation_id == self.conversation_id)
-            .map(|session| session.created_at_ms);
+            .find(|session| session.conversation_id == self.conversation_id);
+        let created_at_ms = existing.map(|session| session.created_at_ms);
+        // An explicit (renamed) title always outlives the derived one, even
+        // as new turns arrive after a restore.
+        let pinned_title = existing
+            .filter(|session| session.title_pinned)
+            .map(|session| session.title.clone());
         let session = ChatSession::from_conversation(
             self.conversation_id.clone(),
             self.chat_messages.iter().cloned().collect(),
             self.latest_chat.clone(),
             created_at_ms,
+            pinned_title,
             now_ms,
         );
         if let Some(store) = &self.chat_store {
@@ -1621,9 +1690,115 @@ impl App {
         self.analyzer_last_error = None;
         self.chat_scroll_from_bottom = 0;
         self.chat_history_focused = false;
+        self.vault_rename = None;
+        self.vault_delete_armed = None;
         self.chat_session_state.select(Some(0));
         self.status = "New analyzer conversation ready".into();
         self.status_is_error = false;
+    }
+
+    /// The Chat Vault session behind the current selection, skipping the
+    /// pinned "＋ NEW CHAT" row at index 0.
+    fn selected_vault_session_index(&self) -> Option<usize> {
+        let index = self.chat_session_state.selected()?.checked_sub(1)?;
+        (index < self.chat_sessions.len()).then_some(index)
+    }
+
+    /// `r` / `F2` with the vault focused: open the inline rename band seeded
+    /// with the current title.
+    fn begin_vault_rename(&mut self) {
+        match self.selected_vault_session_index() {
+            Some(index) => self.vault_rename = Some(self.chat_sessions[index].title.clone()),
+            None => self.set_error("Select a saved chat to rename".into()),
+        }
+    }
+
+    /// Enter inside the rename band: pin the typed title to the selected
+    /// session and persist the vault. An empty title re-arms the band.
+    fn commit_vault_rename(&mut self, typed: &str) {
+        let title = typed.trim();
+        if title.is_empty() {
+            self.set_error("Chat title cannot be empty".into());
+            self.vault_rename = Some(String::new());
+            return;
+        }
+        let Some(index) = self.selected_vault_session_index() else {
+            return;
+        };
+        let session = &mut self.chat_sessions[index];
+        session.title = crate::chat_history::truncate_title(title, 52);
+        session.title_pinned = true;
+        match self.persist_sessions() {
+            Ok(()) => {
+                self.status = "Chat renamed".into();
+                self.status_is_error = false;
+            }
+            Err(error) => self.set_error(error),
+        }
+    }
+
+    /// `d` / `Delete` with the vault focused. First press arms the selected
+    /// session; a second press on the same session deletes and persists.
+    /// Deleting the restored/active session starts a fresh chat.
+    fn vault_delete_step(&mut self, armed: Option<String>) {
+        let Some(index) = self.selected_vault_session_index() else {
+            self.set_error("Select a saved chat to delete".into());
+            return;
+        };
+        let id = self.chat_sessions[index].conversation_id.clone();
+        if armed.as_deref() != Some(id.as_str()) {
+            self.status = format!(
+                "Press d again to delete '{}'",
+                self.chat_sessions[index].title
+            );
+            self.status_is_error = false;
+            self.vault_delete_armed = Some(id);
+            return;
+        }
+        let removed = self.chat_sessions.remove(index);
+        let persisted = self.persist_sessions();
+        if removed.conversation_id == self.conversation_id {
+            self.begin_new_chat();
+            // The user is still working the vault; keep it focused.
+            self.chat_history_focused = true;
+        }
+        self.clamp_selection();
+        match persisted {
+            Ok(()) => {
+                self.status = "Chat deleted".into();
+                self.status_is_error = false;
+            }
+            Err(error) => self.set_error(error),
+        }
+    }
+
+    /// `e` on Oracle: recall the latest user question into the chat input
+    /// for editing and resubmission.
+    fn edit_last_question(&mut self) {
+        let Some(question) = self
+            .chat_messages
+            .iter()
+            .rev()
+            .find(|message| message.role == ChatRole::User)
+            .map(|message| message.text.clone())
+        else {
+            self.set_error("No question to edit yet".into());
+            return;
+        };
+        self.mode = InputMode::Chat(question);
+        self.status = "Editing your last question — Enter resubmits".into();
+        self.status_is_error = false;
+    }
+
+    /// Write the whole vault through the store's atomic-replace path; without
+    /// a store (tests, no %LOCALAPPDATA%) the in-memory vault is the truth.
+    fn persist_sessions(&self) -> Result<(), String> {
+        match &self.chat_store {
+            Some(store) => store
+                .save(&self.chat_sessions)
+                .map_err(|error| format!("Failed to save chat history: {error:#}")),
+            None => Ok(()),
+        }
     }
 
     pub(crate) fn activate_chat_history_index(&mut self, index: usize) {
@@ -2500,6 +2675,202 @@ mod tests {
         assert!(matches!(app.mode, InputMode::EditSetting { .. }));
         assert_eq!(app.client_prefs.analyzer_timeout_secs, 600);
         let _ = std::fs::remove_file(path);
+    }
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    /// An inert app with one persisted vault session and the vault focused.
+    fn app_with_vault_session(question: &str) -> App {
+        let mut app = App::new_inert();
+        app.page = Page::Analyzer;
+        app.chat_messages.push_back(ChatMessage {
+            role: ChatRole::User,
+            timestamp_ms: 10,
+            text: question.into(),
+            evidence_refs: Vec::new(),
+            is_error: false,
+        });
+        app.persist_current_chat().unwrap();
+        app.handle_key(key(KeyCode::Char('h')));
+        assert!(app.chat_history_focused);
+        app.chat_session_state.select(Some(1));
+        app
+    }
+
+    #[test]
+    fn vault_rename_commits_a_pinned_title_that_beats_derivation_and_restore() {
+        let mut app = app_with_vault_session("Why did the machine slow down?");
+
+        // `r` opens the band seeded with the current (derived) title, and
+        // while it is open every printable key is title text — even q.
+        app.handle_key(key(KeyCode::Char('r')));
+        assert_eq!(
+            app.vault_rename.as_deref(),
+            Some("Why did the machine slow down?")
+        );
+        for _ in 0.."Why did the machine slow down?".len() {
+            app.handle_key(key(KeyCode::Backspace));
+        }
+        for character in "Morning slowdown q".chars() {
+            assert!(!app.handle_key(key(KeyCode::Char(character))));
+        }
+        app.handle_key(key(KeyCode::Enter));
+
+        assert!(app.vault_rename.is_none());
+        assert_eq!(app.chat_sessions[0].title, "Morning slowdown q");
+        assert!(app.chat_sessions[0].title_pinned);
+        assert_eq!(app.status, "Chat renamed");
+        assert!(!app.status_is_error);
+
+        // The derived title never wins again: a new turn re-persists the
+        // conversation and the explicit title survives.
+        app.chat_messages.push_back(ChatMessage {
+            role: ChatRole::User,
+            timestamp_ms: 20,
+            text: "And what about the disk?".into(),
+            evidence_refs: Vec::new(),
+            is_error: false,
+        });
+        app.persist_current_chat().unwrap();
+        assert_eq!(app.chat_sessions[0].title, "Morning slowdown q");
+        assert!(app.chat_sessions[0].title_pinned);
+
+        // Restoring the session keeps the explicit title too.
+        let renamed_id = app.chat_sessions[0].conversation_id.clone();
+        app.begin_new_chat();
+        app.activate_chat_history_index(1);
+        assert_eq!(app.conversation_id, renamed_id);
+        app.persist_current_chat().unwrap();
+        assert_eq!(app.chat_sessions[0].title, "Morning slowdown q");
+    }
+
+    #[test]
+    fn vault_rename_esc_cancels_and_f2_also_opens() {
+        let mut app = app_with_vault_session("Why is the fan loud?");
+        app.handle_key(key(KeyCode::F(2)));
+        assert!(app.vault_rename.is_some());
+        app.handle_key(key(KeyCode::Char('!')));
+        app.handle_key(key(KeyCode::Esc));
+        assert!(app.vault_rename.is_none());
+        assert_eq!(app.chat_sessions[0].title, "Why is the fan loud?");
+        assert!(!app.chat_sessions[0].title_pinned);
+
+        // An empty title re-arms the band with an error instead of renaming.
+        app.handle_key(key(KeyCode::Char('r')));
+        for _ in 0..40 {
+            app.handle_key(key(KeyCode::Backspace));
+        }
+        app.handle_key(key(KeyCode::Enter));
+        assert!(app.vault_rename.is_some());
+        assert!(app.status_is_error);
+        app.handle_key(key(KeyCode::Esc));
+
+        // On the ＋ NEW CHAT row there is nothing to rename.
+        app.chat_session_state.select(Some(0));
+        app.handle_key(key(KeyCode::Char('r')));
+        assert!(app.vault_rename.is_none());
+        assert!(app.status_is_error);
+    }
+
+    #[test]
+    fn vault_delete_takes_two_presses_and_any_other_key_disarms() {
+        let mut app = app_with_vault_session("Old chat to purge");
+        // Park a second, inactive session so the delete target is not the
+        // active conversation.
+        app.begin_new_chat();
+        app.chat_messages.push_back(ChatMessage {
+            role: ChatRole::User,
+            timestamp_ms: 30,
+            text: "Fresh question".into(),
+            evidence_refs: Vec::new(),
+            is_error: false,
+        });
+        app.persist_current_chat().unwrap();
+        app.handle_key(key(KeyCode::Char('h')));
+        assert_eq!(app.chat_sessions.len(), 2);
+        // Select the older (inactive) session — the last vault row.
+        app.chat_session_state.select(Some(2));
+
+        // First press only arms.
+        app.handle_key(key(KeyCode::Char('d')));
+        assert!(app.vault_delete_armed.is_some());
+        assert!(app.status.contains("Press d again to delete 'Old chat to purge'"));
+        assert_eq!(app.chat_sessions.len(), 2);
+
+        // Any other key disarms; the next d starts over.
+        app.handle_key(key(KeyCode::Char('k')));
+        assert!(app.vault_delete_armed.is_none());
+        app.chat_session_state.select(Some(2));
+        app.handle_key(key(KeyCode::Char('d')));
+        assert_eq!(app.chat_sessions.len(), 2, "re-armed, not deleted");
+
+        // The immediate second press deletes and persists.
+        app.handle_key(key(KeyCode::Char('d')));
+        assert_eq!(app.chat_sessions.len(), 1);
+        assert_eq!(app.status, "Chat deleted");
+        assert!(!app.status_is_error);
+        assert!(app.vault_delete_armed.is_none());
+        assert!(
+            app.chat_sessions
+                .iter()
+                .all(|session| session.title != "Old chat to purge")
+        );
+    }
+
+    #[test]
+    fn deleting_the_active_session_starts_a_fresh_chat() {
+        let mut app = app_with_vault_session("Active investigation");
+        let active_id = app.conversation_id.clone();
+        app.handle_key(key(KeyCode::Delete));
+        app.handle_key(key(KeyCode::Delete));
+        assert!(app.chat_sessions.is_empty());
+        assert_ne!(app.conversation_id, active_id);
+        assert!(app.chat_messages.is_empty());
+        assert!(app.latest_chat.is_none());
+        assert!(app.chat_history_focused, "the vault keeps focus");
+        assert_eq!(app.status, "Chat deleted");
+    }
+
+    #[test]
+    fn e_recalls_the_latest_user_question_into_the_chat_input() {
+        let mut app = App::new_inert();
+        app.page = Page::Analyzer;
+        for (role, text) in [
+            (ChatRole::User, "First question"),
+            (ChatRole::Assistant, "First answer"),
+            (ChatRole::User, "Second question about the disk"),
+            (ChatRole::Assistant, "Second answer"),
+        ] {
+            app.chat_messages.push_back(ChatMessage {
+                role,
+                timestamp_ms: 0,
+                text: text.into(),
+                evidence_refs: Vec::new(),
+                is_error: false,
+            });
+        }
+        app.handle_key(key(KeyCode::Char('e')));
+        assert!(matches!(
+            app.mode,
+            InputMode::Chat(ref value) if value == "Second question about the disk"
+        ));
+        assert_eq!(app.status, "Editing your last question — Enter resubmits");
+        assert!(!app.status_is_error);
+
+        // Without a user turn there is nothing to edit.
+        let mut empty = App::new_inert();
+        empty.page = Page::Analyzer;
+        empty.handle_key(key(KeyCode::Char('e')));
+        assert!(matches!(empty.mode, InputMode::Normal));
+        assert!(empty.status_is_error);
+        assert!(empty.status.contains("No question to edit"));
+
+        // With the vault focused, e is not the edit key.
+        let mut focused = app_with_vault_session("A question");
+        focused.handle_key(key(KeyCode::Char('e')));
+        assert!(matches!(focused.mode, InputMode::Normal));
     }
 
     #[test]
