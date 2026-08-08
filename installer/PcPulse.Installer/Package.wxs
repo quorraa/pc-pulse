@@ -1,0 +1,48 @@
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs" xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
+  <Package Name="PC Pulse" Manufacturer="PC Pulse" Version="$(var.ProductVersion)"
+           UpgradeCode="6B078B42-05DF-4B92-9EB3-423E506E960D" Scope="perMachine">
+    <SummaryInformation Description="PC Pulse Windows 11 performance monitor" />
+    <MajorUpgrade DowngradeErrorMessage="A newer version of PC Pulse is already installed." />
+    <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
+
+    <Feature Id="MainFeature" Title="PC Pulse" Level="1">
+      <ComponentGroupRef Id="ProductComponents" />
+    </Feature>
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="PC Pulse" />
+    </StandardDirectory>
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Directory Id="ProgramsFolder" Name="PC Pulse" />
+    </StandardDirectory>
+
+    <ComponentGroup Id="ProductComponents" Directory="INSTALLFOLDER">
+      <Component Id="CollectorComponent" Guid="E1D24833-D314-4AF8-8DD6-4B420E2EA73B" Bitness="always64">
+        <File Id="CollectorExe" Source="..\..\artifacts\publish\PcPulse.Service.exe" KeyPath="yes" />
+        <ServiceInstall Id="CollectorServiceInstall" Name="PcPulseCollector"
+                        DisplayName="PC Pulse Collector" Description="Collects low-overhead Windows performance and diagnostic evidence for PC Pulse."
+                        Type="ownProcess" Start="auto" ErrorControl="normal" Account="LocalSystem" />
+        <ServiceControl Id="CollectorServiceControl" Name="PcPulseCollector"
+                        Start="install" Stop="both" Remove="uninstall" Wait="yes" />
+        <util:ServiceConfig ServiceName="PcPulseCollector" FirstFailureActionType="restart" SecondFailureActionType="restart"
+                            ThirdFailureActionType="none" RestartServiceDelayInSeconds="15"
+                            ResetPeriodInDays="1" />
+      </Component>
+      <Component Id="TuiComponent" Guid="1E774D95-3925-423E-9060-F4D49AFB1952" Bitness="always64">
+        <File Id="TuiExe" Source="..\..\artifacts\publish\PcPulse.exe" KeyPath="yes">
+          <Shortcut Id="StartMenuShortcut" Directory="ProgramsFolder" Name="PC Pulse"
+                    Description="Keyboard-first Windows performance monitor" WorkingDirectory="INSTALLFOLDER" Advertise="yes" />
+        </File>
+        <RegistryValue Root="HKLM" Key="Software\PC Pulse" Name="InstallPath"
+                       Type="string" Value="[INSTALLFOLDER]" />
+        <RemoveFolder Id="RemoveProgramsFolder" Directory="ProgramsFolder" On="uninstall" />
+      </Component>
+      <Component Id="NotifierComponent" Guid="70865E01-2AAC-402D-A429-AF6C16B29474" Bitness="always64">
+        <File Id="NotifierExe" Source="..\..\artifacts\publish\PcPulse.Notify.exe" KeyPath="yes" />
+        <RegistryValue Root="HKLM" Key="Software\Microsoft\Windows\CurrentVersion\Run"
+                       Name="PcPulseNotify" Type="string"
+                       Value="&quot;[INSTALLFOLDER]PcPulse.Notify.exe&quot;" />
+      </Component>
+    </ComponentGroup>
+  </Package>
+</Wix>

@@ -1,0 +1,43 @@
+[package]
+name = "pcpulse-tui"
+version = "1.4.3"
+edition = "2024"
+license = "MIT"
+description = "Keyboard-first terminal client and native notifier for PC Pulse"
+
+[lib]
+name = "pcpulse_tui"
+path = "src/lib.rs"
+
+[[bin]]
+name = "pcpulse"
+path = "src/main.rs"
+
+[[bin]]
+name = "pcpulse-notify"
+path = "src/bin/pcpulse-notify.rs"
+
+[dependencies]
+anyhow = "1.0"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+crossbeam-channel = "0.5"
+ctrlc = "3.5"
+pcpulse-service = { path = "../PcPulse.Service" }
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm", "layout-cache", "macros"] }
+tachyonfx = { version = "0.25.1", default-features = false, features = ["std"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[dependencies.windows]
+version = "0.62"
+features = [
+  "Win32_Foundation",
+  "Win32_Graphics_Gdi",
+  "Win32_Storage_FileSystem",
+  "Win32_System_Console",
+  "Win32_System_LibraryLoader",
+  "Win32_System_Pipes",
+  "Win32_System_Threading",
+  "Win32_UI_Shell",
+  "Win32_UI_WindowsAndMessaging"
+]

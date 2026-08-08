@@ -1,0 +1,115 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "PC Pulse Systems Chat Response",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "conversationId",
+    "contextId",
+    "generatedAtMs",
+    "agentName",
+    "answer",
+    "evidenceRefs",
+    "proposedActions",
+    "suggestedFollowUps"
+  ],
+  "properties": {
+    "schemaVersion": { "type": "integer", "const": 1 },
+    "conversationId": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "contextId": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "generatedAtMs": { "type": "integer" },
+    "agentName": { "type": "string", "const": "pcpulse-systems-analyzer" },
+    "answer": { "type": "string", "minLength": 1, "maxLength": 6000 },
+    "evidenceRefs": {
+      "type": "array",
+      "maxItems": 48,
+      "items": { "type": "string", "minLength": 1, "maxLength": 512 }
+    },
+    "proposedActions": {
+      "type": "array",
+      "maxItems": 6,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "priority",
+          "title",
+          "category",
+          "target",
+          "reason",
+          "risk",
+          "requiresConfirmation",
+          "prerequisites",
+          "steps",
+          "validation",
+          "rollback",
+          "evidenceRefs"
+        ],
+        "properties": {
+          "id": { "type": "string", "minLength": 1, "maxLength": 128 },
+          "priority": { "type": "integer", "minimum": 1, "maximum": 100 },
+          "title": { "type": "string", "minLength": 1, "maxLength": 300 },
+          "category": { "type": "string", "enum": ["observe", "contain", "optimize", "repair", "verify"] },
+          "target": { "type": "string", "minLength": 1, "maxLength": 500 },
+          "reason": { "type": "string", "minLength": 1, "maxLength": 2000 },
+          "risk": { "type": "string", "enum": ["low", "medium", "high"] },
+          "requiresConfirmation": { "type": "boolean" },
+          "prerequisites": {
+            "type": "array",
+            "maxItems": 12,
+            "items": { "type": "string", "minLength": 1, "maxLength": 500 }
+          },
+          "steps": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 10,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "kind",
+                "description",
+                "command",
+                "mutatesSystem",
+                "requiresElevation",
+                "confirmationPrompt"
+              ],
+              "properties": {
+                "kind": { "type": "string", "enum": ["command", "pcPulse", "manual"] },
+                "description": { "type": "string", "minLength": 1, "maxLength": 1000 },
+                "command": { "type": ["string", "null"], "maxLength": 4000 },
+                "mutatesSystem": { "type": "boolean" },
+                "requiresElevation": { "type": "boolean" },
+                "confirmationPrompt": { "type": ["string", "null"], "maxLength": 1000 }
+              }
+            }
+          },
+          "validation": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 12,
+            "items": { "type": "string", "minLength": 1, "maxLength": 1000 }
+          },
+          "rollback": {
+            "type": "array",
+            "maxItems": 12,
+            "items": { "type": "string", "minLength": 1, "maxLength": 1000 }
+          },
+          "evidenceRefs": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 32,
+            "items": { "type": "string", "minLength": 1, "maxLength": 512 }
+          }
+        }
+      }
+    },
+    "suggestedFollowUps": {
+      "type": "array",
+      "maxItems": 4,
+      "items": { "type": "string", "minLength": 1, "maxLength": 300 }
+    }
+  }
+}

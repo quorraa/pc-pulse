@@ -1,0 +1,52 @@
+[package]
+name = "pcpulse-service"
+version = "1.4.3"
+edition = "2024"
+license = "MIT"
+description = "Low-overhead Windows performance collector for PC Pulse"
+
+[lib]
+name = "pcpulse_service"
+path = "src/lib.rs"
+
+[[bin]]
+name = "pcpulse-collector"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+crossbeam-channel = "0.5"
+ctrlc = "3.5"
+rusqlite = { version = "0.38", features = ["bundled"] }
+quick-xml = { version = "0.38", features = ["serialize"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+uuid = { version = "1.18", features = ["v4"] }
+windows-service = "0.8"
+
+[dependencies.windows]
+version = "0.62"
+features = [
+  "Win32_Foundation",
+  "Win32_Security",
+  "Win32_Security_Authorization",
+  "Win32_Storage_FileSystem",
+  "Win32_System_Diagnostics_Etw",
+  "Win32_System_Diagnostics_ToolHelp",
+  "Win32_System_EventLog",
+  "Win32_System_IO",
+  "Win32_System_Memory",
+  "Win32_System_Performance",
+  "Win32_System_Pipes",
+  "Win32_System_ProcessStatus",
+  "Win32_System_Services",
+  "Win32_System_SystemInformation",
+  "Win32_System_RemoteDesktop",
+  "Win32_System_Time",
+  "Win32_System_Threading",
+  "Win32_UI_WindowsAndMessaging"
+]
+
+[dev-dependencies]
+tempfile = "3.23"

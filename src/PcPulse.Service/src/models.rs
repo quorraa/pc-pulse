@@ -1,0 +1,608 @@
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SystemMetric {
+    pub timestamp_ms: i64,
+    pub cpu_percent: f64,
+    pub memory_used_bytes: u64,
+    pub memory_total_bytes: u64,
+    pub disk_latency_ms: f64,
+    pub disk_read_bytes_per_sec: f64,
+    pub disk_write_bytes_per_sec: f64,
+    pub paged_pool_bytes: u64,
+    pub nonpaged_pool_bytes: u64,
+    pub dpc_rate: f64,
+    pub interrupt_rate: f64,
+    pub process_count: u32,
+    pub thread_count: u32,
+    pub handle_count: u32,
+    pub collector_working_set_bytes: u64,
+    pub collector_cpu_percent: f64,
+    pub collector_handle_count: u32,
+    pub etw_events_per_sec: f64,
+    pub dropped_etw_events: u64,
+    pub etw_active: bool,
+}
+
+impl Default for SystemMetric {
+    fn default() -> Self {
+        Self {
+            timestamp_ms: 0,
+            cpu_percent: 0.0,
+            memory_used_bytes: 0,
+            memory_total_bytes: 0,
+            disk_latency_ms: 0.0,
+            disk_read_bytes_per_sec: 0.0,
+            disk_write_bytes_per_sec: 0.0,
+            paged_pool_bytes: 0,
+            nonpaged_pool_bytes: 0,
+            dpc_rate: 0.0,
+            interrupt_rate: 0.0,
+            process_count: 0,
+            thread_count: 0,
+            handle_count: 0,
+            collector_working_set_bytes: 0,
+            collector_cpu_percent: 0.0,
+            collector_handle_count: 0,
+            etw_events_per_sec: 0.0,
+            dropped_etw_events: 0,
+            etw_active: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProcessMetric {
+    pub timestamp_ms: i64,
+    pub pid: u32,
+    pub parent_pid: u32,
+    pub name: String,
+    pub executable_path: String,
+    pub cpu_percent: f64,
+    pub working_set_bytes: u64,
+    pub private_bytes: u64,
+    pub handle_count: u32,
+    pub thread_count: u32,
+    pub read_bytes_per_sec: f64,
+    pub write_bytes_per_sec: f64,
+    pub total_read_bytes: u64,
+    pub total_write_bytes: u64,
+    pub started_at_ms: i64,
+    pub session_id: u32,
+    pub responsive: bool,
+    pub has_visible_window: bool,
+    pub launch_duration_ms: Option<u64>,
+    pub is_agent_candidate: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum Severity {
+    Info,
+    Warning,
+    Critical,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct Evidence {
+    pub label: String,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct Alert {
+    pub id: String,
+    pub kind: String,
+    pub severity: Severity,
+    pub first_seen_ms: i64,
+    pub last_seen_ms: i64,
+    pub process_id: Option<u32>,
+    pub process_name: Option<String>,
+    pub title: String,
+    pub explanation: String,
+    pub evidence: Vec<Evidence>,
+    pub recommendation: String,
+    pub acknowledged: bool,
+    pub occurrence_count: u32,
+    pub resolved_at_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct Snapshot {
+    pub protocol_version: u32,
+    pub service_version: String,
+    pub system: SystemMetric,
+    pub processes: Vec<ProcessMetric>,
+    pub active_alerts: Vec<Alert>,
+}
+
+impl Default for Snapshot {
+    fn default() -> Self {
+        Self {
+            protocol_version: crate::PROTOCOL_VERSION,
+            service_version: env!("CARGO_PKG_VERSION").to_string(),
+            system: SystemMetric::default(),
+            processes: Vec::new(),
+            active_alerts: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProcessNode {
+    pub process: ProcessMetric,
+    pub children: Vec<ProcessNode>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum DiagnosticLevel {
+    Critical,
+    Error,
+    Warning,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum DiagnosticCategory {
+    Hardware,
+    Storage,
+    Graphics,
+    ApplicationCrash,
+    ApplicationHang,
+    ResourceExhaustion,
+    Power,
+    Service,
+    Network,
+    AgentRuntime,
+    Other,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DiagnosticField {
+    pub name: String,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DiagnosticLog {
+    pub timestamp_ms: i64,
+    pub channel: String,
+    pub provider: String,
+    pub event_id: u32,
+    pub record_id: u64,
+    pub level: DiagnosticLevel,
+    pub category: DiagnosticCategory,
+    pub process_id: Option<u32>,
+    pub thread_id: Option<u32>,
+    pub related_process: Option<String>,
+    pub fingerprint: String,
+    pub fields: Vec<DiagnosticField>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, rename_all = "camelCase")]
+pub struct DiagnosticLogStatus {
+    pub enabled: bool,
+    pub last_poll_ms: Option<i64>,
+    pub last_success_ms: Option<i64>,
+    pub last_error: Option<String>,
+    pub events_seen: u64,
+    pub events_stored: u64,
+    pub duplicate_events: u64,
+    pub malformed_events: u64,
+    pub truncated_polls: u64,
+}
+
+impl Default for DiagnosticLogStatus {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            last_poll_ms: None,
+            last_success_ms: None,
+            last_error: None,
+            events_seen: 0,
+            events_stored: 0,
+            duplicate_events: 0,
+            malformed_events: 0,
+            truncated_polls: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DiagnosticLogResponse {
+    pub status: DiagnosticLogStatus,
+    pub logs: Vec<DiagnosticLog>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentSystemRollup {
+    pub sample_count: usize,
+    pub first_sample_ms: Option<i64>,
+    pub last_sample_ms: Option<i64>,
+    pub cpu_average_percent: f64,
+    pub cpu_p95_percent: f64,
+    pub cpu_max_percent: f64,
+    pub memory_average_percent: f64,
+    pub memory_p95_percent: f64,
+    pub memory_max_percent: f64,
+    pub disk_latency_p95_ms: f64,
+    pub disk_latency_max_ms: f64,
+    pub dpc_p95_per_sec: f64,
+    pub interrupt_p95_per_sec: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentProcessRollup {
+    pub evidence_ref: String,
+    pub pid: u32,
+    pub parent_pid: u32,
+    pub name: String,
+    pub executable_path: String,
+    pub started_at_ms: i64,
+    pub sample_count: usize,
+    pub first_sample_ms: i64,
+    pub last_sample_ms: i64,
+    pub cpu_average_percent: f64,
+    pub cpu_max_percent: f64,
+    pub working_set_first_bytes: u64,
+    pub working_set_last_bytes: u64,
+    pub working_set_max_bytes: u64,
+    pub working_set_delta_bytes: i64,
+    pub handle_first: u32,
+    pub handle_last: u32,
+    pub handle_delta: i64,
+    pub thread_first: u32,
+    pub thread_last: u32,
+    pub thread_delta: i64,
+    pub io_average_bytes_per_sec: f64,
+    pub io_max_bytes_per_sec: f64,
+    pub responsive: bool,
+    pub has_visible_window: bool,
+    pub is_agent_candidate: bool,
+    pub pressure_score: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentLogRollup {
+    pub evidence_ref: String,
+    pub fingerprint: String,
+    pub category: DiagnosticCategory,
+    pub level: DiagnosticLevel,
+    pub provider: String,
+    pub event_id: u32,
+    pub count: u32,
+    pub first_seen_ms: i64,
+    pub last_seen_ms: i64,
+    pub related_process: Option<String>,
+    pub representative_fields: Vec<DiagnosticField>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentContext {
+    pub schema_version: u32,
+    pub context_id: String,
+    pub generated_at_ms: i64,
+    pub requested_window_hours: u32,
+    pub effective_history_from_ms: Option<i64>,
+    pub privacy: Vec<String>,
+    pub safety_constraints: Vec<String>,
+    pub collector_status: DiagnosticLogStatus,
+    pub current: Snapshot,
+    pub settings: crate::config::Settings,
+    pub system_rollup: AgentSystemRollup,
+    pub process_suspects: Vec<AgentProcessRollup>,
+    pub diagnostic_log_rollups: Vec<AgentLogRollup>,
+    pub recent_alerts: Vec<Alert>,
+    pub limitations: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanAgent {
+    pub name: String,
+    pub model: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanDataPoint {
+    pub label: String,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanDiagnosis {
+    pub id: String,
+    pub severity: Severity,
+    pub title: String,
+    pub explanation: String,
+    pub responsible_process: Option<String>,
+    pub evidence_refs: Vec<String>,
+    pub supporting_data: Vec<PlanDataPoint>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum PlanRisk {
+    Low,
+    Medium,
+    High,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum PlanActionCategory {
+    Observe,
+    Contain,
+    Optimize,
+    Repair,
+    Verify,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum PlanStepKind {
+    Command,
+    PcPulse,
+    Manual,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanStep {
+    pub kind: PlanStepKind,
+    pub description: String,
+    pub command: Option<String>,
+    pub mutates_system: bool,
+    pub requires_elevation: bool,
+    pub confirmation_prompt: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanAction {
+    pub id: String,
+    pub priority: u32,
+    pub title: String,
+    pub category: PlanActionCategory,
+    pub target: String,
+    pub reason: String,
+    pub risk: PlanRisk,
+    pub requires_confirmation: bool,
+    pub prerequisites: Vec<String>,
+    pub steps: Vec<PlanStep>,
+    pub validation: Vec<String>,
+    pub rollback: Vec<String>,
+    pub evidence_refs: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanConstraints {
+    pub never_auto_terminate: bool,
+    pub never_auto_apply: bool,
+    pub confirmation_required_for_mutations: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct OptimizationPlan {
+    pub schema_version: u32,
+    pub plan_id: String,
+    pub context_id: String,
+    pub generated_at_ms: i64,
+    pub agent: PlanAgent,
+    pub summary: String,
+    pub confidence: String,
+    pub diagnoses: Vec<PlanDiagnosis>,
+    pub actions: Vec<PlanAction>,
+    pub constraints: PlanConstraints,
+}
+
+impl OptimizationPlan {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.schema_version != 1 {
+            return Err("unsupported optimization-plan schema version".into());
+        }
+        if self.plan_id.is_empty() || self.context_id.is_empty() || self.summary.is_empty() {
+            return Err("planId, contextId, and summary are required".into());
+        }
+        if self.summary.len() > 4_000 || self.diagnoses.len() > 20 || self.actions.len() > 20 {
+            return Err("optimization plan exceeds bounded limits".into());
+        }
+        if !matches!(self.confidence.as_str(), "low" | "medium" | "high") {
+            return Err("confidence must be low, medium, or high".into());
+        }
+        if self.agent.name != "pcpulse-systems-analyzer" {
+            return Err("unexpected optimization-plan agent identity".into());
+        }
+        if !self.constraints.never_auto_terminate
+            || !self.constraints.never_auto_apply
+            || !self.constraints.confirmation_required_for_mutations
+        {
+            return Err("required PC Pulse safety constraints are missing".into());
+        }
+        for action in &self.actions {
+            if action.steps.len() > 12
+                || action.validation.len() > 12
+                || action.rollback.len() > 12
+                || action.evidence_refs.len() > 32
+            {
+                return Err(format!("action {} exceeds bounded limits", action.id));
+            }
+            if action.steps.iter().any(|step| step.mutates_system)
+                && (!action.requires_confirmation
+                    || action
+                        .steps
+                        .iter()
+                        .filter(|step| step.mutates_system)
+                        .any(|step| step.confirmation_prompt.as_deref().unwrap_or("").is_empty()))
+            {
+                return Err(format!(
+                    "action {} mutates the system without explicit confirmation",
+                    action.id
+                ));
+            }
+            if action.steps.iter().any(|step| {
+                let command = step
+                    .command
+                    .as_deref()
+                    .unwrap_or_default()
+                    .to_ascii_lowercase();
+                [
+                    "stop-process",
+                    "taskkill",
+                    "terminateprocess",
+                    "wmic process",
+                ]
+                .iter()
+                .any(|forbidden| command.contains(forbidden))
+            }) {
+                return Err(format!(
+                    "action {} contains a forbidden direct termination command",
+                    action.id
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "command", rename_all = "camelCase")]
+pub enum PipeRequest {
+    Ping,
+    GetSnapshot,
+    GetHistory {
+        from_ms: i64,
+        to_ms: i64,
+        limit: u32,
+    },
+    GetSystemHistory {
+        from_ms: i64,
+        to_ms: i64,
+        limit: u32,
+    },
+    GetAlerts {
+        from_ms: i64,
+        limit: u32,
+    },
+    GetDiagnosticLogs {
+        from_ms: i64,
+        limit: u32,
+    },
+    GetAgentContext {
+        window_hours: u32,
+    },
+    GetOptimizationPlans {
+        limit: u32,
+    },
+    SaveOptimizationPlan {
+        plan: OptimizationPlan,
+    },
+    GetSettings,
+    UpdateSettings {
+        settings: crate::config::Settings,
+    },
+    GetProcessTree,
+    AcknowledgeAlert {
+        alert_id: String,
+    },
+    TerminateProcess {
+        pid: u32,
+        confirmed: bool,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HistoryResponse {
+    pub system: Vec<SystemMetric>,
+    pub processes: Vec<ProcessMetric>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "camelCase")]
+pub enum PipeResponse {
+    Ok { data: serde_json::Value },
+    Error { code: String, message: String },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn plan() -> OptimizationPlan {
+        OptimizationPlan {
+            schema_version: 1,
+            plan_id: "plan-1".into(),
+            context_id: "context-1".into(),
+            generated_at_ms: 123,
+            agent: PlanAgent {
+                name: "pcpulse-systems-analyzer".into(),
+                model: "codex".into(),
+            },
+            summary: "Observe before changing anything.".into(),
+            confidence: "low".into(),
+            diagnoses: Vec::new(),
+            actions: Vec::new(),
+            constraints: PlanConstraints {
+                never_auto_terminate: true,
+                never_auto_apply: true,
+                confirmation_required_for_mutations: true,
+            },
+        }
+    }
+
+    #[test]
+    fn plan_requires_non_execution_safety_contract() {
+        let mut value = plan();
+        assert!(value.validate().is_ok());
+        value.constraints.never_auto_apply = false;
+        assert!(value.validate().is_err());
+    }
+
+    #[test]
+    fn plan_rejects_direct_termination_commands() {
+        let mut value = plan();
+        value.actions.push(PlanAction {
+            id: "kill".into(),
+            priority: 100,
+            title: "Terminate".into(),
+            category: PlanActionCategory::Contain,
+            target: "PID 42".into(),
+            reason: "test".into(),
+            risk: PlanRisk::High,
+            requires_confirmation: true,
+            prerequisites: Vec::new(),
+            steps: vec![PlanStep {
+                kind: PlanStepKind::Command,
+                description: "direct kill".into(),
+                command: Some("Stop-Process -Id 42".into()),
+                mutates_system: true,
+                requires_elevation: false,
+                confirmation_prompt: Some("confirm".into()),
+            }],
+            validation: vec!["validate".into()],
+            rollback: Vec::new(),
+            evidence_refs: vec!["process:42:1".into()],
+        });
+        assert!(value.validate().is_err());
+    }
+}

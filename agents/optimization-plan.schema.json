@@ -1,0 +1,175 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "PC Pulse Optimization Plan",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "planId",
+    "contextId",
+    "generatedAtMs",
+    "agent",
+    "summary",
+    "confidence",
+    "diagnoses",
+    "actions",
+    "constraints"
+  ],
+  "properties": {
+    "schemaVersion": { "type": "integer", "const": 1 },
+    "planId": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "contextId": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "generatedAtMs": { "type": "integer" },
+    "agent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "model"],
+      "properties": {
+        "name": { "type": "string", "const": "pcpulse-systems-analyzer" },
+        "model": { "type": "string", "minLength": 1, "maxLength": 128 }
+      }
+    },
+    "summary": { "type": "string", "minLength": 1, "maxLength": 4000 },
+    "confidence": { "type": "string", "enum": ["low", "medium", "high"] },
+    "diagnoses": {
+      "type": "array",
+      "maxItems": 20,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "severity",
+          "title",
+          "explanation",
+          "responsibleProcess",
+          "evidenceRefs",
+          "supportingData"
+        ],
+        "properties": {
+          "id": { "type": "string", "minLength": 1, "maxLength": 128 },
+          "severity": { "type": "string", "enum": ["info", "warning", "critical"] },
+          "title": { "type": "string", "minLength": 1, "maxLength": 300 },
+          "explanation": { "type": "string", "minLength": 1, "maxLength": 2000 },
+          "responsibleProcess": {
+            "type": ["string", "null"],
+            "maxLength": 300
+          },
+          "evidenceRefs": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 32,
+            "items": { "type": "string", "minLength": 1, "maxLength": 512 }
+          },
+          "supportingData": {
+            "type": "array",
+            "maxItems": 20,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["label", "value"],
+              "properties": {
+                "label": { "type": "string", "minLength": 1, "maxLength": 160 },
+                "value": { "type": "string", "minLength": 1, "maxLength": 500 }
+              }
+            }
+          }
+        }
+      }
+    },
+    "actions": {
+      "type": "array",
+      "maxItems": 20,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "priority",
+          "title",
+          "category",
+          "target",
+          "reason",
+          "risk",
+          "requiresConfirmation",
+          "prerequisites",
+          "steps",
+          "validation",
+          "rollback",
+          "evidenceRefs"
+        ],
+        "properties": {
+          "id": { "type": "string", "minLength": 1, "maxLength": 128 },
+          "priority": { "type": "integer", "minimum": 1, "maximum": 100 },
+          "title": { "type": "string", "minLength": 1, "maxLength": 300 },
+          "category": { "type": "string", "enum": ["observe", "contain", "optimize", "repair", "verify"] },
+          "target": { "type": "string", "minLength": 1, "maxLength": 500 },
+          "reason": { "type": "string", "minLength": 1, "maxLength": 2000 },
+          "risk": { "type": "string", "enum": ["low", "medium", "high"] },
+          "requiresConfirmation": { "type": "boolean" },
+          "prerequisites": {
+            "type": "array",
+            "maxItems": 12,
+            "items": { "type": "string", "minLength": 1, "maxLength": 500 }
+          },
+          "steps": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 12,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "kind",
+                "description",
+                "command",
+                "mutatesSystem",
+                "requiresElevation",
+                "confirmationPrompt"
+              ],
+              "properties": {
+                "kind": { "type": "string", "enum": ["command", "pcPulse", "manual"] },
+                "description": { "type": "string", "minLength": 1, "maxLength": 1000 },
+                "command": { "type": ["string", "null"], "maxLength": 4000 },
+                "mutatesSystem": { "type": "boolean" },
+                "requiresElevation": { "type": "boolean" },
+                "confirmationPrompt": { "type": ["string", "null"], "maxLength": 1000 }
+              }
+            }
+          },
+          "validation": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 12,
+            "items": { "type": "string", "minLength": 1, "maxLength": 1000 }
+          },
+          "rollback": {
+            "type": "array",
+            "maxItems": 12,
+            "items": { "type": "string", "minLength": 1, "maxLength": 1000 }
+          },
+          "evidenceRefs": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 32,
+            "items": { "type": "string", "minLength": 1, "maxLength": 512 }
+          }
+        }
+      }
+    },
+    "constraints": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "neverAutoTerminate",
+        "neverAutoApply",
+        "confirmationRequiredForMutations"
+      ],
+      "properties": {
+        "neverAutoTerminate": { "type": "boolean", "const": true },
+        "neverAutoApply": { "type": "boolean", "const": true },
+        "confirmationRequiredForMutations": { "type": "boolean", "const": true }
+      }
+    }
+  }
+}
