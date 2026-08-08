@@ -12,7 +12,7 @@ PC Pulse uses sustained conditions and learned baseline deviations instead of al
 
 ## Quick start
 
-1. Download `PcPulse-1.4.3-x64.msi` and `SHA256SUMS.txt` from the [latest release](https://github.com/quorraa/pc-pulse/releases/latest).
+1. Download `PcPulse-1.5.0-x64.msi` and `SHA256SUMS.txt` from the [latest release](https://github.com/quorraa/pc-pulse/releases/latest).
 2. Verify the MSI's SHA-256 hash against the manifest.
 3. Install the MSI from an elevated terminal or Explorer.
 4. Open **PC Pulse** from Start. The collector runs as the `PcPulseCollector` Windows service.
@@ -34,6 +34,15 @@ ETW supplies process lifecycle timing, PDH supplies localized system performance
 ## Terminal interface
 
 The TUI ships two presentation profiles: **vitals** (default), a patient-monitor identity with top header, tabs, and a bottom footer, and **avionics**, an amber-CRT multi-function display with a left bezel-key rail, a top annunciator strip that keeps one lamp per finding class lit from every page, and an Observe canvas rebuilt around a custom pressure-map treemap — every major process becomes a clickable tile sized by working set and colored/heated by its dominant pressure channel. Start with `PcPulse.exe --theme vitals|avionics` or cycle live with `t`.
+
+| Vitals (default) | Avionics |
+|---|---|
+| ![Observe — pressure field, suspect ranking, load ribbon](docs/media/vitals-observe.png) | ![Observe — the pressure-map treemap under the annunciator strip](docs/media/avionics-observe.png) |
+| ![Process hunt — sortable spectrum and process lens](docs/media/vitals-hunt.png) | ![Findings — annunciator lamps and the finding archive](docs/media/avionics-incidents.png) |
+
+![Oracle — the embedded systems-analyzer chat](docs/media/vitals-oracle.png)
+
+Screenshots are captured from the deterministic render gallery (`cargo test -p pcpulse-tui --lib dev_render_gallery -- --ignored` with `PCPULSE_GALLERY_DIR` set), which renders every page in both profiles at four terminal sizes from synthetic fixture data.
 
 The TUI has eight views:
 
@@ -148,16 +157,16 @@ cargo build --workspace --release
 Create the three Rust executables, MSI, and SHA-256 manifest:
 
 ```powershell
-.\scripts\Build-Release.ps1 -Architecture x64 -Version 1.4.3
+.\scripts\Build-Release.ps1 -Architecture x64 -Version 1.5.0
 ```
 
 For a signed release:
 
 ```powershell
-.\scripts\Build-Release.ps1 -Version 1.4.3 -CertificateThumbprint YOUR_SHA1_THUMBPRINT
+.\scripts\Build-Release.ps1 -Version 1.5.0 -CertificateThumbprint YOUR_SHA1_THUMBPRINT
 ```
 
-Outputs are placed in `artifacts`, including `PcPulse-1.4.3-x64.msi`, `SHA256SUMS.txt`, and:
+Outputs are placed in `artifacts`, including `PcPulse-1.5.0-x64.msi`, `SHA256SUMS.txt`, and:
 
 ```text
 artifacts\publish\PcPulse.Service.exe
@@ -170,7 +179,7 @@ artifacts\publish\PcPulse.Notify.exe
 Install or upgrade from an elevated terminal:
 
 ```powershell
-msiexec.exe /i .\artifacts\PcPulse-1.4.3-x64.msi
+msiexec.exe /i .\artifacts\PcPulse-1.5.0-x64.msi
 ```
 
 Open **PC Pulse** from Start, or run:
@@ -240,7 +249,7 @@ The named pipe rejects remote clients, caps messages at one MiB, and grants acce
 Use Apps > Installed apps, or:
 
 ```powershell
-msiexec.exe /x .\artifacts\PcPulse-1.4.3-x64.msi
+msiexec.exe /x .\artifacts\PcPulse-1.5.0-x64.msi
 ```
 
 For development installs, `scripts\Uninstall-Service.ps1` removes the service, notifier startup entry, binaries, settings, and history. Pass `-KeepHistory` to retain `%ProgramData%\PcPulse`.

@@ -10,3 +10,4 @@ artifacts/
 *.db-shm
 *.db-wal
 *.log
+.playwright-mcp/

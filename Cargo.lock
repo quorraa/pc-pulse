@@ -758,7 +758,7 @@ dependencies = [
 
 [[package]]
 name = "pcpulse-service"
-version = "1.4.3"
+version = "1.5.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -776,7 +776,7 @@ dependencies = [
 
 [[package]]
 name = "pcpulse-tui"
-version = "1.4.3"
+version = "1.5.0"
 dependencies = [
  "anyhow",
  "chrono",
