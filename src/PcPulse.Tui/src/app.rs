@@ -772,7 +772,6 @@ pub struct App {
     pub alert_state: TableState,
     /// Most recent left click on a finding row, for double-click detection.
     alert_last_click: Option<(usize, Instant)>,
-    vault_last_click: Option<(usize, Instant)>,
     pub plan_action_state: ListState,
     pub setting_state: TableState,
     pub worker: Worker,
@@ -862,7 +861,6 @@ impl App {
             tree_state: TableState::default().with_selected(0),
             alert_state: TableState::default().with_selected(0),
             alert_last_click: None,
-            vault_last_click: None,
             plan_action_state: ListState::default().with_selected(Some(0)),
             setting_state: TableState::default().with_selected(0),
             worker,
@@ -1811,10 +1809,9 @@ impl App {
         }
     }
 
-    /// A click on a Chat Vault row selects it and focuses the vault so
-    /// r/rename and d/delete work; a second click within the double-click
-    /// window (or Enter) restores the conversation. The "＋ NEW CHAT" row
-    /// still acts on the first click.
+    /// A click on a Chat Vault row shows that conversation immediately —
+    /// the natural click contract for a chat list — and keeps the vault
+    /// focused so r/rename and d/delete still target the clicked chat.
     pub(crate) fn register_vault_click(&mut self, index: usize) {
         if index == 0 {
             self.begin_new_chat();
@@ -1823,20 +1820,10 @@ impl App {
         if index > self.chat_sessions.len() {
             return;
         }
+        self.activate_chat_history_index(index);
         self.chat_history_focused = true;
-        self.chat_session_state.select(Some(index));
-        let now = Instant::now();
-        let is_double = self.vault_last_click.take().is_some_and(|(last, at)| {
-            last == index && now.duration_since(at) <= DOUBLE_CLICK_WINDOW
-        });
-        if is_double {
-            self.activate_chat_history_index(index);
-        } else {
-            self.vault_last_click = Some((index, now));
-            self.status = "Chat selected · click again or Enter to restore · r rename · d delete"
-                .into();
-            self.status_is_error = false;
-        }
+        self.status = "Chat restored · r rename · d delete · Esc leaves the vault".into();
+        self.status_is_error = false;
     }
 
     pub(crate) fn activate_chat_history_index(&mut self, index: usize) {
@@ -2493,22 +2480,18 @@ mod tests {
     }
 
     #[test]
-    fn vault_clicks_select_first_and_restore_on_double_click() {
+    fn a_vault_click_shows_the_chat_and_keeps_rename_reachable() {
         let mut app = app_with_vault_session("Morning hunt question");
         let saved = app.conversation_id.clone();
         app.begin_new_chat();
         assert_ne!(app.conversation_id, saved);
 
-        // First click on a saved chat selects and focuses — rename/delete
-        // now have a target — without restoring the conversation.
+        // One click shows the conversation — the click contract of a chat
+        // list — and the vault stays focused so r/d target the clicked chat.
         app.register_vault_click(1);
+        assert_eq!(app.conversation_id, saved, "a click must show the chat");
         assert!(app.chat_history_focused);
         assert_eq!(app.chat_session_state.selected(), Some(1));
-        assert_ne!(app.conversation_id, saved, "single click must not restore");
-
-        // Second click within the window restores.
-        app.register_vault_click(1);
-        assert_eq!(app.conversation_id, saved);
     }
 
     #[test]

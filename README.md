@@ -90,7 +90,7 @@ Important keys:
 | `t` | Cycle presentation profiles (vitals / avionics); the choice is saved per user |
 | `?` | Open the keys overlay on top of any page; `Esc`, `?`, or a click closes it (the Keys page itself stays on `8`) |
 | `q` / `Ctrl-C` | Exit the TUI; the collector continues |
-| Left-click | Select tabs, process/tree/finding rows, settings, Chat Vault rows, or the Oracle prompt; double-click a Chat Vault row to restore it |
+| Left-click | Select tabs, process/tree/finding rows, settings, or the Oracle prompt; clicking a Chat Vault row opens that chat and keeps the vault focused for rename/delete |
 | Click any table header | Sort the overview suspects, processes, lineage rows, findings, or settings by that column |
 | Mouse wheel | Scroll the active table, finding list, or Oracle conversation; zoom Timeline history |
 | Right-click a process | Open the existing typed-PID termination confirmation; never terminate directly |
