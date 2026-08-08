@@ -142,6 +142,27 @@ pub fn handle_mouse(app: &mut App, event: MouseEvent, area: Rect) -> bool {
         } else {
             return false;
         }
+    } else if matches!(app.mode, InputMode::EditSetting { .. }) {
+        // Clicking away from the edited value cancels the edit like Esc,
+        // then the click acts normally (selecting another row re-enters
+        // editing there). Clicking the row being edited keeps the edit.
+        if let MouseEventKind::Down(MouseButton::Left) = event.kind {
+            let point = (event.column, event.row);
+            let table = inset(settings_regions(regions(area).body).0);
+            let clicked_row = table_row_at(
+                table,
+                point,
+                2,
+                app.setting_state.offset(),
+                app.visible_setting_fields().len(),
+            );
+            if clicked_row.is_some() && clicked_row == app.setting_state.selected() {
+                return false;
+            }
+            app.mode = InputMode::Normal;
+        } else {
+            return false;
+        }
     } else if !matches!(app.mode, InputMode::Normal) {
         return false;
     }
@@ -4723,6 +4744,69 @@ mod tests {
             assert!(handle_mouse(&mut app, event, area));
             assert_eq!(app.process_sort, expected);
         }
+    }
+
+    #[test]
+    fn clicking_away_from_a_setting_edit_cancels_it_like_esc() {
+        let _theme = theme::test_support::activate(theme::ThemeId::Vitals);
+        let mut app = sample_app();
+        app.page = Page::Settings;
+        let area = Rect::new(0, 0, 160, 48);
+        let table = inset(settings_regions(regions(area).body).0);
+        let click = |app: &mut App, column: u16, row: u16| {
+            handle_mouse(
+                app,
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column,
+                    row,
+                    modifiers: ratatui::crossterm::event::KeyModifiers::NONE,
+                },
+                area,
+            )
+        };
+        // Click the CLIENT timeout row (index 2) to start a typed edit.
+        // Rows begin at table.y + 1 + header_height(2).
+        click(&mut app, table.x + 2, table.y + 3 + 2);
+        assert!(matches!(
+            app.mode,
+            InputMode::EditSetting {
+                field: SettingField::ClientTimeout,
+                ..
+            }
+        ));
+        // Clicking the row being edited keeps the edit.
+        click(&mut app, table.x + 4, table.y + 3 + 2);
+        assert!(matches!(
+            app.mode,
+            InputMode::EditSetting {
+                field: SettingField::ClientTimeout,
+                ..
+            }
+        ));
+        // Clicking another editable row cancels this edit and begins there.
+        click(&mut app, table.x + 2, table.y + 3 + 4);
+        match &app.mode {
+            InputMode::EditSetting { field, .. } => {
+                assert_ne!(*field, SettingField::ClientTimeout)
+            }
+            InputMode::Normal => {}
+            other => panic!("unexpected mode after clicking another row: {other:?}"),
+        }
+        // Re-enter the timeout edit, then click a tab: the edit cancels and
+        // the navigation happens — no Esc required.
+        app.page = Page::Settings;
+        app.mode = InputMode::EditSetting {
+            field: SettingField::ClientTimeout,
+            typed: "120".into(),
+        };
+        let tabs = regions(area).tabs;
+        let hunt_column = (tabs.x..tabs.right())
+            .find(|column| route_at(*column, tabs) == Some(Page::Processes))
+            .expect("Hunt tab should have a clickable cell");
+        assert!(click(&mut app, hunt_column, tabs.y));
+        assert!(matches!(app.mode, InputMode::Normal));
+        assert_eq!(app.page, Page::Processes);
     }
 
     #[test]
