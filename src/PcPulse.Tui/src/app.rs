@@ -382,6 +382,7 @@ pub enum WorkerCommand {
         conversation_id: String,
         history: Vec<ChatMessage>,
         hours: u32,
+        focus_alert: Option<Alert>,
     },
     CancelAnalyzer,
     LoadSettings,
@@ -480,7 +481,7 @@ fn worker_loop(commands: Receiver<WorkerCommand>, events: Sender<WorkerEvent>) {
                             crate::analyzer::chatgpt_subscription_status().map_err(error_text),
                         ));
                     }
-                    Ok(WorkerCommand::RunChat { conversation_id, history, hours }) if analyzer.is_none() => {
+                    Ok(WorkerCommand::RunChat { conversation_id, history, hours, focus_alert }) if analyzer.is_none() => {
                         let cancellation = Arc::new(AtomicBool::new(false));
                         let worker_cancellation = Arc::clone(&cancellation);
                         let worker_events = events.clone();
@@ -491,6 +492,7 @@ fn worker_loop(commands: Receiver<WorkerCommand>, events: Sender<WorkerEvent>) {
                                     &conversation_id,
                                     &history,
                                     hours,
+                                    focus_alert,
                                     worker_cancellation,
                                 )
                                     .map_err(error_text);
@@ -940,7 +942,7 @@ impl App {
                 self.mode = InputMode::Chat(value);
             }
             KeyCode::Enter if !value.trim().is_empty() => {
-                self.submit_chat_message(value.trim().to_string(), Vec::new());
+                self.submit_chat_message(value.trim().to_string(), Vec::new(), None);
                 self.mode = InputMode::Normal;
             }
             _ => {}
@@ -952,7 +954,12 @@ impl App {
     /// composed by an investigation. Records the user turn, arms the running
     /// state and timeout ticker, clears the sticky error, and hands the
     /// bounded history to the worker.
-    fn submit_chat_message(&mut self, text: String, evidence_refs: Vec<String>) {
+    fn submit_chat_message(
+        &mut self,
+        text: String,
+        evidence_refs: Vec<String>,
+        focus_alert: Option<Alert>,
+    ) {
         let message = ChatMessage {
             role: ChatRole::User,
             timestamp_ms: Utc::now().timestamp_millis(),
@@ -976,6 +983,7 @@ impl App {
             conversation_id: self.conversation_id.clone(),
             history: self.outgoing_chat_history(),
             hours: self.analyzer_window_hours,
+            focus_alert,
         };
         if self.worker.commands.try_send(command).is_err() {
             self.analyzer_running = false;
@@ -1002,7 +1010,10 @@ impl App {
         let question = compose_investigation_question(&alert);
         self.select_page(Page::Analyzer);
         self.begin_new_chat();
-        self.submit_chat_message(question, vec![format!("alert:{}", alert.id)]);
+        // Carry the full finding so the analyzer's evidence bundle contains
+        // it even when it has aged out of the fresh-context window; the
+        // citation contract only accepts references backed by the bundle.
+        self.submit_chat_message(question, vec![format!("alert:{}", alert.id)], Some(alert));
     }
 
     /// A left click on a finding row: always select it; a second click on the
@@ -1832,14 +1843,22 @@ mod tests {
                 WorkerCommand::RunChat {
                     conversation_id,
                     history,
+                    focus_alert,
                     ..
-                } => Some((conversation_id, history)),
+                } => Some((conversation_id, history, focus_alert)),
                 _ => None,
             })
             .expect("investigation must enqueue a RunChat command");
         assert_eq!(run.0, &app.conversation_id);
         assert_eq!(run.1.len(), 1);
         assert!(run.1[0].text.starts_with("Investigate finding finding-77:"));
+        // The full finding rides along so the analyzer folds it into the
+        // evidence bundle — otherwise citing alert:<id> fails validation
+        // whenever the finding has aged out of the fresh-context window.
+        assert_eq!(
+            run.2.as_ref().map(|alert| alert.id.as_str()),
+            Some("finding-77")
+        );
     }
 
     #[test]

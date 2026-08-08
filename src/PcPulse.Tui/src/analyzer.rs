@@ -1,6 +1,6 @@
 use crate::client::PipeClient;
 use anyhow::{Context, Result, anyhow, bail};
-use pcpulse_service::models::{AgentContext, OptimizationPlan, PlanAction};
+use pcpulse_service::models::{AgentContext, Alert, OptimizationPlan, PlanAction};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashSet,
@@ -120,11 +120,13 @@ pub fn chat(
     conversation_id: &str,
     conversation: &[ChatMessage],
     window_hours: u32,
+    focus_alert: Option<Alert>,
     cancelled: Arc<AtomicBool>,
 ) -> Result<ChatResponse> {
     chatgpt_subscription_status()?;
     let client = PipeClient;
-    let context = client.agent_context(window_hours)?;
+    let mut context = client.agent_context(window_hours)?;
+    inject_focus_alert(&mut context, focus_alert);
     let temporary = TemporaryArtifacts::create(CHAT_SCHEMA, "chat-response")?;
     run_chat(
         conversation_id,
@@ -479,6 +481,17 @@ fn validate_chat_response(
     Ok(())
 }
 
+/// An investigated finding may have aged out of the fresh-context window;
+/// fold it into the bundle so the analyzer sees its data and the citation
+/// contract accepts `alert:<id>` references to it.
+fn inject_focus_alert(context: &mut AgentContext, focus_alert: Option<Alert>) {
+    if let Some(alert) = focus_alert
+        && !context.recent_alerts.iter().any(|item| item.id == alert.id)
+    {
+        context.recent_alerts.push(alert);
+    }
+}
+
 fn evidence_set(context: &AgentContext) -> HashSet<String> {
     context
         .process_suspects
@@ -609,6 +622,38 @@ mod tests {
             recent_alerts: Vec::new(),
             limitations: Vec::new(),
         }
+    }
+
+    fn focus_alert(id: &str) -> Alert {
+        Alert {
+            id: id.into(),
+            kind: "sustainedCpu".into(),
+            severity: pcpulse_service::models::Severity::Warning,
+            first_seen_ms: 1,
+            last_seen_ms: 2,
+            process_id: Some(4242),
+            process_name: Some("codex.exe".into()),
+            title: "Sustained CPU".into(),
+            explanation: "test".into(),
+            evidence: Vec::new(),
+            recommendation: "observe".into(),
+            acknowledged: false,
+            occurrence_count: 1,
+            resolved_at_ms: None,
+        }
+    }
+
+    #[test]
+    fn focus_alert_joins_the_evidence_bundle_exactly_once() {
+        let mut bundle = context();
+        inject_focus_alert(&mut bundle, Some(focus_alert("aged-out")));
+        assert_eq!(bundle.recent_alerts.len(), 1);
+        assert!(evidence_set(&bundle).contains("alert:aged-out"));
+        // Already-present findings are not duplicated.
+        inject_focus_alert(&mut bundle, Some(focus_alert("aged-out")));
+        assert_eq!(bundle.recent_alerts.len(), 1);
+        inject_focus_alert(&mut bundle, None);
+        assert_eq!(bundle.recent_alerts.len(), 1);
     }
 
     fn empty_plan() -> OptimizationPlan {

@@ -18,6 +18,7 @@ fn embedded_chat_answers_from_live_evidence() {
         &conversation_id,
         &conversation,
         1,
+        None,
         Arc::new(AtomicBool::new(false)),
     )
     .expect("live embedded chat should complete");
