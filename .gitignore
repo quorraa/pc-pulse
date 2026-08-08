@@ -1,5 +1,7 @@
 /target/
 **/bin/
+!src/PcPulse.Tui/src/bin/
+!src/PcPulse.Tui/src/bin/pcpulse-notify.rs
 **/obj/
 artifacts/
 .vs/
