@@ -374,8 +374,7 @@ fn mouse_body_click(
                 app.chat_session_state.offset(),
                 app.chat_sessions.len() + 1,
             ) {
-                app.chat_session_state.select(Some(index));
-                app.activate_chat_history_index(index);
+                app.register_vault_click(index);
                 return true;
             }
             if point_in(inset(columns[0]), point) {

@@ -772,6 +772,7 @@ pub struct App {
     pub alert_state: TableState,
     /// Most recent left click on a finding row, for double-click detection.
     alert_last_click: Option<(usize, Instant)>,
+    vault_last_click: Option<(usize, Instant)>,
     pub plan_action_state: ListState,
     pub setting_state: TableState,
     pub worker: Worker,
@@ -861,6 +862,7 @@ impl App {
             tree_state: TableState::default().with_selected(0),
             alert_state: TableState::default().with_selected(0),
             alert_last_click: None,
+            vault_last_click: None,
             plan_action_state: ListState::default().with_selected(Some(0)),
             setting_state: TableState::default().with_selected(0),
             worker,
@@ -1065,6 +1067,14 @@ impl App {
             }
             KeyCode::Char('h') if self.page == Page::Analyzer && !self.analyzer_running => {
                 self.chat_history_focused = !self.chat_history_focused;
+                // Land on the first saved chat, not the "＋ NEW CHAT" row, so
+                // r/d act on a real session immediately.
+                if self.chat_history_focused
+                    && !self.chat_sessions.is_empty()
+                    && self.chat_session_state.selected().unwrap_or(0) == 0
+                {
+                    self.chat_session_state.select(Some(1));
+                }
             }
             KeyCode::Char('n' | 'c') if self.page == Page::Analyzer && !self.analyzer_running => {
                 self.begin_new_chat();
@@ -1801,6 +1811,34 @@ impl App {
         }
     }
 
+    /// A click on a Chat Vault row selects it and focuses the vault so
+    /// r/rename and d/delete work; a second click within the double-click
+    /// window (or Enter) restores the conversation. The "＋ NEW CHAT" row
+    /// still acts on the first click.
+    pub(crate) fn register_vault_click(&mut self, index: usize) {
+        if index == 0 {
+            self.begin_new_chat();
+            return;
+        }
+        if index > self.chat_sessions.len() {
+            return;
+        }
+        self.chat_history_focused = true;
+        self.chat_session_state.select(Some(index));
+        let now = Instant::now();
+        let is_double = self.vault_last_click.take().is_some_and(|(last, at)| {
+            last == index && now.duration_since(at) <= DOUBLE_CLICK_WINDOW
+        });
+        if is_double {
+            self.activate_chat_history_index(index);
+        } else {
+            self.vault_last_click = Some((index, now));
+            self.status = "Chat selected · click again or Enter to restore · r rename · d delete"
+                .into();
+            self.status_is_error = false;
+        }
+    }
+
     pub(crate) fn activate_chat_history_index(&mut self, index: usize) {
         if index == 0 {
             self.begin_new_chat();
@@ -2451,6 +2489,39 @@ mod tests {
             commands
                 .try_iter()
                 .any(|command| matches!(command, WorkerCommand::RunChat { .. }))
+        );
+    }
+
+    #[test]
+    fn vault_clicks_select_first_and_restore_on_double_click() {
+        let mut app = app_with_vault_session("Morning hunt question");
+        let saved = app.conversation_id.clone();
+        app.begin_new_chat();
+        assert_ne!(app.conversation_id, saved);
+
+        // First click on a saved chat selects and focuses — rename/delete
+        // now have a target — without restoring the conversation.
+        app.register_vault_click(1);
+        assert!(app.chat_history_focused);
+        assert_eq!(app.chat_session_state.selected(), Some(1));
+        assert_ne!(app.conversation_id, saved, "single click must not restore");
+
+        // Second click within the window restores.
+        app.register_vault_click(1);
+        assert_eq!(app.conversation_id, saved);
+    }
+
+    #[test]
+    fn focusing_the_vault_lands_on_the_first_saved_chat() {
+        let mut app = app_with_vault_session("Morning hunt question");
+        app.begin_new_chat();
+        assert_eq!(app.chat_session_state.selected(), Some(0));
+        app.handle_key(key(KeyCode::Char('h')));
+        assert!(app.chat_history_focused);
+        assert_eq!(
+            app.chat_session_state.selected(),
+            Some(1),
+            "focus should land on a renameable chat, not the new-chat row"
         );
     }
 
