@@ -162,10 +162,100 @@ fn run_chat(
     )?;
     let payload = fs::read_to_string(&temporary.output_path)
         .context("Codex completed without writing a chat response")?;
-    let response: ChatResponse =
+    let mut response: ChatResponse =
         serde_json::from_str(&payload).context("Codex returned an invalid chat response")?;
+    repair_chat_citations(&mut response, &evidence_set(context))?;
     validate_chat_response(&response, conversation_id, context)?;
     Ok(response)
+}
+
+/// Models garble long UUIDs when transcribing many of them (observed: a
+/// single response citing the same finding as `…450aa38a` and `…45038a`).
+/// Rather than rejecting an otherwise-valid answer for one slipped
+/// character, repair each citation to its unique near-match in the evidence
+/// set, drop citations that cannot be repaired unambiguously, and fail only
+/// when an answer that tried to cite evidence is left with no valid
+/// citation at all.
+fn repair_chat_citations(
+    response: &mut ChatResponse,
+    evidence: &HashSet<String>,
+) -> Result<()> {
+    let cited_any = !response.evidence_refs.is_empty();
+    repair_reference_list(&mut response.evidence_refs, evidence);
+    for action in &mut response.proposed_actions {
+        repair_reference_list(&mut action.evidence_refs, evidence);
+    }
+    if cited_any && response.evidence_refs.is_empty() {
+        bail!("Codex chat cited only unknown evidence references");
+    }
+    Ok(())
+}
+
+fn repair_reference_list(references: &mut Vec<String>, evidence: &HashSet<String>) {
+    references.retain_mut(|reference| {
+        if evidence.contains(reference.as_str()) {
+            return true;
+        }
+        if let Some(repaired) = unambiguous_near_match(reference, evidence) {
+            *reference = repaired;
+            return true;
+        }
+        false
+    });
+    references.dedup();
+}
+
+/// A reference is repairable when exactly one collected reference sits
+/// within a small edit distance of it; two or more equally-close candidates
+/// stay ambiguous and the citation is dropped instead.
+fn unambiguous_near_match(reference: &str, evidence: &HashSet<String>) -> Option<String> {
+    const MAX_DISTANCE: usize = 3;
+    let mut best: Option<(usize, &str)> = None;
+    let mut tied = false;
+    for candidate in evidence {
+        let distance = edit_distance(reference, candidate, MAX_DISTANCE);
+        let Some(distance) = distance else { continue };
+        match best {
+            Some((current, _)) if distance > current => {}
+            Some((current, _)) if distance == current => tied = true,
+            _ => {
+                best = Some((distance, candidate));
+                tied = false;
+            }
+        }
+    }
+    match best {
+        Some((_, candidate)) if !tied => Some(candidate.to_string()),
+        _ => None,
+    }
+}
+
+/// Bounded Levenshtein distance: returns None once the distance exceeds
+/// `maximum`, keeping the scan cheap over the small evidence set.
+fn edit_distance(left: &str, right: &str, maximum: usize) -> Option<usize> {
+    let left: Vec<char> = left.chars().collect();
+    let right: Vec<char> = right.chars().collect();
+    if left.len().abs_diff(right.len()) > maximum {
+        return None;
+    }
+    let mut previous: Vec<usize> = (0..=right.len()).collect();
+    let mut current = vec![0; right.len() + 1];
+    for (row, left_char) in left.iter().enumerate() {
+        current[0] = row + 1;
+        let mut row_minimum = current[0];
+        for (column, right_char) in right.iter().enumerate() {
+            let substitution = previous[column] + usize::from(left_char != right_char);
+            current[column + 1] = substitution
+                .min(previous[column + 1] + 1)
+                .min(current[column] + 1);
+            row_minimum = row_minimum.min(current[column + 1]);
+        }
+        if row_minimum > maximum {
+            return None;
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+    (previous[right.len()] <= maximum).then_some(previous[right.len()])
 }
 
 pub fn generate_and_save(
@@ -208,8 +298,15 @@ fn run_generate(
     )?;
     let payload = fs::read_to_string(&temporary.output_path)
         .context("Codex completed without writing an optimization plan")?;
-    let plan: OptimizationPlan =
+    let mut plan: OptimizationPlan =
         serde_json::from_str(&payload).context("Codex returned an invalid optimization plan")?;
+    let evidence = evidence_set(context);
+    for diagnosis in &mut plan.diagnoses {
+        repair_reference_list(&mut diagnosis.evidence_refs, &evidence);
+    }
+    for action in &mut plan.actions {
+        repair_reference_list(&mut action.evidence_refs, &evidence);
+    }
     validate_against_context(&plan, context)?;
     Ok(plan)
 }
@@ -641,6 +738,71 @@ mod tests {
             occurrence_count: 1,
             resolved_at_ms: None,
         }
+    }
+
+    #[test]
+    fn garbled_uuid_citations_repair_to_their_unique_near_match() {
+        // The real-world failure: one dropped character in a 36-char UUID.
+        let mut bundle = context();
+        bundle
+            .recent_alerts
+            .push(focus_alert("64c9a463-f5eb-4874-a98f-784a450aa38a"));
+        bundle
+            .recent_alerts
+            .push(focus_alert("4ad51137-7fc7-457f-83ce-fed484be6673"));
+        let evidence = evidence_set(&bundle);
+        let mut refs = vec![
+            "alert:64c9a463-f5eb-4874-a98f-784a45038a".to_string(),
+            "alert:4ad51137-7fc7-457f-83ce-fed484be6673".to_string(),
+            "alert:totally-fabricated".to_string(),
+        ];
+        repair_reference_list(&mut refs, &evidence);
+        assert_eq!(
+            refs,
+            vec![
+                "alert:64c9a463-f5eb-4874-a98f-784a450aa38a".to_string(),
+                "alert:4ad51137-7fc7-457f-83ce-fed484be6673".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn ambiguous_near_matches_stay_dropped() {
+        let mut bundle = context();
+        bundle.recent_alerts.push(focus_alert("twin-aaaa"));
+        bundle.recent_alerts.push(focus_alert("twin-aaab"));
+        let evidence = evidence_set(&bundle);
+        // Equidistant from both twins: repair must refuse to guess.
+        let mut refs = vec!["alert:twin-aaac".to_string()];
+        repair_reference_list(&mut refs, &evidence);
+        assert!(refs.is_empty());
+    }
+
+    #[test]
+    fn chat_with_only_unknown_citations_is_still_rejected() {
+        let mut response = ChatResponse {
+            schema_version: 1,
+            conversation_id: "conversation-1".into(),
+            context_id: "context-1".into(),
+            generated_at_ms: 123,
+            agent_name: "pcpulse-systems-analyzer".into(),
+            answer: "Answer".into(),
+            evidence_refs: vec!["alert:fabricated-from-nothing".into()],
+            proposed_actions: Vec::new(),
+            suggested_follow_ups: Vec::new(),
+        };
+        let error = repair_chat_citations(&mut response, &evidence_set(&context()))
+            .expect_err("an answer citing only unknown evidence must fail");
+        assert!(error.to_string().contains("only unknown evidence"));
+    }
+
+    #[test]
+    fn bounded_edit_distance_reports_and_cuts_off() {
+        assert_eq!(edit_distance("abc", "abc", 3), Some(0));
+        assert_eq!(edit_distance("abc", "abd", 3), Some(1));
+        assert_eq!(edit_distance("abc", "ab", 3), Some(1));
+        assert_eq!(edit_distance("abcdef", "uvwxyz", 3), None);
+        assert_eq!(edit_distance("short", "very-much-longer", 3), None);
     }
 
     #[test]
