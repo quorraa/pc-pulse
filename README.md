@@ -1,5 +1,7 @@
 # PC Pulse
 
+<p align="center"><img src="docs/media/logo.svg" alt="PC Pulse — workstation vital signs" width="640"></p>
+
 [![Windows CI](https://github.com/quorraa/pc-pulse/actions/workflows/ci.yml/badge.svg)](https://github.com/quorraa/pc-pulse/actions/workflows/ci.yml)
 [![Latest release](https://img.shields.io/github/v/release/quorraa/pc-pulse?display_name=tag)](https://github.com/quorraa/pc-pulse/releases/latest)
 [![License: MIT](https://img.shields.io/badge/license-MIT-70e1c1.svg)](LICENSE)

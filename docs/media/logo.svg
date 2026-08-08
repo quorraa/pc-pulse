@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1380 400" role="img" aria-label="PC Pulse — workstation vital signs">
+  <rect x="6" y="6" width="1368" height="388" rx="72" fill="#050907" stroke="#1F3227" stroke-width="4"/>
+  <!-- faint monitor grid, badge zone -->
+  <g stroke="#0F1A13" stroke-width="2">
+    <line x1="64" y1="128" x2="420" y2="128"/>
+    <line x1="64" y1="200" x2="420" y2="200"/>
+    <line x1="64" y1="272" x2="420" y2="272"/>
+    <line x1="152" y1="64" x2="152" y2="336"/>
+    <line x1="242" y1="64" x2="242" y2="336"/>
+    <line x1="332" y1="64" x2="332" y2="336"/>
+  </g>
+  <!-- ECG glow -->
+  <path d="M60 200 L140 200 C148 200 150 186 160 186 C170 186 172 200 180 200 L202 200 L216 214 L238 96 L260 258 L274 200 L296 200 C304 200 309 181 319 181 C329 181 334 200 342 200 L396 200"
+        fill="none" stroke="#52F084" stroke-opacity="0.22" stroke-width="30" stroke-linecap="round" stroke-linejoin="round"/>
+  <!-- ECG trace -->
+  <path d="M60 200 L140 200 C148 200 150 186 160 186 C170 186 172 200 180 200 L202 200 L216 214 L238 96 L260 258 L274 200 L296 200 C304 200 309 181 319 181 C329 181 334 200 342 200 L396 200"
+        fill="none" stroke="#52F084" stroke-width="14" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="404" cy="200" r="10" fill="#D8E9DE"/>
+  <circle cx="404" cy="200" r="17" fill="none" stroke="#52F084" stroke-opacity="0.35" stroke-width="5"/>
+  <!-- divider -->
+  <line x1="470" y1="90" x2="470" y2="310" stroke="#1F3227" stroke-width="4"/>
+  <!-- wordmark -->
+  <text x="530" y="218" font-family="'Cascadia Mono','Consolas','DejaVu Sans Mono',monospace" font-size="118" font-weight="700" letter-spacing="6" fill="#D8E9DE">PC PULSE</text>
+  <text x="534" y="292" font-family="'Cascadia Mono','Consolas','DejaVu Sans Mono',monospace" font-size="40" letter-spacing="10" fill="#6F8577">WORKSTATION VITAL SIGNS</text>
+</svg>
