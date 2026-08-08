@@ -192,11 +192,11 @@ fn run_loop(terminal: &mut ratatui::DefaultTerminal, effects_enabled: bool) -> R
                     dirty = true;
                 }
                 Event::Resize(_, _) => dirty = true,
-                Event::Mouse(mouse) => {
-                    if ui::handle_mouse(&mut app, mouse, terminal_area) {
-                        motion.observe(&app);
-                        dirty = true;
-                    }
+                Event::Mouse(mouse)
+                    if ui::handle_mouse(&mut app, mouse, terminal_area) =>
+                {
+                    motion.observe(&app);
+                    dirty = true;
                 }
                 _ => {}
             }
