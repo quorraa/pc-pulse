@@ -15,6 +15,9 @@ pub struct PdhSample {
     pub disk_latency_ms: f64,
     pub dpc_rate: f64,
     pub interrupt_rate: f64,
+    /// Effective processor frequency (base MHz × % performance), or `None`
+    /// when the "Processor Information" counter set is unavailable.
+    pub cpu_frequency_mhz: Option<f64>,
 }
 
 pub struct PdhCollector {
@@ -23,6 +26,11 @@ pub struct PdhCollector {
     disk_latency: PDH_HCOUNTER,
     dpc_rate: PDH_HCOUNTER,
     interrupt_rate: PDH_HCOUNTER,
+    /// Optional pair: base frequency plus % performance. Missing on systems
+    /// without the "Processor Information" counter set; the collector then
+    /// simply reports no frequency instead of failing to start.
+    processor_frequency: Option<PDH_HCOUNTER>,
+    processor_performance: Option<PDH_HCOUNTER>,
 }
 
 // PDH query handles are valid across the dedicated sampling thread.
@@ -42,6 +50,16 @@ impl PdhCollector {
                 disk_latency: add_counter(query, r"\PhysicalDisk(_Total)\Avg. Disk sec/Transfer")?,
                 dpc_rate: add_counter(query, r"\Processor(_Total)\DPC Rate")?,
                 interrupt_rate: add_counter(query, r"\Processor(_Total)\Interrupts/sec")?,
+                processor_frequency: add_counter(
+                    query,
+                    r"\Processor Information(_Total)\Processor Frequency",
+                )
+                .ok(),
+                processor_performance: add_counter(
+                    query,
+                    r"\Processor Information(_Total)\% Processor Performance",
+                )
+                .ok(),
             };
             // Rate counters require two samples. Prime them without blocking.
             let _ = PdhCollectQueryData(query);
@@ -59,8 +77,30 @@ impl PdhCollector {
                 disk_latency_ms: (formatted(self.disk_latency) * 1_000.0).max(0.0),
                 dpc_rate: formatted(self.dpc_rate).max(0.0),
                 interrupt_rate: formatted(self.interrupt_rate).max(0.0),
+                cpu_frequency_mhz: self.effective_frequency_mhz(),
             }
         }
+    }
+}
+
+impl PdhCollector {
+    /// Current effective MHz: base frequency scaled by % performance (which
+    /// exceeds 100 under turbo). Falls back to the raw base frequency when
+    /// the performance counter is missing, and to `None` when neither
+    /// counter yields a positive value.
+    fn effective_frequency_mhz(&self) -> Option<f64> {
+        let base = unsafe { formatted(self.processor_frequency?) };
+        if base <= 0.0 {
+            return None;
+        }
+        let performance = self
+            .processor_performance
+            .map(|counter| unsafe { formatted(counter) })
+            .filter(|value| *value > 0.0);
+        Some(match performance {
+            Some(percent) => base * percent / 100.0,
+            None => base,
+        })
     }
 }
 

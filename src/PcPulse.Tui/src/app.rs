@@ -10,8 +10,8 @@ use crossbeam_channel::{Receiver, Sender, bounded, select};
 use pcpulse_service::{
     config::Settings,
     models::{
-        Alert, DiagnosticLogResponse, DiagnosticLogStatus, HistoryResponse, OptimizationPlan,
-        ProcessMetric, ProcessNode, Severity, Snapshot, SystemMetric,
+        Alert, DiagnosticLogResponse, DiagnosticLogStatus, HardwareMetrics, HistoryResponse,
+        OptimizationPlan, ProcessMetric, ProcessNode, Severity, Snapshot, SystemMetric,
     },
 };
 use ratatui::{
@@ -54,10 +54,11 @@ pub enum Page {
     Analyzer,
     Settings,
     Help,
+    Hardware,
 }
 
 impl Page {
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::Overview,
         Self::Processes,
         Self::Tree,
@@ -66,6 +67,7 @@ impl Page {
         Self::Analyzer,
         Self::Settings,
         Self::Help,
+        Self::Hardware,
     ];
 
     pub const fn title(self) -> &'static str {
@@ -78,6 +80,7 @@ impl Page {
             Self::Analyzer => "Analyzer",
             Self::Settings => "Settings",
             Self::Help => "Keys",
+            Self::Hardware => "Gauges",
         }
     }
 }
@@ -175,6 +178,15 @@ impl ProcessSort {
 pub struct TreeRow {
     pub depth: usize,
     pub process: ProcessMetric,
+}
+
+/// One temperature source's recent readings for the GAUGES sparklines —
+/// a client-side ring buffer fed from snapshots, bounded exactly like
+/// [`App::live_history`].
+#[derive(Debug, Clone)]
+pub struct HardwareTrace {
+    pub label: String,
+    pub points: VecDeque<f64>,
 }
 
 #[derive(Debug, Clone)]
@@ -707,6 +719,13 @@ pub struct App {
     pub status: String,
     pub status_is_error: bool,
     pub live_history: VecDeque<SystemMetric>,
+    /// GAUGES sparklines: one bounded trace per temperature source, fed
+    /// only when a snapshot carries a fresh hardware sample.
+    pub hardware_history: Vec<HardwareTrace>,
+    /// The `sampled_at_ms` of the last hardware sample recorded into
+    /// [`Self::hardware_history`]; the service caches hardware between
+    /// 5-second probes, so most snapshots repeat the previous sample.
+    hardware_history_ms: i64,
     pub persisted_history: HistoryResponse,
     pub alerts: Vec<Alert>,
     pub diagnostics: DiagnosticLogResponse,
@@ -814,6 +833,8 @@ impl App {
                 .unwrap_or_else(|| "Connecting to collector…".into()),
             status_is_error: history_error.is_some(),
             live_history: VecDeque::with_capacity(LIVE_HISTORY_CAPACITY),
+            hardware_history: Vec::new(),
+            hardware_history_ms: 0,
             persisted_history: HistoryResponse {
                 system: Vec::new(),
                 processes: Vec::new(),
@@ -904,6 +925,10 @@ impl App {
                         while self.live_history.len() > LIVE_HISTORY_CAPACITY {
                             self.live_history.pop_front();
                         }
+                    }
+                    if snapshot.hardware.sampled_at_ms != self.hardware_history_ms {
+                        self.hardware_history_ms = snapshot.hardware.sampled_at_ms;
+                        self.record_hardware(&snapshot.hardware);
                     }
                     self.snapshot = Some(snapshot);
                     self.clamp_selection();
@@ -1049,7 +1074,7 @@ impl App {
             KeyCode::Tab | KeyCode::Right if self.page != Page::Settings => self.change_page(1),
             KeyCode::BackTab | KeyCode::Left if self.page != Page::Settings => self.change_page(-1),
             KeyCode::Char('?') => self.help_overlay = Some(0),
-            KeyCode::Char(value @ '1'..='8') => {
+            KeyCode::Char(value @ '1'..='9') => {
                 self.select_page(Page::ALL[(value as u8 - b'1') as usize]);
             }
             KeyCode::Esc if self.page == Page::Analyzer && self.analyzer_running => {
@@ -1589,6 +1614,45 @@ impl App {
     fn set_error(&mut self, error: String) {
         self.status = error;
         self.status_is_error = true;
+    }
+
+    /// Feed the GAUGES sparklines: one point per temperature source per
+    /// fresh hardware sample. Sources that vanish (a zone denied after a
+    /// service restart, a GPU gone) drop their trace; every kept trace is
+    /// bounded to [`LIVE_HISTORY_CAPACITY`] points like `live_history`.
+    fn record_hardware(&mut self, hardware: &HardwareMetrics) {
+        let sources: Vec<(&str, f64)> = hardware
+            .thermal_zones
+            .iter()
+            .map(|zone| (zone.name.as_str(), zone.temperature_c))
+            .chain(hardware.gpus.iter().filter_map(|gpu| {
+                gpu.temperature_c
+                    .map(|temperature| (gpu.name.as_str(), temperature))
+            }))
+            .collect();
+        self.hardware_history
+            .retain(|trace| sources.iter().any(|(label, _)| *label == trace.label));
+        for (label, temperature) in sources {
+            let trace = match self
+                .hardware_history
+                .iter_mut()
+                .position(|trace| trace.label == label)
+            {
+                Some(index) => &mut self.hardware_history[index],
+                None => {
+                    self.hardware_history.push(HardwareTrace {
+                        label: label.to_string(),
+                        points: VecDeque::with_capacity(LIVE_HISTORY_CAPACITY),
+                    });
+                    let last = self.hardware_history.len() - 1;
+                    &mut self.hardware_history[last]
+                }
+            };
+            trace.points.push_back(temperature);
+            while trace.points.len() > LIVE_HISTORY_CAPACITY {
+                trace.points.pop_front();
+            }
+        }
     }
 
     fn bound_chat_history(&mut self) {
@@ -2152,6 +2216,68 @@ mod tests {
                 .assign(&mut settings, "999")
                 .is_err()
         );
+    }
+
+    #[test]
+    fn key_9_routes_to_the_gauges_page_and_tab_cycles_through_it() {
+        let mut app = App::new_inert();
+        app.handle_key(KeyEvent::new(KeyCode::Char('9'), KeyModifiers::NONE));
+        assert_eq!(app.page, Page::Hardware);
+        // Tab wraps from the last page back to Overview.
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.page, Page::Overview);
+        // Shift-Tab reaches GAUGES from Overview.
+        app.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE));
+        assert_eq!(app.page, Page::Hardware);
+        assert_eq!(Page::ALL.len(), 9);
+        assert_eq!(Page::Hardware.title(), "Gauges");
+    }
+
+    #[test]
+    fn hardware_history_records_fresh_samples_bounded_per_source() {
+        use pcpulse_service::models::{GpuMetrics, HardwareMetrics, ThermalZone};
+        let mut app = App::new_inert();
+        for step in 0..200_i64 {
+            let hardware = HardwareMetrics {
+                sampled_at_ms: step * 5_000,
+                cpu_frequency_mhz: Some(4_000.0),
+                thermal_zones: vec![ThermalZone {
+                    name: "TZ00".into(),
+                    temperature_c: 40.0 + step as f64 * 0.1,
+                }],
+                gpus: vec![GpuMetrics {
+                    name: "NVIDIA GeForce RTX 4080".into(),
+                    temperature_c: Some(60.0),
+                    core_clock_mhz: Some(2_550.0),
+                    memory_clock_mhz: Some(10_500.0),
+                    utilization_percent: Some(34.0),
+                }],
+                available: true,
+                detail: String::new(),
+            };
+            // Mirror the drain_events guard: a cached sample whose
+            // sampled_at_ms did not advance is skipped.
+            if hardware.sampled_at_ms != app.hardware_history_ms {
+                app.hardware_history_ms = hardware.sampled_at_ms;
+                app.record_hardware(&hardware);
+            }
+        }
+        assert_eq!(app.hardware_history.len(), 2);
+        for trace in &app.hardware_history {
+            assert!(trace.points.len() <= LIVE_HISTORY_CAPACITY);
+        }
+        // A source that disappears drops its trace; the survivor remains.
+        let survivor_only = HardwareMetrics {
+            sampled_at_ms: 999 * 5_000,
+            thermal_zones: vec![ThermalZone {
+                name: "TZ00".into(),
+                temperature_c: 55.0,
+            }],
+            ..HardwareMetrics::default()
+        };
+        app.record_hardware(&survivor_only);
+        assert_eq!(app.hardware_history.len(), 1);
+        assert_eq!(app.hardware_history[0].label, "TZ00");
     }
 
     #[test]
@@ -2850,7 +2976,10 @@ mod tests {
         // First press only arms.
         app.handle_key(key(KeyCode::Char('d')));
         assert!(app.vault_delete_armed.is_some());
-        assert!(app.status.contains("Press d again to delete 'Old chat to purge'"));
+        assert!(
+            app.status
+                .contains("Press d again to delete 'Old chat to purge'")
+        );
         assert_eq!(app.chat_sessions.len(), 2);
 
         // Any other key disarms; the next d starts over.

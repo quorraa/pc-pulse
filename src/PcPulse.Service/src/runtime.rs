@@ -349,7 +349,8 @@ fn sampling_loop(state: &Arc<AppState>, stop: crossbeam_channel::Receiver<()>) -
         let etw_snapshot = etw
             .as_ref()
             .map_or_else(crate::etw::EtwSnapshot::default, EtwCollector::snapshot);
-        let (system, processes) = collector.collect(timestamp_ms, &settings, &etw_snapshot)?;
+        let (system, processes, hardware) =
+            collector.collect(timestamp_ms, &settings, &etw_snapshot)?;
         let evaluation = state
             .alerts
             .lock()
@@ -364,6 +365,7 @@ fn sampling_loop(state: &Arc<AppState>, stop: crossbeam_channel::Receiver<()>) -
             snapshot.system = system.clone();
             snapshot.processes = processes.clone();
             snapshot.active_alerts = evaluation.active;
+            snapshot.hardware = hardware;
         }
         if Instant::now() >= next_system_write {
             state.storage.insert_system(&system)?;

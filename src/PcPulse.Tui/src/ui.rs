@@ -8,7 +8,8 @@ use crate::{
     theme::{self, LayoutKind, palette},
 };
 use pcpulse_service::models::{
-    Alert, OptimizationPlan, PlanAction, PlanRisk, ProcessMetric, Severity, SystemMetric,
+    Alert, HardwareMetrics, OptimizationPlan, PlanAction, PlanRisk, ProcessMetric, Severity,
+    SystemMetric,
 };
 use ratatui::{
     Frame,
@@ -829,6 +830,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
         Page::Analyzer => render_analyzer(frame, app, regions.body),
         Page::Settings => render_settings(frame, app, regions.body),
         Page::Help => render_help(frame, regions.body),
+        Page::Hardware => render_hardware(frame, app, regions.body),
     }
     if !rail {
         render_footer(frame, app, regions.footer);
@@ -1048,7 +1050,7 @@ fn rail_mode_line(app: &App) -> Line<'static> {
                 Style::default().fg(palette().bg).bg(palette().ok).bold(),
             ),
             Span::styled(
-                format!(" {:02}/08", page_index(app.page) + 1),
+                format!(" {:02}/{:02}", page_index(app.page) + 1, Page::ALL.len()),
                 Style::default().fg(palette().muted),
             ),
         ]),
@@ -1084,7 +1086,8 @@ fn rail_input_line(app: &App) -> Line<'static> {
                 Page::Timeline => "[ ] r",
                 Page::Analyzer => "↵ ask e n h y",
                 Page::Settings => "↵ edit s",
-                Page::Help => "1–8 Tab",
+                Page::Help => "1–9 Tab",
+                Page::Hardware => "r sample",
             };
             return Line::styled(format!(" {hints}"), Style::default().fg(palette().faint));
         }
@@ -1280,6 +1283,7 @@ fn route_name(page: Page) -> &'static str {
         Page::Analyzer => "ORACLE",
         Page::Settings => "TUNE",
         Page::Help => "MANUAL",
+        Page::Hardware => "GAUGES",
     }
 }
 
@@ -1293,6 +1297,7 @@ fn route_short(page: Page) -> &'static str {
         Page::Analyzer => "ASK",
         Page::Settings => "TUNE",
         Page::Help => "HELP",
+        Page::Hardware => "GAUGE",
     }
 }
 
@@ -1311,6 +1316,7 @@ fn route_description(page: Page) -> &'static str {
         Page::Analyzer => "question a systems analyst grounded in live evidence",
         Page::Settings => "shape baselines and sustained thresholds",
         Page::Help => "operate the console without leaving the keyboard",
+        Page::Hardware => "watch temperatures and clocks, best-effort by sensor",
     }
 }
 
@@ -3090,8 +3096,7 @@ pub enum AnalyzerPhase {
 }
 
 const READING_PHRASE: &str = "reading fresh evidence: samples, findings, and event logs…";
-const CORRELATING_PHRASE: &str =
-    "correlating processes, incidents, baselines, and event logs…";
+const CORRELATING_PHRASE: &str = "correlating processes, incidents, baselines, and event logs…";
 const CONSULTING_PHRASE: &str = "consulting the analyst over your Codex session…";
 const WRITING_PHRASE: &str = "writing the validated answer…";
 
@@ -3215,9 +3220,8 @@ fn mix_rgb(from: Color, to: Color, level: f64) -> Color {
     let level = level.clamp(0.0, 1.0);
     match (from, to) {
         (Color::Rgb(r0, g0, b0), Color::Rgb(r1, g1, b1)) => {
-            let mix = |a: u8, b: u8| {
-                (f64::from(a) + (f64::from(b) - f64::from(a)) * level).round() as u8
-            };
+            let mix =
+                |a: u8, b: u8| (f64::from(a) + (f64::from(b) - f64::from(a)) * level).round() as u8;
             Color::Rgb(mix(r0, r1), mix(g0, g1), mix(b0, b1))
         }
         _ => to,
@@ -4022,6 +4026,256 @@ fn format_axis_ms(value: f64) -> String {
     }
 }
 
+/// GAUGES temperature scale: every thermal meter spans 45–95°C so zones
+/// and GPUs read against the same ruler.
+const TEMP_METER_FLOOR_C: f64 = 45.0;
+const TEMP_METER_CEIL_C: f64 = 95.0;
+
+/// Where a temperature sits on the shared 45–95°C meter scale.
+fn temperature_ratio(celsius: f64) -> f64 {
+    ((celsius - TEMP_METER_FLOOR_C) / (TEMP_METER_CEIL_C - TEMP_METER_FLOOR_C)).clamp(0.0, 1.0)
+}
+
+/// [`ratio_color`]'s ok/warn/crit semantics applied to the 45–95°C span:
+/// ok below ~60°C, warn to ~80°C, crit above.
+fn temperature_color(celsius: f64) -> Color {
+    if celsius >= 80.0 {
+        palette().crit
+    } else if celsius >= 60.0 {
+        palette().warn
+    } else {
+        palette().ok
+    }
+}
+
+/// A one-row block sparkline of a trace's most recent points on the shared
+/// 45–95°C scale.
+fn temperature_spark(points: &std::collections::VecDeque<f64>, width: usize) -> String {
+    const LEVELS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    let skip = points.len().saturating_sub(width);
+    points
+        .iter()
+        .skip(skip)
+        .map(|value| LEVELS[((temperature_ratio(*value) * 7.0).round() as usize).min(7)])
+        .collect()
+}
+
+/// Every temperature source on the GAUGES page, zones first then GPUs, in
+/// the same order the sparkline traces are recorded.
+fn hardware_temperature_sources(hardware: &HardwareMetrics) -> Vec<(&str, f64)> {
+    hardware
+        .thermal_zones
+        .iter()
+        .map(|zone| (zone.name.as_str(), zone.temperature_c))
+        .chain(hardware.gpus.iter().filter_map(|gpu| {
+            gpu.temperature_c
+                .map(|temperature| (gpu.name.as_str(), temperature))
+        }))
+        .collect()
+}
+
+fn render_hardware(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    let Some(snapshot) = &app.snapshot else {
+        render_offline(frame, app, area);
+        return;
+    };
+    let hardware = &snapshot.hardware;
+    if !hardware.available {
+        render_hardware_unavailable(frame, hardware, area);
+        return;
+    }
+    let rows =
+        Layout::vertical([Constraint::Percentage(58), Constraint::Percentage(42)]).split(area);
+    render_thermal_panel(frame, app, hardware, inset(rows[0]));
+    render_clock_panel(frame, hardware, inset(rows[1]));
+}
+
+/// The honest empty state: no source produced data, so the page says why
+/// instead of drawing meters full of fabricated zeros.
+fn render_hardware_unavailable(frame: &mut Frame<'_>, hardware: &HardwareMetrics, area: Rect) {
+    let host = area.inner(Margin::new(4, 2));
+    let width = usize::from(host.width.saturating_sub(6)).max(16);
+    let mut lines = vec![
+        Line::styled(
+            "◌  HARDWARE TELEMETRY UNAVAILABLE",
+            Style::default().fg(palette().warn).bold(),
+        ),
+        Line::raw(""),
+    ];
+    let detail = if hardware.detail.is_empty() {
+        "the collector reported no temperature or clock sources"
+    } else {
+        hardware.detail.as_str()
+    };
+    for row in wrap_words(detail, width) {
+        lines.push(Line::styled(row, Style::default().fg(palette().text)));
+    }
+    lines.push(Line::raw(""));
+    for row in wrap_words(
+        "Temperatures may require the installed LocalSystem collector service — \
+         a console-mode collector often lacks ACPI thermal access.",
+        width,
+    ) {
+        lines.push(Line::styled(row, Style::default().fg(palette().muted)));
+    }
+    frame.render_widget(
+        Paragraph::new(lines)
+            .alignment(Alignment::Center)
+            .block(accent_panel(" ◉ GAUGES ", palette().warn)),
+        host,
+    );
+}
+
+/// One row per thermal zone and GPU: name, a 45–95°C meter, the reading,
+/// and the recent history sparkline from the client-side trace buffer.
+fn render_thermal_panel(frame: &mut Frame<'_>, app: &App, hardware: &HardwareMetrics, area: Rect) {
+    let sources = hardware_temperature_sources(hardware);
+    let content = usize::from(area.width.saturating_sub(3));
+    // Label + meter + reading are the identity columns; the sparkline takes
+    // whatever honest width remains and disappears before it would clip.
+    let meter_width = content.saturating_sub(20 + 9 + 3).clamp(8, 22);
+    let spark_width = content
+        .saturating_sub(20 + meter_width + 9 + 3)
+        .min(usize::from(LIVE_SPARK_MAX));
+    let mut lines = Vec::new();
+    if sources.is_empty() {
+        lines.push(Line::styled(
+            " no temperature sources reported",
+            Style::default().fg(palette().muted),
+        ));
+    }
+    let capacity = usize::from(area.height.saturating_sub(3)).max(1);
+    for (name, temperature) in sources.iter().take(capacity) {
+        let color = temperature_color(*temperature);
+        let mut spans = vec![
+            Span::styled(
+                format!(" {:<19}", format::truncate(name, 18)),
+                Style::default().fg(palette().text).bold(),
+            ),
+            Span::styled(
+                meter(temperature_ratio(*temperature), meter_width),
+                Style::default().fg(color),
+            ),
+            Span::styled(
+                format!(" {temperature:>5.1}°C"),
+                Style::default().fg(color).bold(),
+            ),
+        ];
+        if spark_width >= 4
+            && let Some(trace) = app
+                .hardware_history
+                .iter()
+                .find(|trace| trace.label == *name)
+        {
+            spans.push(Span::styled(
+                format!("  {}", temperature_spark(&trace.points, spark_width - 2)),
+                Style::default().fg(color),
+            ));
+        }
+        lines.push(Line::from(spans));
+    }
+    if !hardware.detail.is_empty() {
+        lines.push(Line::styled(
+            format!(
+                " ◌ {}",
+                format::truncate(&hardware.detail, content.max(8) - 3)
+            ),
+            Style::default().fg(palette().faint),
+        ));
+    }
+    frame.render_widget(
+        Paragraph::new(lines)
+            .style(Style::default().fg(palette().text).bg(palette().surface))
+            .block(accent_panel(
+                " ◉ THERMALS · meters span 45–95°C ",
+                palette().warn,
+            )),
+        area,
+    );
+}
+
+/// Sparkline cap: matches the bounded trace so a wide terminal never asks
+/// for more history than the buffer holds.
+const LIVE_SPARK_MAX: u16 = 60;
+
+/// CPU effective MHz plus per-GPU core/memory clocks and utilization.
+fn render_clock_panel(frame: &mut Frame<'_>, hardware: &HardwareMetrics, area: Rect) {
+    let mut lines = Vec::new();
+    match hardware.cpu_frequency_mhz {
+        Some(frequency) => lines.push(Line::from(vec![
+            Span::styled(" CPU  ", Style::default().fg(palette().muted).bold()),
+            Span::styled(
+                format!("{frequency:>6.0} MHz"),
+                Style::default().fg(palette().ok).bold(),
+            ),
+            Span::styled(
+                "  effective (base × performance)",
+                Style::default().fg(palette().faint),
+            ),
+        ])),
+        None => lines.push(Line::from(vec![
+            Span::styled(" CPU  ", Style::default().fg(palette().muted).bold()),
+            Span::styled(
+                "frequency counter unavailable",
+                Style::default().fg(palette().faint),
+            ),
+        ])),
+    }
+    let content = usize::from(area.width.saturating_sub(3));
+    let util_meter_width = content.saturating_sub(14).clamp(6, 16);
+    for gpu in &hardware.gpus {
+        lines.push(Line::styled(
+            format!(" {}", format::truncate(&gpu.name, content.max(2) - 1)),
+            Style::default().fg(palette().alt).bold(),
+        ));
+        let clock = |value: Option<f64>| match value {
+            Some(mhz) => format!("{mhz:>6.0} MHz"),
+            None => "     —    ".into(),
+        };
+        lines.push(Line::from(vec![
+            Span::styled("   CORE ", Style::default().fg(palette().muted)),
+            Span::styled(
+                clock(gpu.core_clock_mhz),
+                Style::default().fg(palette().info).bold(),
+            ),
+            Span::styled("   MEM ", Style::default().fg(palette().muted)),
+            Span::styled(
+                clock(gpu.memory_clock_mhz),
+                Style::default().fg(palette().info).bold(),
+            ),
+        ]));
+        if let Some(utilization) = gpu.utilization_percent {
+            let ratio = (utilization / 100.0).clamp(0.0, 1.0);
+            lines.push(Line::from(vec![
+                Span::styled("   UTIL ", Style::default().fg(palette().muted)),
+                Span::styled(
+                    meter(ratio, util_meter_width),
+                    Style::default().fg(ratio_color(ratio)),
+                ),
+                Span::styled(
+                    format!(" {utilization:>3.0}%"),
+                    Style::default().fg(ratio_color(ratio)).bold(),
+                ),
+            ]));
+        }
+    }
+    if hardware.gpus.is_empty() {
+        lines.push(Line::styled(
+            " no GPU telemetry (NVML unavailable or no NVIDIA adapter)",
+            Style::default().fg(palette().muted),
+        ));
+    }
+    frame.render_widget(
+        Paragraph::new(lines)
+            .style(Style::default().fg(palette().text).bg(palette().surface))
+            .block(accent_panel(
+                " ⌁ CLOCKS · sampled every 5s ",
+                palette().info,
+            )),
+        area,
+    );
+}
+
 /// TUNE body split: the settings table above, the plain-language detail
 /// strip below. Shared with the mouse hit-tests so clicks in the strip can
 /// never masquerade as table rows.
@@ -4203,7 +4457,7 @@ fn render_setting_detail(
 /// wrap does so through [`help_lines`]' hanging indent, so the two-column
 /// grid never sheds orphan full-width words.
 const HELP_GLOBAL: [(&str, &str); 11] = [
-    ("1–8", "jump to a page"),
+    ("1–9", "jump to a page"),
     ("Tab / Shift-Tab", "next / previous page"),
     ("j / k, ↑ / ↓", "move selection"),
     ("PgUp / PgDn", "move ten rows"),
@@ -4227,7 +4481,10 @@ const HELP_CONTEXTUAL: [(&str, &str); 19] = [
     ("e on Oracle", "edit + resubmit your last question"),
     ("h / n on Oracle", "chat history / new chat"),
     ("r / F2 in Chat Vault", "rename the selected chat"),
-    ("d / Del in Chat Vault", "delete the selected chat (press twice)"),
+    (
+        "d / Del in Chat Vault",
+        "delete the selected chat (press twice)",
+    ),
     ("y on Oracle", "copy the latest answer"),
     ("[ / ] on Oracle", "fresh evidence window"),
     ("table header click", "sort by clicked column"),
@@ -4408,7 +4665,8 @@ fn normal_footer(page: Page) -> Line<'static> {
             "Enter ask  ·  e edit last  ·  n new  ·  h vault (r rename · d delete)  ·  y copy  ·  [ ] evidence"
         }
         Page::Settings => "Enter edit  ·  s commit  ·  r revert",
-        Page::Help => "1–8 route  ·  Tab cycle",
+        Page::Help => "1–9 route  ·  Tab cycle",
+        Page::Hardware => "temperatures + clocks resample every 5s  ·  r refresh",
     };
     Line::from(vec![
         Span::styled(
@@ -4417,8 +4675,9 @@ fn normal_footer(page: Page) -> Line<'static> {
         ),
         Span::styled(
             format!(
-                "  {:02}/08 {}  ::  {contextual}   ",
+                "  {:02}/{:02} {}  ::  {contextual}   ",
                 page_index(page) + 1,
+                Page::ALL.len(),
                 route_name(page)
             ),
             Style::default().fg(palette().text),
@@ -4635,9 +4894,12 @@ fn severity_badge(severity: Severity) -> Style {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::TreeRow;
-    use pcpulse_service::models::{ProcessMetric, ProcessNode, Snapshot, SystemMetric};
+    use crate::app::{HardwareTrace, TreeRow};
+    use pcpulse_service::models::{
+        GpuMetrics, ProcessMetric, ProcessNode, Snapshot, SystemMetric, ThermalZone,
+    };
     use ratatui::{Terminal, backend::TestBackend, buffer::Buffer};
+    use std::collections::VecDeque;
 
     #[test]
     fn every_profile_palette_has_distinct_semantic_channels() {
@@ -4962,10 +5224,7 @@ mod tests {
         assert_eq!(text_with_fg(&early, palette().info), "read");
         assert_eq!(text_with_fg(&later, palette().info), "g fr");
         // Everything outside the window stays muted-readable.
-        assert_eq!(
-            text_with_fg(&early, palette().muted),
-            &READING_PHRASE[4..]
-        );
+        assert_eq!(text_with_fg(&early, palette().muted), &READING_PHRASE[4..]);
     }
 
     #[test]
@@ -4998,7 +5257,10 @@ mod tests {
         assert_eq!(peak[0].style.fg, Some(palette().text));
         // The words never change, and the elapsed/budget ticker rides along.
         assert_eq!(rest[0].content.as_ref(), CONSULTING_PHRASE);
-        assert_eq!(spans_text(&peak), format!("{CONSULTING_PHRASE} · 0m1s / 5m0s"));
+        assert_eq!(
+            spans_text(&peak),
+            format!("{CONSULTING_PHRASE} · 0m1s / 5m0s")
+        );
         let deep = analyzer_pending_spans(AnalyzerPhase::Consulting, 154_000, 300, 80);
         assert!(spans_text(&deep).ends_with(" · 2m34s / 5m0s"));
     }
@@ -6133,6 +6395,29 @@ mod tests {
             launch_duration_ms: None,
             is_agent_candidate: true,
         };
+        let hardware = HardwareMetrics {
+            sampled_at_ms: system.timestamp_ms,
+            cpu_frequency_mhz: Some(4_212.0),
+            thermal_zones: vec![
+                ThermalZone {
+                    name: "TZ00".into(),
+                    temperature_c: 48.9,
+                },
+                ThermalZone {
+                    name: "TZ01".into(),
+                    temperature_c: 62.3,
+                },
+            ],
+            gpus: vec![GpuMetrics {
+                name: "NVIDIA GeForce RTX 4080".into(),
+                temperature_c: Some(62.0),
+                core_clock_mhz: Some(2_550.0),
+                memory_clock_mhz: Some(10_500.0),
+                utilization_percent: Some(34.0),
+            }],
+            available: true,
+            detail: String::new(),
+        };
         app.connected = true;
         app.live_history.push_back(system.clone());
         app.snapshot = Some(Snapshot {
@@ -6141,6 +6426,7 @@ mod tests {
             system,
             processes: vec![process],
             active_alerts: Vec::new(),
+            hardware,
         });
         app
     }
@@ -6277,6 +6563,19 @@ mod tests {
             app.live_history.push_back(point.clone());
             app.persisted_history.system.push(point);
         }
+        // GAUGES sparklines: the traces the App would have accumulated from
+        // ~10 minutes of 5-second hardware samples, one per source.
+        let temperature_trace = |label: &str, base: f64| HardwareTrace {
+            label: label.into(),
+            points: (0..120_i64)
+                .map(|step| base + 5.0 * (step as f64 / 9.0).sin())
+                .collect::<VecDeque<f64>>(),
+        };
+        app.hardware_history = vec![
+            temperature_trace("TZ00", 48.9),
+            temperature_trace("TZ01", 62.3),
+            temperature_trace("NVIDIA GeForce RTX 4080", 62.0),
+        ];
         app.status = "Settings saved".into();
         app
     }
@@ -6333,6 +6632,86 @@ mod tests {
         }
         html.push_str("</pre>");
         html
+    }
+
+    #[test]
+    fn gauges_page_renders_meters_and_values_in_both_profiles() {
+        for theme_id in [theme::ThemeId::Vitals, theme::ThemeId::Avionics] {
+            let _guard = theme::test_support::activate(theme_id);
+            let mut app = gallery_app();
+            app.page = Page::Hardware;
+            let backend = render(&mut app);
+            let text = buffer_text(backend.buffer());
+            assert!(text.contains("THERMALS"), "{theme_id:?}: thermal panel");
+            assert!(text.contains("CLOCKS"), "{theme_id:?}: clock panel");
+            assert!(text.contains("TZ00"), "{theme_id:?}: zone row");
+            assert!(text.contains("48.9°C"), "{theme_id:?}: zone reading");
+            assert!(
+                text.contains("NVIDIA GeForce RTX 4080"),
+                "{theme_id:?}: GPU row"
+            );
+            assert!(text.contains("62.0°C"), "{theme_id:?}: GPU temperature");
+            assert!(text.contains("4212 MHz"), "{theme_id:?}: CPU frequency");
+            assert!(text.contains("2550 MHz"), "{theme_id:?}: core clock");
+            assert!(text.contains("10500 MHz"), "{theme_id:?}: memory clock");
+            assert!(text.contains("34%"), "{theme_id:?}: utilization");
+            assert!(text.contains("━"), "{theme_id:?}: meters render");
+            assert!(
+                ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█']
+                    .iter()
+                    .any(|glyph| text.contains(*glyph)),
+                "{theme_id:?}: history sparkline renders"
+            );
+        }
+    }
+
+    #[test]
+    fn gauges_meters_use_the_temperature_ratio_semantics() {
+        let _guard = theme::test_support::activate(theme::ThemeId::Vitals);
+        assert_eq!(temperature_ratio(45.0), 0.0);
+        assert_eq!(temperature_ratio(95.0), 1.0);
+        assert_eq!(temperature_color(48.9), palette().ok);
+        assert_eq!(temperature_color(62.0), palette().warn);
+        assert_eq!(temperature_color(84.0), palette().crit);
+    }
+
+    #[test]
+    fn gauges_unavailable_state_shows_the_detail_and_the_service_hint() {
+        let _guard = theme::test_support::activate(theme::ThemeId::Vitals);
+        let mut app = sample_app();
+        app.page = Page::Hardware;
+        if let Some(snapshot) = app.snapshot.as_mut() {
+            snapshot.hardware = HardwareMetrics {
+                available: false,
+                detail: "thermal zones unavailable: access denied; \
+                         GPU telemetry unavailable: nvml.dll not present"
+                    .into(),
+                ..HardwareMetrics::default()
+            };
+        }
+        let backend = render(&mut app);
+        let text = buffer_text(backend.buffer());
+        assert!(text.contains("HARDWARE TELEMETRY UNAVAILABLE"));
+        assert!(text.contains("access denied"));
+        assert!(
+            text.contains("LocalSystem"),
+            "hints at the installed service"
+        );
+        assert!(!text.contains("°C"), "no fabricated readings");
+    }
+
+    #[test]
+    fn gauges_key_9_reaches_the_page_and_the_rail_lists_it() {
+        let _guard = theme::test_support::activate(theme::ThemeId::Avionics);
+        let mut app = sample_app();
+        app.handle_key(ratatui::crossterm::event::KeyEvent::new(
+            ratatui::crossterm::event::KeyCode::Char('9'),
+            ratatui::crossterm::event::KeyModifiers::NONE,
+        ));
+        assert_eq!(app.page, Page::Hardware);
+        let backend = render(&mut app);
+        let text = buffer_text(backend.buffer());
+        assert!(text.contains("[9] GAUGE"), "rail bezel key for the page");
     }
 
     #[test]
@@ -6442,8 +6821,8 @@ mod tests {
     /// the same way the ticker tests do, so the wait-line phases render at
     /// scripted elapsed values.
     fn backdate_analyzer(app: &mut App, elapsed_ms: u64) {
-        app.analyzer_started_at = std::time::Instant::now()
-            .checked_sub(std::time::Duration::from_millis(elapsed_ms));
+        app.analyzer_started_at =
+            std::time::Instant::now().checked_sub(std::time::Duration::from_millis(elapsed_ms));
     }
 
     /// The gallery fixture plus a populated Chat Vault so the Oracle page
@@ -6690,8 +7069,7 @@ mod tests {
         for theme_id in [theme::ThemeId::Vitals, theme::ThemeId::Avionics] {
             let _guard = theme::test_support::activate(theme_id);
             let mut app = demo_app();
-            let mut terminal =
-                Terminal::new(TestBackend::new(120, 36)).expect("demo terminal");
+            let mut terminal = Terminal::new(TestBackend::new(120, 36)).expect("demo terminal");
             let mut motion = crate::effects::MotionSystem::new(&app, true);
             let mut frames = Vec::new();
             for step in demo_script() {
@@ -6723,8 +7101,7 @@ mod tests {
             let payload = serde_json::to_string(&serde_json::Value::Array(frames))
                 .expect("serialize demo frames");
             std::fs::write(
-                std::path::Path::new(&directory)
-                    .join(format!("frames-{}.json", theme_id.name())),
+                std::path::Path::new(&directory).join(format!("frames-{}.json", theme_id.name())),
                 payload,
             )
             .expect("write demo frames");

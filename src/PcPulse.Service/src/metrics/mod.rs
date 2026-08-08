@@ -1,10 +1,11 @@
+mod hardware;
 mod pdh;
 mod win32;
 
 use crate::{
     config::Settings,
     etw::EtwSnapshot,
-    models::{ProcessMetric, SystemMetric},
+    models::{HardwareMetrics, ProcessMetric, SystemMetric},
 };
 use anyhow::Result;
 use std::time::Instant;
@@ -12,6 +13,7 @@ use std::time::Instant;
 pub struct MetricCollector {
     pdh: pdh::PdhCollector,
     processes: win32::ProcessCollector,
+    hardware: hardware::HardwareSampler,
     last_sample: Instant,
 }
 
@@ -20,6 +22,7 @@ impl MetricCollector {
         Ok(Self {
             pdh: pdh::PdhCollector::new()?,
             processes: win32::ProcessCollector::default(),
+            hardware: hardware::HardwareSampler::new(),
             last_sample: Instant::now(),
         })
     }
@@ -29,7 +32,7 @@ impl MetricCollector {
         timestamp_ms: i64,
         settings: &Settings,
         etw: &EtwSnapshot,
-    ) -> Result<(SystemMetric, Vec<ProcessMetric>)> {
+    ) -> Result<(SystemMetric, Vec<ProcessMetric>, HardwareMetrics)> {
         let now = Instant::now();
         let elapsed = now
             .duration_since(self.last_sample)
@@ -59,7 +62,10 @@ impl MetricCollector {
             system.collector_cpu_percent = collector.cpu_percent;
             system.collector_handle_count = collector.handle_count;
         }
-        Ok((system, processes))
+        // Cached internally to one probe pass per five seconds; the PDH
+        // frequency reading rides along for free on every pass.
+        let hardware = self.hardware.sample(timestamp_ms, pdh.cpu_frequency_mhz);
+        Ok((system, processes, hardware))
     }
 }
 

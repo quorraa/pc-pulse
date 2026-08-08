@@ -26,6 +26,7 @@ Release binaries are currently unsigned; Windows may show an unknown-publisher w
 - System and per-process CPU, working set, private bytes, handles, threads, and read/write I/O.
 - Physical-disk transfer latency, DPC rate, interrupt rate, paged pool, and nonpaged pool.
 - Hung top-level windows, ETW process starts, time to first visible window, parent/child trees, and detached idle agent processes.
+- Hardware temperatures and clocks — ACPI thermal zones, effective CPU frequency, and NVIDIA GPU temperature/clocks/utilization — best-effort by hardware and driver support, sampled every five seconds.
 - Its own collector against absolute budgets (25 MB working set, 0.2% CPU, 250 handles) plus mature working-set growth.
 - Redacted warning/error/critical Application and System events, classified and fingerprinted (hardware, storage, graphics, crashes, hangs, resource exhaustion, power, services, networking, agent runtimes).
 - Active and resolved finding history with responsible process where attribution is defensible, supporting evidence, explanation, and safe next actions.
@@ -49,7 +50,7 @@ The TUI ships two presentation profiles: **vitals** (default), a patient-monitor
 
 *Screenshots come from the deterministic render gallery (`cargo test -p pcpulse-tui --lib dev_render_gallery -- --ignored` with `PCPULSE_GALLERY_DIR` set).*
 
-Eight views:
+Nine views:
 
 1. **Observe** — shared CPU/memory pressure field, multi-resource suspect ranking, threshold vectors, load ribbon, agent footprint, collector budget, incident tape.
 2. **Processes** — dense sortable process table, name/path/PID filtering, full process inspector.
@@ -59,12 +60,13 @@ Eight views:
 6. **Oracle** — evidence-aware chat with the dedicated systems analyzer and the live Windows diagnostic feed.
 7. **Settings** — all detector thresholds and notification state, plain-language explanations, plus per-user CLIENT settings (theme, motion effects, Oracle time budget).
 8. **Keys** — the complete keyboard reference.
+9. **Gauges** — thermal-zone and GPU temperature meters with live history sparklines, plus CPU/GPU clocks and GPU utilization; degrades to an honest unavailable state when sensors are denied.
 
 Important keys:
 
 | Key | Action |
 |---|---|
-| `1`–`8`, `Tab`, `Shift-Tab` | Navigate pages |
+| `1`–`9`, `Tab`, `Shift-Tab` | Navigate pages |
 | `j`/`k`, arrows, `PgUp`/`PgDn` | Move selection |
 | `/` | Filter the process table |
 | `o` | Cycle CPU/memory/I/O/handle/thread/age/name sorting |

@@ -111,6 +111,55 @@ pub struct Alert {
     pub resolved_at_ms: Option<i64>,
 }
 
+/// One ACPI thermal zone reading, converted from decikelvin to Celsius.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ThermalZone {
+    pub name: String,
+    pub temperature_c: f64,
+}
+
+/// Best-effort GPU telemetry (NVML today). Every reading is optional: a
+/// driver that answers the name query but refuses a sensor yields `None`
+/// for that sensor, never a fabricated zero.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct GpuMetrics {
+    pub name: String,
+    pub temperature_c: Option<f64>,
+    pub core_clock_mhz: Option<f64>,
+    pub memory_clock_mhz: Option<f64>,
+    pub utilization_percent: Option<f64>,
+}
+
+/// Temperatures and clocks, sampled at most every few seconds and cached
+/// between snapshots. `available` is false when no source produced data;
+/// `detail` then carries the human-readable reason (and notes partial
+/// degradation even when other sources still report).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default, rename_all = "camelCase")]
+pub struct HardwareMetrics {
+    pub sampled_at_ms: i64,
+    pub cpu_frequency_mhz: Option<f64>,
+    pub thermal_zones: Vec<ThermalZone>,
+    pub gpus: Vec<GpuMetrics>,
+    pub available: bool,
+    pub detail: String,
+}
+
+impl Default for HardwareMetrics {
+    fn default() -> Self {
+        Self {
+            sampled_at_ms: 0,
+            cpu_frequency_mhz: None,
+            thermal_zones: Vec::new(),
+            gpus: Vec::new(),
+            available: false,
+            detail: "no hardware telemetry in this snapshot".into(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Snapshot {
@@ -119,6 +168,11 @@ pub struct Snapshot {
     pub system: SystemMetric,
     pub processes: Vec<ProcessMetric>,
     pub active_alerts: Vec<Alert>,
+    /// Absent in snapshots from services older than the GAUGES page; the
+    /// default keeps old JSON deserializing and old clients simply ignore
+    /// the extra field.
+    #[serde(default)]
+    pub hardware: HardwareMetrics,
 }
 
 impl Default for Snapshot {
@@ -129,6 +183,7 @@ impl Default for Snapshot {
             system: SystemMetric::default(),
             processes: Vec::new(),
             active_alerts: Vec::new(),
+            hardware: HardwareMetrics::default(),
         }
     }
 }
@@ -547,6 +602,53 @@ pub enum PipeResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshot_round_trips_with_hardware_metrics() {
+        let snapshot = Snapshot {
+            hardware: HardwareMetrics {
+                sampled_at_ms: 1_800_000_000_000,
+                cpu_frequency_mhz: Some(4_212.5),
+                thermal_zones: vec![ThermalZone {
+                    name: "TZ00".into(),
+                    temperature_c: 48.9,
+                }],
+                gpus: vec![GpuMetrics {
+                    name: "NVIDIA GeForce RTX 4080".into(),
+                    temperature_c: Some(62.0),
+                    core_clock_mhz: Some(2_550.0),
+                    memory_clock_mhz: Some(10_500.0),
+                    utilization_percent: Some(34.0),
+                }],
+                available: true,
+                detail: String::new(),
+            },
+            ..Snapshot::default()
+        };
+        let json = serde_json::to_string(&snapshot).unwrap();
+        assert!(json.contains("\"cpuFrequencyMhz\""), "camelCase wire names");
+        assert!(json.contains("\"thermalZones\""));
+        let restored: Snapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored, snapshot);
+    }
+
+    #[test]
+    fn snapshot_without_hardware_field_still_deserializes() {
+        // A snapshot serialized by a pre-GAUGES service has no `hardware`
+        // key; the default must report an honest unavailable state.
+        let json = serde_json::json!({
+            "protocolVersion": crate::PROTOCOL_VERSION,
+            "serviceVersion": "1.4.0",
+            "system": serde_json::to_value(SystemMetric::default()).unwrap(),
+            "processes": [],
+            "activeAlerts": [],
+        });
+        let snapshot: Snapshot = serde_json::from_value(json).unwrap();
+        assert!(!snapshot.hardware.available);
+        assert!(snapshot.hardware.thermal_zones.is_empty());
+        assert!(snapshot.hardware.gpus.is_empty());
+        assert!(!snapshot.hardware.detail.is_empty());
+    }
 
     fn plan() -> OptimizationPlan {
         OptimizationPlan {
