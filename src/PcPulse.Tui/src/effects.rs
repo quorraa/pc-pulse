@@ -1,6 +1,32 @@
+//! Monitor motion language for the "vital signs" theme.
+//!
+//! Every composition is styled after a bedside patient monitor and stays finite:
+//!
+//! - **Startup — "monitor boot"**: a phosphor trace sweeps left-to-right across the
+//!   body, coalescing content in its wake; the header then resolves out of ECG-bar
+//!   glyphs (`▁▂▃▄▅▆▇█`) like a signal settling into text. Under ~1.2 s total.
+//! - **Critical alert — "defib"**: two crisp full-header brightness pulses layered
+//!   over a short bounded glitch; warning/info keep a single soft pulse in their
+//!   severity color.
+//! - **Page change — "channel switch"**: the existing slide plus a very short darken
+//!   dip, like a monitor blanking for a beat while switching leads.
+//! - **Sample — "beat"**: the weakest cue; header shimmer always, plus a bounded
+//!   hue-shift scan over the four signal colors on the Overview body only.
+//! - Connection, modal, footer and status cues keep their prior shapes with easing
+//!   trimmed toward crisp, clinical motion (no overshoot).
+//! - **Theme switch — "profile swap"**: a finite full-frame sweep in the incoming
+//!   profile's `ok` color; the hot-swapped palette washes over every populated cell.
+//!
+//! Contracts preserved: all effects are finite (no `repeating`/`never_complete`),
+//! color/shift transforms use `CellFilter::NonEmpty` so no cue erases content, the
+//! idle clock resets on `queue()`, delayed frames clamp to 50 ms, one cleanup frame
+//! restores exact styles after the last effect, each channel replaces via
+//! `add_unique_effect`, and every randomized effect carries a seeded `SimpleRng`.
+
 use crate::{
     app::{App, InputMode, Page},
-    ui::{self, AMBER, AMETHYST, BG, CORAL, ICE, PHOSPHOR, SURFACE, SURFACE_RAISED, UiRegions},
+    theme::{self, palette},
+    ui::{self, UiRegions},
 };
 use pcpulse_service::models::Severity;
 use ratatui::{
@@ -13,7 +39,7 @@ use std::{collections::VecDeque, time::Duration as StdDuration};
 use tachyonfx::{
     CellFilter, ColorSpace, Duration as FxDuration, Effect, EffectManager, Interpolation,
     IntoEffect, Motion, SimpleRng, fx,
-    fx::{ExpandDirection, Glitch},
+    fx::{EvolveSymbolSet, ExpandDirection, Glitch, RepeatMode},
     pattern::{DiagonalPattern, RadialPattern, SweepPattern},
 };
 
@@ -31,6 +57,7 @@ enum EffectKey {
     Sample,
     Modal,
     Footer,
+    Theme,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,6 +91,7 @@ struct VisualState {
     active_alerts: Vec<(String, Severity)>,
     status: String,
     status_is_error: bool,
+    theme: theme::ThemeId,
 }
 
 impl VisualState {
@@ -104,6 +132,7 @@ impl VisualState {
             active_alerts,
             status: app.status.clone(),
             status_is_error: app.status_is_error,
+            theme: theme::active().id,
         }
     }
 }
@@ -122,9 +151,11 @@ enum MotionCue {
     InputOpen,
     Success,
     Failure,
+    ThemeSwitch,
 }
 
-/// Coordinates finite TachyonFX compositions while preserving a completely idle render loop.
+/// Coordinates the finite "monitor" TachyonFX compositions (see module docs) while
+/// preserving a completely idle render loop between cues.
 pub struct MotionSystem {
     manager: EffectManager<EffectKey>,
     pending: VecDeque<MotionCue>,
@@ -179,6 +210,10 @@ impl MotionSystem {
             && next.sample_timestamp != self.previous.sample_timestamp
         {
             self.queue(MotionCue::Sample(next.page));
+        }
+
+        if next.theme != self.previous.theme {
+            self.queue(MotionCue::ThemeSwitch);
         }
 
         let new_alert = next
@@ -288,27 +323,36 @@ impl MotionSystem {
     fn start(&mut self, cue: MotionCue, regions: UiRegions) {
         match cue {
             MotionCue::Startup => {
-                let reveal = fx::parallel(&[
-                    fx::coalesce((420, Interpolation::ExpoOut))
-                        .with_pattern(RadialPattern::new(0.16, 0.0).with_transition_width(7.0))
-                        .with_rng(SimpleRng::new(0x5043_5055))
+                // "Monitor boot": a phosphor trace draws the body left-to-right, with
+                // content coalescing just behind the bright leading edge.
+                let trace = fx::parallel(&[
+                    fx::coalesce((520, Interpolation::QuadOut))
+                        .with_pattern(SweepPattern::left_to_right(26))
+                        .with_rng(SimpleRng::new(0xB007_BEA7))
                         .with_filter(CellFilter::NonEmpty)
-                        .with_area(regions.full),
-                    fx::fade_from(PHOSPHOR, BG, (460, Interpolation::CubicOut))
+                        .with_area(regions.body),
+                    fx::fade_from_fg(palette().ok, (560, Interpolation::CubicOut))
+                        .with_pattern(SweepPattern::left_to_right(26))
                         .with_color_space(ColorSpace::Hsv)
-                        .with_area(regions.full),
+                        .with_filter(CellFilter::NonEmpty)
+                        .with_area(regions.body),
                 ]);
-                let signature = fx::sweep_in(
-                    Motion::LeftToRight,
-                    12,
-                    0,
-                    BG,
-                    (220, Interpolation::QuadOut),
-                )
-                .with_filter(CellFilter::NonEmpty)
-                .with_area(regions.header);
+                // Brand line settles out of ECG-bar glyphs into the header text.
+                let signature = fx::parallel(&[
+                    fx::evolve_into(
+                        EvolveSymbolSet::BlocksVertical,
+                        (380, Interpolation::QuadOut),
+                    )
+                    .with_pattern(SweepPattern::left_to_right(10))
+                    .with_filter(CellFilter::NonEmpty)
+                    .with_area(regions.header),
+                    fx::fade_from_fg(palette().ok, (380, Interpolation::QuadOut))
+                        .with_color_space(ColorSpace::Hsv)
+                        .with_filter(CellFilter::NonEmpty)
+                        .with_area(regions.header),
+                ]);
                 self.manager
-                    .add_unique_effect(EffectKey::Startup, fx::sequence(&[reveal, signature]));
+                    .add_unique_effect(EffectKey::Startup, fx::sequence(&[trace, signature]));
             }
             MotionCue::Page { forward } => {
                 let direction = if forward {
@@ -321,11 +365,25 @@ impl MotionSystem {
                 } else {
                     SweepPattern::right_to_left(16)
                 };
+                // "Channel switch": a blink-short dip while the leads change over,
+                // under the existing slide.
                 let effect = fx::parallel(&[
-                    fx::slide_in(direction, 8, 1, BG, (210, Interpolation::CubicOut))
-                        .with_rng(SimpleRng::new(0x51A7_1001))
-                        .with_area(regions.body),
-                    fx::fade_from_fg(AMETHYST, (280, Interpolation::SineOut))
+                    fx::ping_pong(fx::darken(
+                        Some(0.30),
+                        Some(0.16),
+                        (80, Interpolation::SineInOut),
+                    ))
+                    .with_area(regions.body),
+                    fx::slide_in(
+                        direction,
+                        8,
+                        1,
+                        palette().bg,
+                        (210, Interpolation::CubicOut),
+                    )
+                    .with_rng(SimpleRng::new(0x51A7_1001))
+                    .with_area(regions.body),
+                    fx::fade_from_fg(palette().alt, (280, Interpolation::SineOut))
                         .with_pattern(pattern)
                         .with_color_space(ColorSpace::Hsv)
                         .with_filter(CellFilter::NonEmpty)
@@ -362,7 +420,7 @@ impl MotionSystem {
             MotionCue::Connected => {
                 let effect = fx::parallel(&[
                     fx::coalesce_from(
-                        Style::default().fg(PHOSPHOR).bg(BG),
+                        Style::default().fg(palette().ok).bg(palette().bg),
                         (360, Interpolation::ExpoOut),
                     )
                     .with_pattern(RadialPattern::new(0.08, 0.0).with_transition_width(6.0))
@@ -373,7 +431,7 @@ impl MotionSystem {
                         Motion::LeftToRight,
                         10,
                         0,
-                        BG,
+                        palette().bg,
                         (260, Interpolation::CubicOut),
                     )
                     .with_area(regions.header),
@@ -393,7 +451,7 @@ impl MotionSystem {
                     .with_area(regions.full);
                 let effect = fx::parallel(&[
                     fx::with_duration(FxDuration::from_millis(230), glitch),
-                    fx::fade_from_fg(CORAL, (360, Interpolation::CircOut))
+                    fx::fade_from_fg(palette().crit, (360, Interpolation::ExpoOut))
                         .with_pattern(DiagonalPattern::top_right_to_bottom_left())
                         .with_filter(CellFilter::NonEmpty)
                         .with_area(regions.full),
@@ -408,31 +466,44 @@ impl MotionSystem {
             }
             MotionCue::Alert(severity) => {
                 let accent = match severity {
-                    Severity::Info => ICE,
-                    Severity::Warning => AMBER,
-                    Severity::Critical => CORAL,
+                    Severity::Info => palette().info,
+                    Severity::Warning => palette().warn,
+                    Severity::Critical => palette().crit,
                 };
                 let alert_body = fx::sweep_in(
                     Motion::LeftToRight,
                     18,
                     if severity == Severity::Critical { 3 } else { 1 },
-                    BG,
+                    palette().bg,
                     (340, Interpolation::ExpoOut),
                 )
                 .with_rng(SimpleRng::new(0xA1E4_7001))
                 .with_color_space(ColorSpace::Hsv)
                 .with_filter(CellFilter::NonEmpty)
                 .with_area(regions.body);
-                let pulse = fx::prolong_end(
-                    55,
-                    fx::ping_pong(
-                        fx::fade_to_fg(accent, (105, Interpolation::SineInOut)).with_pattern(
-                            DiagonalPattern::top_left_to_bottom_right().with_transition_width(7.0),
+                let pulse = if severity == Severity::Critical {
+                    // "Defib": two crisp, uniform brightness pulses — charge, shock,
+                    // shock — with no pattern so the whole header flashes as one.
+                    fx::repeat(
+                        fx::ping_pong(fx::lighten_fg(0.34, (70, Interpolation::SineInOut))),
+                        RepeatMode::Times(2),
+                    )
+                    .with_filter(CellFilter::NonEmpty)
+                    .with_area(regions.header)
+                } else {
+                    // Warning/info keep a single softer pulse in their severity color.
+                    fx::prolong_end(
+                        55,
+                        fx::ping_pong(
+                            fx::fade_to_fg(accent, (105, Interpolation::SineInOut)).with_pattern(
+                                DiagonalPattern::top_left_to_bottom_right()
+                                    .with_transition_width(7.0),
+                            ),
                         ),
-                    ),
-                )
-                .with_filter(CellFilter::NonEmpty)
-                .with_area(regions.header);
+                    )
+                    .with_filter(CellFilter::NonEmpty)
+                    .with_area(regions.header)
+                };
                 let mut effects = vec![alert_body, pulse];
                 if severity == Severity::Critical {
                     let glitch = Glitch::builder()
@@ -451,10 +522,10 @@ impl MotionSystem {
             }
             MotionCue::Sample(page) => {
                 let signal_colors = CellFilter::AnyOf(vec![
-                    CellFilter::FgColor(PHOSPHOR),
-                    CellFilter::FgColor(AMETHYST),
-                    CellFilter::FgColor(ICE),
-                    CellFilter::FgColor(AMBER),
+                    CellFilter::FgColor(palette().ok),
+                    CellFilter::FgColor(palette().alt),
+                    CellFilter::FgColor(palette().info),
+                    CellFilter::FgColor(palette().warn),
                 ]);
                 let mut effects = vec![
                     fx::ping_pong(
@@ -465,9 +536,11 @@ impl MotionSystem {
                     .with_area(regions.header),
                 ];
                 if page == Page::Overview {
+                    // "Beat": lightness-led shimmer — hue barely moves so each channel
+                    // keeps its clinical identity, but the trace visibly brightens.
                     effects.push(
                         fx::ping_pong(
-                            fx::hsl_shift_fg([12.0, 10.0, 8.0], (110, Interpolation::SineInOut))
+                            fx::hsl_shift_fg([6.0, 8.0, 14.0], (110, Interpolation::SineInOut))
                                 .with_pattern(SweepPattern::left_to_right(18)),
                         )
                         .with_filter(signal_colors)
@@ -479,12 +552,15 @@ impl MotionSystem {
             }
             MotionCue::ModalOpen => {
                 let area = ui::modal_region(regions.full);
-                let base = Style::default().fg(CORAL).bg(SURFACE_RAISED);
+                let base = Style::default()
+                    .fg(palette().crit)
+                    .bg(palette().surface_raised);
                 let effect = fx::parallel(&[
+                    // ExpoOut instead of BackOut: a monitor snaps open, it never bounces.
                     fx::expand(
                         ExpandDirection::Horizontal,
-                        Style::default().fg(CORAL).bg(BG),
-                        (250, Interpolation::BackOut),
+                        Style::default().fg(palette().crit).bg(palette().bg),
+                        (250, Interpolation::ExpoOut),
                     )
                     .with_area(area),
                     fx::coalesce_from(base, (300, Interpolation::ExpoOut))
@@ -492,22 +568,28 @@ impl MotionSystem {
                         .with_rng(SimpleRng::new(0xDA7E_600D))
                         .with_filter(CellFilter::NonEmpty)
                         .with_area(area),
-                    fx::slide_in(Motion::UpToDown, 5, 0, BG, (220, Interpolation::CubicOut))
-                        .with_area(area),
+                    fx::slide_in(
+                        Motion::UpToDown,
+                        5,
+                        0,
+                        palette().bg,
+                        (220, Interpolation::CubicOut),
+                    )
+                    .with_area(area),
                 ]);
                 self.manager.add_unique_effect(EffectKey::Modal, effect);
             }
             MotionCue::ModalClose => {
                 let effect = fx::sequence(&[
                     fx::dissolve_to(
-                        Style::default().fg(PHOSPHOR).bg(SURFACE),
+                        Style::default().fg(palette().ok).bg(palette().surface),
                         (90, Interpolation::QuadIn),
                     )
                     .with_pattern(SweepPattern::right_to_left(8))
                     .with_rng(SimpleRng::new(0xC105_E001))
                     .with_filter(CellFilter::NonEmpty)
                     .with_area(regions.footer),
-                    fx::fade_from_fg(PHOSPHOR, (130, Interpolation::QuadOut))
+                    fx::fade_from_fg(palette().ok, (130, Interpolation::QuadOut))
                         .with_area(regions.footer),
                 ]);
                 self.manager.add_unique_effect(EffectKey::Modal, effect);
@@ -517,7 +599,7 @@ impl MotionSystem {
                     Motion::LeftToRight,
                     9,
                     0,
-                    BG,
+                    palette().bg,
                     (180, Interpolation::CubicOut),
                 )
                 .with_filter(CellFilter::NonEmpty)
@@ -525,12 +607,32 @@ impl MotionSystem {
                 self.manager.add_unique_effect(EffectKey::Footer, effect);
             }
             MotionCue::Success => {
-                self.manager
-                    .add_unique_effect(EffectKey::Footer, action_effect(PHOSPHOR, regions.footer));
+                self.manager.add_unique_effect(
+                    EffectKey::Footer,
+                    action_effect(palette().ok, regions.footer),
+                );
             }
             MotionCue::Failure => {
-                self.manager
-                    .add_unique_effect(EffectKey::Footer, action_effect(CORAL, regions.footer));
+                self.manager.add_unique_effect(
+                    EffectKey::Footer,
+                    action_effect(palette().crit, regions.footer),
+                );
+            }
+            MotionCue::ThemeSwitch => {
+                // "Profile swap": one finite full-frame wash in the incoming
+                // profile's ok channel — the new palette sweeps across every
+                // populated cell like an MFD re-arming after a mode change.
+                let effect = fx::sweep_in(
+                    Motion::LeftToRight,
+                    24,
+                    2,
+                    palette().ok,
+                    (420, Interpolation::QuadOut),
+                )
+                .with_rng(SimpleRng::new(0xFACA_DE01))
+                .with_filter(CellFilter::NonEmpty)
+                .with_area(regions.full);
+                self.manager.add_unique_effect(EffectKey::Theme, effect);
             }
         }
     }
@@ -542,7 +644,7 @@ fn action_effect(accent: ratatui::style::Color, area: Rect) -> Effect {
             Motion::LeftToRight,
             8,
             0,
-            BG,
+            palette().bg,
             (190, Interpolation::CubicOut),
         )
         .with_area(area),
@@ -600,7 +702,7 @@ mod tests {
         let mut motion = MotionSystem::new(&app, true);
         let area = Rect::new(0, 0, 120, 36);
         let mut cell = Cell::new("X");
-        cell.set_style(Style::default().fg(Color::White).bg(BG));
+        cell.set_style(Style::default().fg(Color::White).bg(palette().bg));
         let mut buffer = Buffer::filled(area, cell);
 
         assert!(motion.is_animating());
@@ -648,7 +750,7 @@ mod tests {
         motion.queue(MotionCue::Page { forward: true });
         let area = Rect::new(0, 0, 120, 36);
         let mut cell = Cell::new("X");
-        cell.set_style(Style::default().fg(Color::White).bg(BG));
+        cell.set_style(Style::default().fg(Color::White).bg(palette().bg));
         let mut buffer = Buffer::filled(area, cell);
         let baseline = buffer.clone();
 

@@ -174,6 +174,7 @@ mod tests {
                             timestamp_ms: index,
                             text: format!("question {index}"),
                             evidence_refs: Vec::new(),
+                            is_error: false,
                         }],
                         None,
                         None,
@@ -185,6 +186,86 @@ mod tests {
         let loaded = store.load().unwrap();
         assert_eq!(loaded.len(), MAX_SESSIONS);
         assert_eq!(loaded[0].conversation_id, "chat-29");
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn failed_turns_round_trip_through_the_store() {
+        let path = env::temp_dir().join(format!(
+            "pcpulse-chat-history-failure-test-{}-{}.json",
+            std::process::id(),
+            chrono::Utc::now().timestamp_millis()
+        ));
+        let store = ChatHistoryStore::at(path.clone());
+        let mut sessions = Vec::new();
+        store
+            .upsert(
+                &mut sessions,
+                ChatSession::from_conversation(
+                    "chat-failed".into(),
+                    vec![
+                        ChatMessage {
+                            role: ChatRole::User,
+                            timestamp_ms: 1,
+                            text: "Why is the disk slow?".into(),
+                            evidence_refs: Vec::new(),
+                            is_error: false,
+                        },
+                        ChatMessage {
+                            role: ChatRole::Assistant,
+                            timestamp_ms: 2,
+                            text: "Analysis failed: Codex systems chat timed out after 300s"
+                                .into(),
+                            evidence_refs: Vec::new(),
+                            is_error: true,
+                        },
+                    ],
+                    None,
+                    None,
+                    2,
+                ),
+            )
+            .unwrap();
+        let loaded = store.load().unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].messages.len(), 2);
+        assert!(!loaded[0].messages[0].is_error);
+        assert!(loaded[0].messages[1].is_error);
+        assert!(loaded[0].messages[1].text.contains("timed out"));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn legacy_history_without_error_flag_still_parses() {
+        let path = env::temp_dir().join(format!(
+            "pcpulse-chat-history-legacy-test-{}-{}.json",
+            std::process::id(),
+            chrono::Utc::now().timestamp_millis()
+        ));
+        // Written by a release that predates the failed-turn flag.
+        let legacy_payload = r#"[
+            {
+                "conversationId": "chat-legacy",
+                "createdAtMs": 1,
+                "updatedAtMs": 2,
+                "title": "old question",
+                "messages": [
+                    {
+                        "role": "user",
+                        "timestampMs": 1,
+                        "text": "old question",
+                        "evidenceRefs": []
+                    }
+                ],
+                "latestResponse": null
+            }
+        ]"#;
+        fs::write(&path, legacy_payload).unwrap();
+        let store = ChatHistoryStore::at(path.clone());
+        let loaded = store.load().unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].conversation_id, "chat-legacy");
+        assert!(!loaded[0].messages[0].is_error);
         let _ = fs::remove_file(path);
     }
 }

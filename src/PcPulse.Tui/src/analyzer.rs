@@ -13,7 +13,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 const AGENT_PROMPT: &str = include_str!("../../../agents/pcpulse-systems-analyzer.md");
@@ -21,6 +21,25 @@ const PLAN_SCHEMA: &str = include_str!("../../../agents/optimization-plan.schema
 const CHAT_PROMPT: &str = include_str!("../../../agents/pcpulse-systems-chat.md");
 const CHAT_SCHEMA: &str = include_str!("../../../agents/chat-response.schema.json");
 const MAX_AGENT_ERROR_BYTES: usize = 8 * 1_024;
+const MAX_FAILURE_LOG_BYTES: usize = 64 * 1_024;
+const DEFAULT_ANALYZER_TIMEOUT_SECS: u64 = 300;
+const MIN_ANALYZER_TIMEOUT_SECS: u64 = 30;
+const MAX_ANALYZER_TIMEOUT_SECS: u64 = 1_800;
+pub const ANALYZER_ERROR_LOG_NAME: &str = "analyzer-last-error.log";
+
+/// The active Codex wait budget in seconds: `PCPULSE_ANALYZER_TIMEOUT_SECS`
+/// clamped to 30..=1800, defaulting to 300 when unset or unparsable.
+pub fn analyzer_timeout_secs() -> u64 {
+    clamp_timeout_secs(env::var("PCPULSE_ANALYZER_TIMEOUT_SECS").ok().as_deref())
+}
+
+fn clamp_timeout_secs(value: Option<&str>) -> u64 {
+    value
+        .and_then(|text| text.trim().parse::<u64>().ok())
+        .map_or(DEFAULT_ANALYZER_TIMEOUT_SECS, |seconds| {
+            seconds.clamp(MIN_ANALYZER_TIMEOUT_SECS, MAX_ANALYZER_TIMEOUT_SECS)
+        })
+}
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -36,6 +55,12 @@ pub struct ChatMessage {
     pub timestamp_ms: i64,
     pub text: String,
     pub evidence_refs: Vec<String>,
+    /// True for assistant-role turns that record an analyzer failure instead of
+    /// an answer. Absent in chat-history files written by older releases, so it
+    /// defaults to false, and it is omitted from serialized output when false
+    /// to keep the Codex prompt payload unchanged for ordinary turns.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_error: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -101,20 +126,43 @@ pub fn chat(
     let client = PipeClient;
     let context = client.agent_context(window_hours)?;
     let temporary = TemporaryArtifacts::create(CHAT_SCHEMA, "chat-response")?;
+    run_chat(
+        conversation_id,
+        conversation,
+        &context,
+        &temporary,
+        &cancelled,
+    )
+    .map_err(|error| annotate_failure(&temporary, "systems chat", error))
+}
+
+fn run_chat(
+    conversation_id: &str,
+    conversation: &[ChatMessage],
+    context: &AgentContext,
+    temporary: &TemporaryArtifacts,
+    cancelled: &AtomicBool,
+) -> Result<ChatResponse> {
     let prompt = format!(
         "{CHAT_PROMPT}\n\nconversationId: {conversation_id}\ncontextId: {}\ngeneratedAtMs: {}\n\nPCPULSE_CONVERSATION_JSON\n{}\n\nPCPULSE_EVIDENCE_BUNDLE_JSON\n{}\n",
         context.context_id,
         context.generated_at_ms,
         serde_json::to_string(conversation)?,
-        serde_json::to_string(&context)?,
+        serde_json::to_string(context)?,
     );
-    let mut child = spawn_codex(&temporary, &prompt)?;
-    wait_for_codex(&mut child, &temporary, &cancelled, "systems chat")?;
+    let mut child = spawn_codex(temporary, &prompt)?;
+    wait_for_codex(
+        &mut child,
+        temporary,
+        cancelled,
+        "systems chat",
+        Duration::from_secs(analyzer_timeout_secs()),
+    )?;
     let payload = fs::read_to_string(&temporary.output_path)
         .context("Codex completed without writing a chat response")?;
     let response: ChatResponse =
         serde_json::from_str(&payload).context("Codex returned an invalid chat response")?;
-    validate_chat_response(&response, conversation_id, &context)?;
+    validate_chat_response(&response, conversation_id, context)?;
     Ok(response)
 }
 
@@ -135,12 +183,27 @@ pub fn generate(context: &AgentContext, cancelled: Arc<AtomicBool>) -> Result<Op
         bail!("systems analysis was cancelled");
     }
     let temporary = TemporaryArtifacts::create(PLAN_SCHEMA, "optimization-plan")?;
+    run_generate(context, &temporary, &cancelled)
+        .map_err(|error| annotate_failure(&temporary, "systems analysis", error))
+}
+
+fn run_generate(
+    context: &AgentContext,
+    temporary: &TemporaryArtifacts,
+    cancelled: &AtomicBool,
+) -> Result<OptimizationPlan> {
     let prompt = format!(
         "{AGENT_PROMPT}\n\nPCPULSE_EVIDENCE_BUNDLE_JSON\n{}\n",
         serde_json::to_string(context)?
     );
-    let mut child = spawn_codex(&temporary, &prompt)?;
-    wait_for_codex(&mut child, &temporary, &cancelled, "systems analysis")?;
+    let mut child = spawn_codex(temporary, &prompt)?;
+    wait_for_codex(
+        &mut child,
+        temporary,
+        cancelled,
+        "systems analysis",
+        Duration::from_secs(analyzer_timeout_secs()),
+    )?;
     let payload = fs::read_to_string(&temporary.output_path)
         .context("Codex completed without writing an optimization plan")?;
     let plan: OptimizationPlan =
@@ -201,7 +264,9 @@ fn wait_for_codex(
     temporary: &TemporaryArtifacts,
     cancelled: &AtomicBool,
     operation: &str,
+    timeout: Duration,
 ) -> Result<()> {
+    let started = Instant::now();
     loop {
         if cancelled.load(Ordering::Acquire) {
             let _ = child.kill();
@@ -213,14 +278,77 @@ fn wait_for_codex(
             .with_context(|| format!("failed to monitor Codex {operation}"))?
         {
             if !status.success() {
-                let details = read_bounded(&temporary.stderr_path, MAX_AGENT_ERROR_BYTES)
-                    .unwrap_or_else(|_| "Codex did not return diagnostic output".into());
+                let details = stderr_tail(temporary);
                 bail!("Codex {operation} failed ({status}): {details}");
             }
             return Ok(());
         }
+        if started.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            // Read the stderr tail now, while the temporary artifacts still exist.
+            let details = stderr_tail(temporary);
+            bail!(
+                "Codex {operation} timed out after {}s (budget {}s, set PCPULSE_ANALYZER_TIMEOUT_SECS to adjust): {details}",
+                started.elapsed().as_secs(),
+                timeout.as_secs()
+            );
+        }
         thread::sleep(Duration::from_millis(200));
     }
+}
+
+fn stderr_tail(temporary: &TemporaryArtifacts) -> String {
+    read_bounded(&temporary.stderr_path, MAX_AGENT_ERROR_BYTES)
+        .unwrap_or_else(|_| "Codex did not return diagnostic output".into())
+}
+
+/// Preserve failure evidence before `TemporaryArtifacts` cleanup deletes it:
+/// the Codex stderr tail and the error are copied into
+/// `%LOCALAPPDATA%\PcPulse\analyzer-last-error.log` (overwritten on each
+/// failure), and the user-facing error is annotated with the log name.
+/// User-initiated cancellations pass through untouched.
+fn annotate_failure(
+    temporary: &TemporaryArtifacts,
+    operation: &str,
+    error: anyhow::Error,
+) -> anyhow::Error {
+    let message = format!("{error:#}");
+    if message.ends_with("was cancelled") {
+        return error;
+    }
+    let tail = stderr_tail(temporary);
+    if let Some(path) = error_log_path() {
+        let _ = write_failure_log(&path, operation, &message, &tail);
+    }
+    anyhow!("{message} · details: {ANALYZER_ERROR_LOG_NAME}")
+}
+
+fn error_log_path() -> Option<PathBuf> {
+    env::var_os("LOCALAPPDATA").map(|root| {
+        PathBuf::from(root)
+            .join("PcPulse")
+            .join(ANALYZER_ERROR_LOG_NAME)
+    })
+}
+
+fn write_failure_log(path: &Path, operation: &str, error_text: &str, tail: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    let mut contents = format!(
+        "PC Pulse analyzer failure ({operation}) at {}\r\nerror: {error_text}\r\n\r\ncodex stderr tail:\r\n{tail}\r\n",
+        chrono::Utc::now().to_rfc3339()
+    );
+    if contents.len() > MAX_FAILURE_LOG_BYTES {
+        let mut boundary = MAX_FAILURE_LOG_BYTES;
+        while !contents.is_char_boundary(boundary) {
+            boundary -= 1;
+        }
+        contents.truncate(boundary);
+    }
+    fs::write(path, contents).with_context(|| format!("failed to write {}", path.display()))
 }
 
 fn validate_against_context(plan: &OptimizationPlan, context: &AgentContext) -> Result<()> {
@@ -547,6 +675,76 @@ mod tests {
             suggested_follow_ups: Vec::new(),
         };
         assert!(validate_chat_response(&response, "conversation-1", &context()).is_err());
+    }
+
+    #[test]
+    fn wait_for_codex_kills_child_on_timeout_and_reports_elapsed_with_stderr_tail() {
+        let temporary = TemporaryArtifacts::create("{}", "timeout-test").unwrap();
+        fs::write(&temporary.stderr_path, "codex stub stderr line").unwrap();
+        let mut child = Command::new("ping")
+            .args(["-n", "30", "127.0.0.1"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let cancelled = AtomicBool::new(false);
+        let error = wait_for_codex(
+            &mut child,
+            &temporary,
+            &cancelled,
+            "systems chat",
+            Duration::from_millis(250),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("timed out after"), "{error}");
+        assert!(error.contains("codex stub stderr line"), "{error}");
+        assert!(
+            child.try_wait().unwrap().is_some(),
+            "child must be reaped after timeout"
+        );
+    }
+
+    #[test]
+    fn timeout_budget_is_defaulted_and_clamped() {
+        assert_eq!(clamp_timeout_secs(None), 300);
+        assert_eq!(clamp_timeout_secs(Some("not-a-number")), 300);
+        assert_eq!(clamp_timeout_secs(Some("5")), 30);
+        assert_eq!(clamp_timeout_secs(Some("999999")), 1_800);
+        assert_eq!(clamp_timeout_secs(Some(" 600 ")), 600);
+    }
+
+    #[test]
+    fn failure_log_is_written_and_bounded() {
+        let path = env::temp_dir().join(format!(
+            "pcpulse-analyzer-error-test-{}-{}.log",
+            std::process::id(),
+            chrono::Utc::now().timestamp_millis()
+        ));
+        let noisy_tail = "x".repeat(200 * 1_024);
+        write_failure_log(
+            &path,
+            "systems chat",
+            "Codex systems chat failed (exit code: 1)",
+            &noisy_tail,
+        )
+        .unwrap();
+        let written = fs::read(&path).unwrap();
+        assert!(written.len() <= MAX_FAILURE_LOG_BYTES);
+        let text = String::from_utf8(written).unwrap();
+        assert!(text.contains("Codex systems chat failed"));
+        assert!(text.contains("codex stderr tail:"));
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn chat_messages_without_error_flag_deserialize_as_ordinary_turns() {
+        let legacy = r#"{"role":"user","timestampMs":1,"text":"question","evidenceRefs":[]}"#;
+        let message: ChatMessage = serde_json::from_str(legacy).unwrap();
+        assert!(!message.is_error);
+        // Ordinary turns serialize without the flag, keeping the Codex prompt payload unchanged.
+        assert!(!serde_json::to_string(&message).unwrap().contains("isError"));
     }
 
     #[test]

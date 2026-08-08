@@ -4,7 +4,7 @@ use pcpulse_tui::{
     app::{App, InputMode},
     client::PipeClient,
     effects::MotionSystem,
-    ui,
+    theme, ui,
 };
 use ratatui::{
     crossterm::{
@@ -31,9 +31,16 @@ fn main() {
 
 fn entry() -> Result<()> {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
+    // A leading TUI flag (or no arguments at all) means an interactive run;
+    // parse_tui_flags then rejects anything it does not recognize.
+    if arguments
+        .first()
+        .is_none_or(|argument| is_tui_flag(argument))
+    {
+        let options = parse_tui_flags(&arguments)?;
+        return run_tui(options);
+    }
     match arguments.first().map(String::as_str) {
-        None => run_tui(true),
-        Some("--no-effects" | "--reduced-motion") if arguments.len() == 1 => run_tui(false),
         Some("--version" | "version") => {
             println!("PC Pulse {}", env!("CARGO_PKG_VERSION"));
             Ok(())
@@ -92,9 +99,56 @@ fn entry() -> Result<()> {
         Some("settings") => print_json(PipeClient.settings()?),
         Some("ping") => print_json(PipeClient.ping()?),
         _ => bail!(
-            "usage: PcPulse.exe [snapshot | alerts | logs [hours] | agent-context [hours] | analyze [hours] | plan | plans | import-plan <file> | validate-plan <file> | plan-schema | agent-prompt | settings | ping | --no-effects | --version]"
+            "usage: PcPulse.exe [snapshot | alerts | logs [hours] | agent-context [hours] | analyze [hours] | plan | plans | import-plan <file> | validate-plan <file> | plan-schema | agent-prompt | settings | ping | --theme <vitals|avionics> | --no-effects | --version]"
         ),
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TuiOptions {
+    effects_enabled: bool,
+    theme: theme::ThemeId,
+}
+
+fn is_tui_flag(argument: &str) -> bool {
+    matches!(argument, "--no-effects" | "--reduced-motion" | "--theme")
+        || argument.starts_with("--theme=")
+}
+
+fn parse_tui_flags(arguments: &[String]) -> Result<TuiOptions> {
+    let mut options = TuiOptions {
+        effects_enabled: true,
+        theme: theme::ThemeId::Vitals,
+    };
+    let mut index = 0;
+    while index < arguments.len() {
+        match arguments[index].as_str() {
+            "--no-effects" | "--reduced-motion" => options.effects_enabled = false,
+            "--theme" => {
+                index += 1;
+                let name = arguments
+                    .get(index)
+                    .ok_or_else(|| anyhow::anyhow!("--theme requires a value{THEME_USAGE}"))?;
+                options.theme = parse_theme(name)?;
+            }
+            other => {
+                if let Some(name) = other.strip_prefix("--theme=") {
+                    options.theme = parse_theme(name)?;
+                } else {
+                    bail!("unknown option \"{other}\"{THEME_USAGE}");
+                }
+            }
+        }
+        index += 1;
+    }
+    Ok(options)
+}
+
+const THEME_USAGE: &str = " (usage: PcPulse.exe [--theme vitals|avionics] [--no-effects])";
+
+fn parse_theme(name: &str) -> Result<theme::ThemeId> {
+    name.parse::<theme::ThemeId>()
+        .map_err(|error| anyhow::anyhow!("{error}{THEME_USAGE}"))
 }
 
 fn parse_hours(arguments: &[String], default: u32) -> Result<u32> {
@@ -131,7 +185,8 @@ fn print_text(value: &str) -> Result<()> {
     }
 }
 
-fn run_tui(effects_enabled: bool) -> Result<()> {
+fn run_tui(options: TuiOptions) -> Result<()> {
+    theme::set_active(options.theme);
     let mut terminal = ratatui::try_init()?;
     if let Err(error) = execute!(std::io::stdout(), EnableMouseCapture) {
         let _ = ratatui::try_restore();
@@ -140,7 +195,7 @@ fn run_tui(effects_enabled: bool) -> Result<()> {
     let result = terminal
         .clear()
         .map_err(anyhow::Error::from)
-        .and_then(|_| run_loop(&mut terminal, effects_enabled));
+        .and_then(|_| run_loop(&mut terminal, options.effects_enabled));
     let mouse_restore =
         execute!(std::io::stdout(), DisableMouseCapture).map_err(anyhow::Error::from);
     let restore = ratatui::try_restore().map_err(anyhow::Error::from);
@@ -185,6 +240,20 @@ fn run_loop(terminal: &mut ratatui::DefaultTerminal, effects_enabled: bool) -> R
                         dirty = true;
                         continue;
                     }
+                    if key.kind != KeyEventKind::Release
+                        && key.code == KeyCode::Char('t')
+                        && matches!(app.mode, InputMode::Normal)
+                    {
+                        let active = theme::cycle();
+                        app.status = format!("Theme: {}", active.name);
+                        app.status_is_error = false;
+                        // The base draw repaints every cell, but clear the
+                        // backend diff so no stale-bg cell survives the swap.
+                        terminal.clear()?;
+                        motion.observe(&app);
+                        dirty = true;
+                        continue;
+                    }
                     if app.handle_key(key) {
                         break;
                     }
@@ -192,14 +261,18 @@ fn run_loop(terminal: &mut ratatui::DefaultTerminal, effects_enabled: bool) -> R
                     dirty = true;
                 }
                 Event::Resize(_, _) => dirty = true,
-                Event::Mouse(mouse)
-                    if ui::handle_mouse(&mut app, mouse, terminal_area) =>
-                {
+                Event::Mouse(mouse) if ui::handle_mouse(&mut app, mouse, terminal_area) => {
                     motion.observe(&app);
                     dirty = true;
                 }
                 _ => {}
             }
+        } else if app.analyzer_running {
+            // The worker stays silent for the whole Codex run, so while a
+            // submission is in flight the finite poll timeout is the wakeup
+            // that advances the "analyzing …" ticker. Idle behavior without
+            // an active analysis is untouched.
+            dirty = true;
         }
     }
     Ok(())

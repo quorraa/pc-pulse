@@ -33,9 +33,11 @@ ETW supplies process lifecycle timing, PDH supplies localized system performance
 
 ## Terminal interface
 
+The TUI ships two presentation profiles: **vitals** (default), a patient-monitor identity with top header, tabs, and a bottom footer, and **avionics**, an amber-CRT multi-function display with a left bezel-key rail, a top annunciator strip that keeps one lamp per finding class lit from every page, and an Observe canvas rebuilt around a custom pressure-map treemap — every major process becomes a clickable tile sized by working set and colored/heated by its dominant pressure channel. Start with `PcPulse.exe --theme vitals|avionics` or cycle live with `t`.
+
 The TUI has eight views:
 
-1. **Observe** — an asymmetric runtime-forensics canvas with a shared CPU/memory pressure field, multi-resource suspect ranking, system threshold vectors, parallel-agent footprint, collector budget, and an owner/evidence incident tape.
+1. **Observe** — an asymmetric runtime-forensics canvas with a shared CPU/memory pressure field, multi-resource suspect ranking, system threshold vectors, a CPU load-composition ribbon on tall terminals, parallel-agent footprint, collector budget, and an owner/evidence incident tape.
 2. **Processes** — dense sortable process table, filtering by name/path/PID, and a full process inspector.
 3. **Tree** — parent/child ownership for identifying abandoned agent descendants and runaway parallel jobs.
 4. **Findings** — active/resolved history with ownership, explanation, evidence, and recommendations.
@@ -55,6 +57,7 @@ Important keys:
 | `g` | Toggle agent-only process focus |
 | `x` | Begin a manual termination request; exact PID entry is required |
 | `a` | Acknowledge the selected finding |
+| `i` | Investigate the selected finding in Oracle — a new chat opens and the composed question is submitted with the finding's evidence; double-clicking the finding row does the same |
 | `[` / `]` | Shorten or lengthen the persisted timeline |
 | `Enter` or `/` on Oracle | Ask the embedded systems analyzer |
 | `j`/`k`, `PgUp`/`PgDn` on Oracle | Scroll the conversation |
@@ -66,6 +69,7 @@ Important keys:
 | `s` | Save settings |
 | `r` | Refresh the current view |
 | `m` | Toggle finite TachyonFX motion effects |
+| `t` | Cycle presentation profiles (vitals / avionics) |
 | `q` / `Ctrl-C` | Exit the TUI; the collector continues |
 | Left-click | Select tabs, process/tree/finding rows, settings, or the Oracle prompt |
 | Click any table header | Sort the overview suspects, processes, lineage rows, findings, or settings by that column |

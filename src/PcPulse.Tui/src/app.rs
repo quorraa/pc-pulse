@@ -28,6 +28,9 @@ use std::{
 };
 
 const LIVE_HISTORY_CAPACITY: usize = 180;
+/// Two left clicks on the same finding row within this window count as a
+/// double-click and open an investigation.
+const DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(400);
 static CHAT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 fn new_conversation_id() -> String {
@@ -560,6 +563,14 @@ pub struct App {
     pub diagnostics: DiagnosticLogResponse,
     pub plans: Vec<OptimizationPlan>,
     pub analyzer_running: bool,
+    /// Wall-clock start of the in-flight analyzer submission; see `analyzer_progress`.
+    pub(crate) analyzer_started_at: Option<Instant>,
+    /// Sticky record of the most recent analyzer failure. Unlike `status`, it
+    /// is not clobbered by routine status updates; it clears on the next chat
+    /// submission (or a new conversation).
+    // ui: render analyzer_last_error as a persistent error banner on the Analyzer (Oracle)
+    // page whenever it is Some, independent of the one-line footer status.
+    pub analyzer_last_error: Option<String>,
     pub analyzer_window_hours: u32,
     pub conversation_id: String,
     pub chat_messages: VecDeque<ChatMessage>,
@@ -585,6 +596,8 @@ pub struct App {
     pub process_state: TableState,
     pub tree_state: TableState,
     pub alert_state: TableState,
+    /// Most recent left click on a finding row, for double-click detection.
+    alert_last_click: Option<(usize, Instant)>,
     pub plan_action_state: ListState,
     pub setting_state: TableState,
     pub worker: Worker,
@@ -638,6 +651,8 @@ impl App {
             },
             plans: Vec::new(),
             analyzer_running: false,
+            analyzer_started_at: None,
+            analyzer_last_error: None,
             analyzer_window_hours: 1,
             conversation_id: new_conversation_id(),
             chat_messages: VecDeque::with_capacity(16),
@@ -663,6 +678,7 @@ impl App {
             process_state: TableState::default().with_selected(0),
             tree_state: TableState::default().with_selected(0),
             alert_state: TableState::default().with_selected(0),
+            alert_last_click: None,
             plan_action_state: ListState::default().with_selected(Some(0)),
             setting_state: TableState::default().with_selected(0),
             worker,
@@ -747,11 +763,13 @@ impl App {
                 }
                 WorkerEvent::Chat(Ok(response)) => {
                     self.analyzer_running = false;
+                    self.analyzer_started_at = None;
                     self.chat_messages.push_back(ChatMessage {
                         role: ChatRole::Assistant,
                         timestamp_ms: Utc::now().timestamp_millis(),
                         text: response.answer.clone(),
                         evidence_refs: response.evidence_refs.clone(),
+                        is_error: false,
                     });
                     self.bound_chat_history();
                     self.latest_chat = Some(response);
@@ -765,10 +783,7 @@ impl App {
                         Err(error) => self.set_error(error),
                     }
                 }
-                WorkerEvent::Chat(Err(error)) => {
-                    self.analyzer_running = false;
-                    self.set_error(error);
-                }
+                WorkerEvent::Chat(Err(error)) => self.handle_chat_failure(error),
                 WorkerEvent::Settings(Ok(settings)) => {
                     self.settings = settings;
                     self.settings_dirty = false;
@@ -853,6 +868,7 @@ impl App {
                 self.begin_termination();
             }
             KeyCode::Char('a') if self.page == Page::Alerts => self.acknowledge_selected(),
+            KeyCode::Char('i') if self.page == Page::Alerts => self.investigate_selected_finding(),
             KeyCode::Enter | KeyCode::Char('/')
                 if self.page == Page::Analyzer
                     && !self.analyzer_running
@@ -924,39 +940,84 @@ impl App {
                 self.mode = InputMode::Chat(value);
             }
             KeyCode::Enter if !value.trim().is_empty() => {
-                let message = ChatMessage {
-                    role: ChatRole::User,
-                    timestamp_ms: Utc::now().timestamp_millis(),
-                    text: value.trim().to_string(),
-                    evidence_refs: Vec::new(),
-                };
-                self.chat_messages.push_back(message);
-                self.bound_chat_history();
-                let history_result = self.persist_current_chat();
-                self.analyzer_running = true;
-                self.chat_scroll_from_bottom = 0;
-                self.status = format!(
-                    "Systems analyzer is reading {} hour(s) of live evidence…",
-                    self.analyzer_window_hours
-                );
-                self.status_is_error = false;
-                let command = WorkerCommand::RunChat {
-                    conversation_id: self.conversation_id.clone(),
-                    history: self.chat_messages.iter().cloned().collect(),
-                    hours: self.analyzer_window_hours,
-                };
-                if self.worker.commands.try_send(command).is_err() {
-                    self.analyzer_running = false;
-                    self.set_error("systems-analyzer command queue is busy".into());
-                }
-                if let Err(error) = history_result {
-                    self.set_error(error);
-                }
+                self.submit_chat_message(value.trim().to_string(), Vec::new());
                 self.mode = InputMode::Normal;
             }
             _ => {}
         }
         false
+    }
+
+    /// The single submission path for every analyzer question — typed or
+    /// composed by an investigation. Records the user turn, arms the running
+    /// state and timeout ticker, clears the sticky error, and hands the
+    /// bounded history to the worker.
+    fn submit_chat_message(&mut self, text: String, evidence_refs: Vec<String>) {
+        let message = ChatMessage {
+            role: ChatRole::User,
+            timestamp_ms: Utc::now().timestamp_millis(),
+            text,
+            evidence_refs,
+            is_error: false,
+        };
+        self.chat_messages.push_back(message);
+        self.bound_chat_history();
+        let history_result = self.persist_current_chat();
+        self.analyzer_running = true;
+        self.analyzer_started_at = Some(Instant::now());
+        self.analyzer_last_error = None;
+        self.chat_scroll_from_bottom = 0;
+        self.status = format!(
+            "Systems analyzer is reading {} hour(s) of live evidence…",
+            self.analyzer_window_hours
+        );
+        self.status_is_error = false;
+        let command = WorkerCommand::RunChat {
+            conversation_id: self.conversation_id.clone(),
+            history: self.outgoing_chat_history(),
+            hours: self.analyzer_window_hours,
+        };
+        if self.worker.commands.try_send(command).is_err() {
+            self.analyzer_running = false;
+            self.analyzer_started_at = None;
+            self.set_error("systems-analyzer command queue is busy".into());
+        }
+        if let Err(error) = history_result {
+            self.set_error(error);
+        }
+    }
+
+    /// `i` on the Findings page (or a double-click on a finding row): open a
+    /// fresh Oracle conversation about the selected finding — active or
+    /// archived — and submit the composed question through the ordinary
+    /// chat path, citing the finding's evidence reference.
+    pub(crate) fn investigate_selected_finding(&mut self) {
+        if self.analyzer_running {
+            self.set_error("analyzer busy — Esc to cancel first".into());
+            return;
+        }
+        let Some(alert) = self.selected_alert().cloned() else {
+            return;
+        };
+        let question = compose_investigation_question(&alert);
+        self.select_page(Page::Analyzer);
+        self.begin_new_chat();
+        self.submit_chat_message(question, vec![format!("alert:{}", alert.id)]);
+    }
+
+    /// A left click on a finding row: always select it; a second click on the
+    /// same row within [`DOUBLE_CLICK_WINDOW`] opens the investigation.
+    pub(crate) fn register_finding_click(&mut self, index: usize) {
+        self.alert_state.select(Some(index));
+        let now = Instant::now();
+        let is_double = self.alert_last_click.take().is_some_and(|(last, at)| {
+            last == index && now.duration_since(at) <= DOUBLE_CLICK_WINDOW
+        });
+        if is_double {
+            self.investigate_selected_finding();
+        } else {
+            self.alert_last_click = Some((index, now));
+        }
     }
 
     fn handle_confirm_key(
@@ -1157,6 +1218,52 @@ impl App {
         }
     }
 
+    /// Elapsed seconds since the in-flight analyzer submission plus the total
+    /// timeout budget in seconds; `None` when no analysis is running.
+    // ui: while analyzer_running, render this on the Analyzer (Oracle) page as
+    // "analyzing {elapsed_m}m{elapsed_s}s / {budget_m}m{budget_s}s · Esc cancels".
+    pub fn analyzer_progress(&self) -> Option<(u64, u64)> {
+        self.analyzer_started_at.map(|started| {
+            (
+                started.elapsed().as_secs(),
+                crate::analyzer::analyzer_timeout_secs(),
+            )
+        })
+    }
+
+    /// The conversation turns sent to Codex: failed-turn records stay local to
+    /// the transcript and are excluded from the analyzer prompt.
+    fn outgoing_chat_history(&self) -> Vec<ChatMessage> {
+        self.chat_messages
+            .iter()
+            .filter(|message| !message.is_error)
+            .cloned()
+            .collect()
+    }
+
+    /// Record an analyzer failure so it can never disappear silently: the
+    /// failure becomes an error-marked assistant turn persisted with the
+    /// conversation, and a sticky error that outlives routine status updates.
+    fn handle_chat_failure(&mut self, error: String) {
+        self.analyzer_running = false;
+        self.analyzer_started_at = None;
+        self.chat_messages.push_back(ChatMessage {
+            role: ChatRole::Assistant,
+            timestamp_ms: Utc::now().timestamp_millis(),
+            text: format!("Analysis failed: {error}"),
+            evidence_refs: Vec::new(),
+            is_error: true,
+        });
+        self.bound_chat_history();
+        self.chat_scroll_from_bottom = 0;
+        let persisted = self.persist_current_chat();
+        self.analyzer_last_error = Some(error.clone());
+        self.set_error(error);
+        if let Err(persist_error) = persisted {
+            self.set_error(persist_error);
+        }
+    }
+
     fn persist_current_chat(&mut self) -> Result<(), String> {
         if self.chat_messages.is_empty() {
             return Ok(());
@@ -1195,6 +1302,7 @@ impl App {
         self.conversation_id = new_conversation_id();
         self.chat_messages.clear();
         self.latest_chat = None;
+        self.analyzer_last_error = None;
         self.chat_scroll_from_bottom = 0;
         self.chat_history_focused = false;
         self.chat_session_state.select(Some(0));
@@ -1373,6 +1481,55 @@ fn severity_rank(severity: Severity) -> u8 {
     }
 }
 
+fn severity_word(severity: Severity) -> &'static str {
+    match severity {
+        Severity::Info => "info",
+        Severity::Warning => "warning",
+        Severity::Critical => "critical",
+    }
+}
+
+/// The Oracle question an investigation submits: it cites the finding
+/// precisely, keeps only the fields that carry a value, and always ends on
+/// the same three asks so the analyzer's answer shape stays predictable.
+pub(crate) fn compose_investigation_question(alert: &Alert) -> String {
+    let mut question = format!("Investigate finding {}: {}.", alert.id, alert.title);
+    let mut facts: Vec<String> = Vec::new();
+    if !alert.kind.is_empty() {
+        facts.push(format!("Kind {}", alert.kind));
+    }
+    facts.push(format!("severity {}", severity_word(alert.severity)));
+    if let Some(name) = alert
+        .process_name
+        .as_deref()
+        .filter(|name| !name.is_empty())
+    {
+        facts.push(match alert.process_id {
+            Some(pid) => format!("owner {name} (pid {pid})"),
+            None => format!("owner {name}"),
+        });
+    }
+    facts.push(format!("seen {}x", alert.occurrence_count));
+    if alert.resolved_at_ms.is_some() {
+        facts.push("now resolved".into());
+    }
+    question.push(' ');
+    question.push_str(&facts.join(", "));
+    question.push('.');
+    let evidence: Vec<String> = alert
+        .evidence
+        .iter()
+        .map(|item| format!("{} {}", item.label, item.value))
+        .collect();
+    if !evidence.is_empty() {
+        question.push_str(&format!(" Evidence: {}.", evidence.join("; ")));
+    }
+    question.push_str(
+        " Explain the likely root cause, whether it is still occurring, and the safest next steps.",
+    );
+    question
+}
+
 fn alert_state_rank(alert: &Alert) -> u8 {
     if alert.resolved_at_ms.is_some() {
         2
@@ -1494,6 +1651,7 @@ mod tests {
                 timestamp_ms,
                 text: format!("message {timestamp_ms}"),
                 evidence_refs: Vec::new(),
+                is_error: false,
             });
         }
         app.bound_chat_history();
@@ -1521,6 +1679,7 @@ mod tests {
             timestamp_ms: 10,
             text: "Why did the machine slow down?".into(),
             evidence_refs: Vec::new(),
+            is_error: false,
         });
         app.persist_current_chat().unwrap();
         assert_eq!(app.chat_sessions.len(), 1);
@@ -1533,5 +1692,232 @@ mod tests {
         assert_eq!(app.conversation_id, original_id);
         assert_eq!(app.chat_messages.len(), 1);
         assert_eq!(app.chat_messages[0].text, "Why did the machine slow down?");
+    }
+
+    #[test]
+    fn chat_failure_is_recorded_as_failed_turn_and_sticky_error() {
+        let mut app = App::new_inert();
+        app.chat_messages.push_back(ChatMessage {
+            role: ChatRole::User,
+            timestamp_ms: 10,
+            text: "Why is the disk thrashing?".into(),
+            evidence_refs: Vec::new(),
+            is_error: false,
+        });
+        app.analyzer_running = true;
+        app.analyzer_started_at = Some(Instant::now());
+
+        app.handle_chat_failure(
+            "Codex systems chat timed out after 300s · details: analyzer-last-error.log".into(),
+        );
+
+        assert!(!app.analyzer_running);
+        assert!(app.analyzer_progress().is_none());
+        assert_eq!(app.chat_messages.len(), 2);
+        let failed = app.chat_messages.back().unwrap();
+        assert_eq!(failed.role, ChatRole::Assistant);
+        assert!(failed.is_error);
+        assert!(failed.text.contains("timed out"));
+        assert!(
+            app.analyzer_last_error
+                .as_deref()
+                .is_some_and(|error| error.ends_with("details: analyzer-last-error.log"))
+        );
+        assert!(app.status_is_error);
+
+        // The failed turn is persisted with the conversation for the Chat Vault.
+        assert_eq!(app.chat_sessions.len(), 1);
+        assert!(
+            app.chat_sessions[0]
+                .messages
+                .iter()
+                .any(|message| message.is_error)
+        );
+
+        // Failed turns never travel back to Codex on the next submission.
+        let outgoing = app.outgoing_chat_history();
+        assert_eq!(outgoing.len(), 1);
+        assert!(outgoing.iter().all(|message| !message.is_error));
+
+        // Routine status updates must not clobber the sticky error.
+        app.status = "Connected".into();
+        app.status_is_error = false;
+        assert!(app.analyzer_last_error.is_some());
+
+        // The next submission-equivalent reset clears it.
+        app.begin_new_chat();
+        assert!(app.analyzer_last_error.is_none());
+    }
+
+    /// An `App` whose worker command queue is held open by the test, so
+    /// submissions actually enqueue and the sent commands can be asserted.
+    fn app_with_captive_worker() -> (App, Receiver<WorkerCommand>) {
+        let (commands, command_rx) = bounded(8);
+        let (event_source, events) = bounded(1);
+        drop(event_source);
+        let app = App::with_worker(
+            Worker {
+                commands,
+                events,
+                handle: None,
+            },
+            false,
+        );
+        (app, command_rx)
+    }
+
+    fn investigation_alert() -> Alert {
+        Alert {
+            id: "finding-77".into(),
+            kind: "memoryGrowth".into(),
+            severity: Severity::Warning,
+            first_seen_ms: 1_800_000_000_000,
+            last_seen_ms: 1_800_000_600_000,
+            process_id: Some(5100),
+            process_name: Some("chrome.exe".into()),
+            title: "Chrome working set is growing".into(),
+            explanation: "sustained growth over baseline".into(),
+            evidence: vec![
+                pcpulse_service::models::Evidence {
+                    label: "working set".into(),
+                    value: "+512 MB in 10m".into(),
+                },
+                pcpulse_service::models::Evidence {
+                    label: "baseline".into(),
+                    value: "4.2 sigma".into(),
+                },
+            ],
+            recommendation: "observe".into(),
+            acknowledged: false,
+            occurrence_count: 3,
+            resolved_at_ms: None,
+        }
+    }
+
+    const INVESTIGATION_TAIL: &str =
+        " Explain the likely root cause, whether it is still occurring, and the safest next steps.";
+
+    #[test]
+    fn investigate_composes_the_question_and_submits_through_the_chat_path() {
+        let (mut app, commands) = app_with_captive_worker();
+        app.page = Page::Alerts;
+        app.alerts = vec![investigation_alert()];
+        app.alert_state.select(Some(0));
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+
+        assert_eq!(app.page, Page::Analyzer);
+        assert!(app.analyzer_running);
+        assert!(app.analyzer_progress().is_some());
+        assert!(app.analyzer_last_error.is_none());
+        assert_eq!(app.chat_messages.len(), 1);
+        let turn = app.chat_messages.front().unwrap();
+        assert_eq!(turn.role, ChatRole::User);
+        assert_eq!(
+            turn.text,
+            format!(
+                "Investigate finding finding-77: Chrome working set is growing. \
+                 Kind memoryGrowth, severity warning, owner chrome.exe (pid 5100), seen 3x. \
+                 Evidence: working set +512 MB in 10m; baseline 4.2 sigma.{INVESTIGATION_TAIL}"
+            )
+        );
+        assert_eq!(turn.evidence_refs, vec!["alert:finding-77".to_string()]);
+
+        // select_page(Analyzer) refreshes the page, then the chat runs; the
+        // enqueued conversation carries the composed question.
+        let sent: Vec<WorkerCommand> = commands.try_iter().collect();
+        let run = sent
+            .iter()
+            .find_map(|command| match command {
+                WorkerCommand::RunChat {
+                    conversation_id,
+                    history,
+                    ..
+                } => Some((conversation_id, history)),
+                _ => None,
+            })
+            .expect("investigation must enqueue a RunChat command");
+        assert_eq!(run.0, &app.conversation_id);
+        assert_eq!(run.1.len(), 1);
+        assert!(run.1[0].text.starts_with("Investigate finding finding-77:"));
+    }
+
+    #[test]
+    fn investigation_question_drops_absent_fields_and_notes_resolution() {
+        let mut alert = investigation_alert();
+        alert.id = "f-2".into();
+        alert.title = "Kernel pool climbing".into();
+        alert.kind = "kernelPool".into();
+        alert.severity = Severity::Critical;
+        alert.process_id = None;
+        alert.process_name = None;
+        alert.evidence = Vec::new();
+        alert.occurrence_count = 1;
+        alert.resolved_at_ms = Some(1_800_000_700_000);
+        assert_eq!(
+            compose_investigation_question(&alert),
+            format!(
+                "Investigate finding f-2: Kernel pool climbing. \
+                 Kind kernelPool, severity critical, seen 1x, now resolved.{INVESTIGATION_TAIL}"
+            )
+        );
+    }
+
+    #[test]
+    fn investigate_refuses_while_the_analyzer_is_busy() {
+        let (mut app, commands) = app_with_captive_worker();
+        app.page = Page::Alerts;
+        app.alerts = vec![investigation_alert()];
+        app.alert_state.select(Some(0));
+        app.analyzer_running = true;
+        app.analyzer_started_at = Some(Instant::now());
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+
+        assert_eq!(app.page, Page::Alerts);
+        assert!(app.chat_messages.is_empty());
+        assert_eq!(app.status, "analyzer busy — Esc to cancel first");
+        assert!(app.status_is_error);
+        assert!(
+            !commands
+                .try_iter()
+                .any(|command| matches!(command, WorkerCommand::RunChat { .. }))
+        );
+    }
+
+    #[test]
+    fn double_clicking_a_finding_row_investigates_and_a_single_click_selects() {
+        let (mut app, commands) = app_with_captive_worker();
+        app.page = Page::Alerts;
+        app.alerts = vec![investigation_alert()];
+
+        app.register_finding_click(0);
+        assert_eq!(app.page, Page::Alerts, "first click only selects");
+        assert_eq!(app.alert_state.selected(), Some(0));
+        assert!(app.chat_messages.is_empty());
+
+        app.register_finding_click(0);
+        assert_eq!(app.page, Page::Analyzer);
+        assert!(app.analyzer_running);
+        assert!(
+            app.chat_messages
+                .front()
+                .is_some_and(|turn| turn.text.starts_with("Investigate finding finding-77:"))
+        );
+        assert!(
+            commands
+                .try_iter()
+                .any(|command| matches!(command, WorkerCommand::RunChat { .. }))
+        );
+    }
+
+    #[test]
+    fn analyzer_progress_reports_elapsed_and_budget() {
+        let mut app = App::new_inert();
+        assert!(app.analyzer_progress().is_none());
+        app.analyzer_started_at = Some(Instant::now());
+        let (elapsed, budget) = app.analyzer_progress().unwrap();
+        assert!(elapsed <= 1);
+        assert!((30..=1_800).contains(&budget));
     }
 }

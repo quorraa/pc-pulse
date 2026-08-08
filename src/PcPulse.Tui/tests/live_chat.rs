@@ -12,6 +12,7 @@ fn embedded_chat_answers_from_live_evidence() {
         timestamp_ms: chrono::Utc::now().timestamp_millis(),
         text: "Briefly summarize the strongest sustained performance signal in the current evidence. If none is defensible, say so.".into(),
         evidence_refs: Vec::new(),
+        is_error: false,
     }];
     let response = chat(
         &conversation_id,
