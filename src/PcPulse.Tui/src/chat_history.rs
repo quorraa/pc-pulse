@@ -117,7 +117,7 @@ fn normalize(sessions: &mut Vec<ChatSession>) {
         }
         session.title = truncate_title(&session.title, 52);
     }
-    sessions.sort_by(|left, right| right.updated_at_ms.cmp(&left.updated_at_ms));
+    sessions.sort_by_key(|session| std::cmp::Reverse(session.updated_at_ms));
     let mut seen = std::collections::HashSet::new();
     sessions.retain(|session| seen.insert(session.conversation_id.clone()));
     sessions.truncate(MAX_SESSIONS);
