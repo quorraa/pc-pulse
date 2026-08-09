@@ -1,6 +1,6 @@
 [package]
 name = "pcpulse-tui"
-version = "1.7.1"
+version = "1.7.2"
 edition = "2024"
 license = "MIT"
 description = "Keyboard-first terminal client and native notifier for PC Pulse"
