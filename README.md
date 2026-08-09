@@ -27,7 +27,7 @@ Release binaries are currently unsigned; Windows may show an unknown-publisher w
 - Physical-disk transfer latency, DPC rate, interrupt rate, paged pool, and nonpaged pool.
 - Hung top-level windows, ETW process starts, time to first visible window, parent/child trees, and detached idle agent processes.
 - Hardware temperatures and clocks — ACPI thermal zones, effective CPU frequency, and NVIDIA GPU temperature/clocks/utilization — best-effort by hardware and driver support, sampled every five seconds.
-- Its own collector against absolute budgets (25 MB working set, 0.2% CPU, 250 handles) plus mature working-set growth.
+- Its own collector against absolute budgets (25 MB working set, 0.2% CPU, 600 handles) plus mature working-set growth.
 - When a handle or thread leak is flagged, captures which handle types and which modules' threads grew — for any process, system metadata only.
 - Redacted warning/error/critical Application and System events, classified and fingerprinted (hardware, storage, graphics, crashes, hangs, resource exhaustion, power, services, networking, agent runtimes).
 - Active and resolved finding history with responsible process where attribution is defensible, supporting evidence, explanation, and safe next actions.

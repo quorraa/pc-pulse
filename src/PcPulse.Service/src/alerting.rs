@@ -6,6 +6,12 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use uuid::Uuid;
 
 const MIB: f64 = 1024.0 * 1024.0;
+/// Absolute collector handle budget. The original 250 predates the WMI/COM
+/// apartment, NVML, and forensics subsystems, whose fixed infrastructure
+/// (ETW provider registrations, registry keys, driver handles) measures
+/// ~350-500 steady handles on real machines with zero growth. 600 keeps
+/// headroom for detection of genuine leaks without flagging the baseline.
+const COLLECTOR_HANDLE_BUDGET: u32 = 600;
 
 #[derive(Debug, Clone, Default)]
 struct RunningStats {
@@ -311,7 +317,7 @@ impl AlertEngine {
                 let memory_mb = process.working_set_bytes as f64 / MIB;
                 let memory_breached = memory_mb >= 25.0;
                 let cpu_breached = process.cpu_percent >= 0.2;
-                let handles_breached = process.handle_count >= 250;
+                let handles_breached = process.handle_count >= COLLECTOR_HANDLE_BUDGET;
                 if memory_breached || cpu_breached || handles_breached {
                     let mut budget_evidence = Vec::new();
                     if memory_breached {
@@ -329,13 +335,19 @@ impl AlertEngine {
                     if handles_breached {
                         budget_evidence.push(evidence(
                             "Breached budget",
-                            format!("Handles {} >= 250", process.handle_count),
+                            format!(
+                                "Handles {} >= {COLLECTOR_HANDLE_BUDGET}",
+                                process.handle_count
+                            ),
                         ));
                     }
                     budget_evidence.extend([
                         evidence("Working set", format!("{memory_mb:.1} MB / 25 MB")),
                         evidence("CPU", format!("{:.3}% / 0.2%", process.cpu_percent)),
-                        evidence("Handles", format!("{} / 250", process.handle_count)),
+                        evidence(
+                            "Handles",
+                            format!("{} / {COLLECTOR_HANDLE_BUDGET}", process.handle_count),
+                        ),
                     ]);
                     candidates.push(process_candidate(
                         process,

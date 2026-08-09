@@ -35,7 +35,7 @@ try {
         MaxWorkingSetMb = [Math]::Round($maxWorkingSet / 1MB, 2)
         MaxHandles = $maxHandles
         WorkingSetGrowthMb = [Math]::Round($growth / 1MB, 2)
-        Passed = $averageCpu -lt 0.2 -and $maxWorkingSet -lt 25MB -and $maxHandles -lt 250 -and $growth -lt 1MB
+        Passed = $averageCpu -lt 0.2 -and $maxWorkingSet -lt 25MB -and $maxHandles -lt 600 -and $growth -lt 1MB
     }
     $result
     if (-not $result.Passed) { throw 'Collector did not meet one or more resource budgets.' }

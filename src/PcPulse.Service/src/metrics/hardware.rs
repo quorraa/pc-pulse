@@ -169,7 +169,22 @@ impl SystemProbe {
 impl HardwareProbe for SystemProbe {
     fn thermal_zones(&mut self) -> Result<Vec<ThermalZone>, String> {
         match &self.thermal {
-            Ok(wmi) => wmi.zones().map_err(|error| format!("{error:#}")),
+            Ok(wmi) => match wmi.zones() {
+                Ok(zones) => Ok(zones),
+                Err(error) => {
+                    let detail = format!("{error:#}");
+                    // A permanent failure (firmware without thermal zones,
+                    // absent class/namespace, denied access) will never
+                    // succeed in this process: make it sticky so the query
+                    // stops re-running every cycle, and drop the whole WMI
+                    // stack — its COM apartment's handle footprint is dead
+                    // weight against the collector's handle budget.
+                    if is_permanent_thermal_failure(&detail) {
+                        self.thermal = Err(detail.clone());
+                    }
+                    Err(detail)
+                }
+            },
             Err(detail) => Err(detail.clone()),
         }
     }
@@ -291,6 +306,15 @@ impl WmiThermal {
             Ok(zones)
         }
     }
+}
+
+/// Failure modes that cannot heal within this process lifetime: firmware
+/// without ACPI thermal zones, an absent WMI class or namespace, or denied
+/// access. Matches the phrases `wbem_error_text` maps in this module.
+fn is_permanent_thermal_failure(detail: &str) -> bool {
+    detail.contains("not supported by this system's ACPI firmware")
+        || detail.contains("is absent")
+        || detail.contains("access denied")
 }
 
 /// The WMI failure modes a user can actually act on, in plain words; other

@@ -1087,6 +1087,31 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "dev harness: prints the handle-type histogram of the process named by PCPULSE_TARGET_PID"]
+    fn dev_probe_target_process_handles() {
+        let pid: u32 = std::env::var("PCPULSE_TARGET_PID")
+            .expect("set PCPULSE_TARGET_PID")
+            .parse()
+            .expect("PCPULSE_TARGET_PID must be a pid");
+        let mut source = WindowsForensicsSource::default();
+        let histograms = source
+            .handle_histograms(&HashSet::from([pid]))
+            .expect("capture handle table");
+        let mut rows: Vec<(String, u64)> = histograms
+            .get(&pid)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        rows.sort_by_key(|row| std::cmp::Reverse(row.1));
+        let total: u64 = rows.iter().map(|(_, count)| count).sum();
+        println!("pid {pid}: {total} handles");
+        for (name, count) in rows.iter().take(12) {
+            println!("  {name:<24} {count}");
+        }
+    }
+
+    #[test]
     #[ignore = "dev harness: probes the real system handle table and thread start modules on this machine and prints the resulting forensic evidence"]
     fn dev_probe_real_leak_forensics() {
         use windows::Win32::System::Threading::CreateEventW;
