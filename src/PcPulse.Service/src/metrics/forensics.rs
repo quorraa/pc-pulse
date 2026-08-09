@@ -28,13 +28,14 @@ use windows::Win32::{
             CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First,
             Thread32Next,
         },
+        Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree},
         ProcessStatus::{
-            EnumProcessModulesEx, GetModuleBaseNameW, GetModuleInformation, LIST_MODULES_ALL,
-            MODULEINFO,
+            EnumProcessModulesEx, GetModuleBaseNameW, GetModuleInformation, K32EmptyWorkingSet,
+            LIST_MODULES_ALL, MODULEINFO,
         },
         Threading::{
-            OpenProcess, OpenThread, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_VM_READ,
-            THREAD_QUERY_INFORMATION, THREAD_QUERY_LIMITED_INFORMATION,
+            GetCurrentProcess, OpenProcess, OpenThread, PROCESS_QUERY_LIMITED_INFORMATION,
+            PROCESS_VM_READ, THREAD_QUERY_INFORMATION, THREAD_QUERY_LIMITED_INFORMATION,
         },
     },
 };
@@ -444,21 +445,68 @@ const fn align_up(value: usize, alignment: usize) -> usize {
     (value + alignment - 1) & !(alignment - 1)
 }
 
-/// Growth loop shared by both NT queries. The buffer is backed by `u64`s so
-/// every structure offset the kernel writes is naturally aligned.
+/// Page-backed buffer for the large NT queries. Heap frees keep their pages
+/// in the process working set (the residue tripped the collector's own
+/// budget detector at 44 MB in the field); `VirtualFree(MEM_RELEASE)`
+/// returns them to the OS the moment the buffer drops. VirtualAlloc's
+/// page alignment also satisfies every structure the kernel writes.
+struct PageBuffer {
+    ptr: *mut c_void,
+    bytes: usize,
+}
+
+impl PageBuffer {
+    fn allocate(bytes: usize) -> Result<Self> {
+        let ptr = unsafe { VirtualAlloc(None, bytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) };
+        if ptr.is_null() {
+            bail!("VirtualAlloc failed for a {bytes}-byte forensics buffer");
+        }
+        Ok(Self { ptr, bytes })
+    }
+
+    fn as_mut_ptr(&mut self) -> *mut c_void {
+        self.ptr
+    }
+
+    fn as_ptr(&self) -> *const u8 {
+        self.ptr.cast()
+    }
+
+    const fn bytes(&self) -> usize {
+        self.bytes
+    }
+}
+
+impl Drop for PageBuffer {
+    fn drop(&mut self) {
+        let _ = unsafe { VirtualFree(self.ptr, 0, MEM_RELEASE) };
+    }
+}
+
+/// Trim the working set after a capture pass: even with page-backed
+/// buffers, soft page-ins accumulated while walking a ~16 MB table linger
+/// in the working set, and the collector budgets itself at 25 MB. Pages
+/// still in use fault back in cheaply.
+fn trim_working_set() {
+    unsafe {
+        let _ = K32EmptyWorkingSet(GetCurrentProcess());
+    }
+}
+
+/// Growth loop shared by both NT queries.
 fn query_growing(
     query: impl Fn(*mut c_void, u32, *mut u32) -> i32,
     initial_bytes: usize,
     cap_bytes: usize,
-) -> Result<(Vec<u64>, usize)> {
+) -> Result<(PageBuffer, usize)> {
     let mut size = initial_bytes;
     loop {
         if size > cap_bytes {
             bail!("forensics buffer exceeded the {} MB cap", cap_bytes >> 20);
         }
-        let mut buffer = vec![0_u64; size.div_ceil(8)];
+        let mut buffer = PageBuffer::allocate(align_up(size, 4096))?;
         let mut returned = 0_u32;
-        let status = query(buffer.as_mut_ptr().cast(), size as u32, &mut returned);
+        let status = query(buffer.as_mut_ptr(), size as u32, &mut returned);
         if status == STATUS_INFO_LENGTH_MISMATCH {
             size = size
                 .saturating_mul(2)
@@ -469,7 +517,7 @@ fn query_growing(
             bail!("NT query failed with status {status:#010x}");
         }
         let filled = if returned == 0 {
-            size
+            size.min(buffer.bytes())
         } else {
             (returned as usize).min(size)
         };
@@ -485,7 +533,7 @@ fn load_type_names() -> Result<(HashMap<u16, String>, &'static str)> {
         64 << 10,
         TYPE_TABLE_CAP_BYTES,
     )?;
-    let base = buffer.as_ptr().cast::<u8>();
+    let base = buffer.as_ptr();
     let count = unsafe { std::ptr::read_unaligned(base.cast::<u32>()) } as usize;
     let entry_size = size_of::<ObjectTypeInformation>();
     let mut offset = align_up(size_of::<u32>(), size_of::<usize>());
@@ -665,7 +713,7 @@ impl ForensicsSource for WindowsForensicsSource {
                 HANDLE_TABLE_CAP_BYTES,
             )?;
             self.last_table_bytes = filled;
-            let base = buffer.as_ptr().cast::<u8>();
+            let base = buffer.as_ptr();
             let declared = unsafe { std::ptr::read_unaligned(base.cast::<usize>()) };
             let header = 2 * size_of::<usize>();
             let entry_size = size_of::<SystemHandleEntry>();
@@ -681,6 +729,7 @@ impl ForensicsSource for WindowsForensicsSource {
                 }
             }
         }
+        trim_working_set();
         Ok(by_index
             .into_iter()
             .map(|(pid, histogram)| {
@@ -1135,6 +1184,30 @@ mod tests {
             module_row.value
         );
         assert_eq!(opened, closed, "handle discipline broke");
+
+        // Regression guard for the field-reported 44 MB breach: repeated
+        // captures must not park the handle-table pages in the working set.
+        // Ten passes with the cadence advanced past the interval each time,
+        // then the working set must sit well under the 25 MB budget even in
+        // this test process (which carries the test harness itself).
+        for round in 2..12_i64 {
+            engine.observe(&alerts, round * 10 * 60_000);
+        }
+        let mut counters = windows::Win32::System::ProcessStatus::PROCESS_MEMORY_COUNTERS::default();
+        unsafe {
+            windows::Win32::System::ProcessStatus::K32GetProcessMemoryInfo(
+                GetCurrentProcess(),
+                &mut counters,
+                size_of::<windows::Win32::System::ProcessStatus::PROCESS_MEMORY_COUNTERS>() as u32,
+            )
+            .expect("query own memory counters");
+        }
+        let working_set_mb = counters.WorkingSetSize as f64 / (1024.0 * 1024.0);
+        println!("working set after 10 capture rounds: {working_set_mb:.1} MB");
+        assert!(
+            working_set_mb < 25.0,
+            "working set stayed inflated after captures: {working_set_mb:.1} MB"
+        );
 
         done.store(true, std::sync::atomic::Ordering::Release);
         for thread in threads {
