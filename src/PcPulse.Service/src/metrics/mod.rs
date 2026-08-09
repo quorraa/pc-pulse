@@ -1,3 +1,4 @@
+pub mod forensics;
 mod hardware;
 mod pdh;
 mod win32;

@@ -24,6 +24,17 @@ Collector self-monitoring treats absolute budgets and growth as different condit
 
 A collector restart closes persisted open findings because monitoring continuity was interrupted. Conditions that remain present must satisfy their sustained streak again after restart.
 
+## Leak forensics
+
+While a handle-growth or thread-growth finding is active — for any process — the collector attaches two extra evidence captures to it:
+
+- **Handle types.** One pass over the system handle table (`NtQuerySystemInformation`, extended handle information) builds a per-type histogram for the flagged PID. Type indexes are resolved to names once via the object-type table. The finding's evidence shows the top three per-type deltas since the finding fired, e.g. `Handle types :: Event +1870 · Section +40 · File +12`. No per-handle query and no handle duplication is ever performed, so handles in blocking states cannot stall the collector.
+- **New-thread modules.** Thread IDs are snapshotted when the finding fires; on each capture, threads that appeared since then have their Win32 start address resolved and mapped to the owning module, e.g. `New-thread modules :: xul.dll x34 · nvwgf2umx.dll x3`. Threads whose process denies access are reported as `unattributed`.
+
+Both captures take a baseline when the finding first fires, then refresh at most once per minute while it stays active; a `Forensics window` row states the span the deltas cover. Evidence rows are replaced on each capture, never accumulated, and a finding resolving clears its baselines — with no leak finding active the forensics engine performs no syscalls at all. The multi-megabyte handle-table buffer is bucketed and freed within the capture (bailing with a degraded evidence note past a 64 MB cap), and every process, thread, and snapshot handle a capture opens is closed in the same pass so the collector's 250-handle budget holds.
+
+Privacy boundary: forensics records kernel object type names and module base file names only — never command lines, handle names, window text, or memory content.
+
 ## Attribution limits
 
 - Disk latency is a system PDH value. PC Pulse names the process with the greatest current read/write rate as the likely workload owner and phrases the explanation accordingly; it does not claim proof of storage-stack ownership.

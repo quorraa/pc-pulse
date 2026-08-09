@@ -4,7 +4,10 @@ use crate::{
     config::Settings,
     etw::EtwCollector,
     eventlog::EventLogCollector,
-    metrics::MetricCollector,
+    metrics::{
+        MetricCollector,
+        forensics::{ForensicsEngine, WindowsForensicsSource},
+    },
     models::{
         DiagnosticLogResponse, DiagnosticLogStatus, PipeRequest, PipeResponse, ProcessMetric,
         ProcessNode, Snapshot,
@@ -324,6 +327,9 @@ fn sampling_loop(state: &Arc<AppState>, stop: crossbeam_channel::Receiver<()>) -
     };
     let mut next_etw_retry = Instant::now() + Duration::from_secs(60);
     let mut collector = MetricCollector::new()?;
+    // Leak forensics is a strict no-op (zero syscalls) until a handle- or
+    // thread-growth finding is active; then it captures at most once a minute.
+    let mut forensics = ForensicsEngine::new(WindowsForensicsSource::default());
     let mut event_logs = EventLogCollector::default();
     let mut next_system_write = Instant::now();
     let mut next_process_write = Instant::now();
@@ -351,11 +357,14 @@ fn sampling_loop(state: &Arc<AppState>, stop: crossbeam_channel::Receiver<()>) -
             .map_or_else(crate::etw::EtwSnapshot::default, EtwCollector::snapshot);
         let (system, processes, hardware) =
             collector.collect(timestamp_ms, &settings, &etw_snapshot)?;
-        let evaluation = state
+        let mut evaluation = state
             .alerts
             .lock()
             .map_err(|_| anyhow!("alert lock poisoned"))?
             .evaluate(&system, &processes, &settings);
+        forensics.observe(&evaluation.active, timestamp_ms);
+        forensics.decorate(&mut evaluation.active);
+        forensics.decorate(&mut evaluation.changed);
         state.storage.upsert_alerts(&evaluation.changed)?;
         {
             let mut snapshot = state
