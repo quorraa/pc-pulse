@@ -10,4 +10,5 @@ pub mod notifier;
 pub mod prefs;
 pub mod theme;
 pub mod treemap;
+pub mod tween;
 pub mod ui;

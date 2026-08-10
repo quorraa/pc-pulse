@@ -1252,16 +1252,11 @@ fn render_header(frame: &mut Frame<'_>, app: &App, area: Rect) {
     );
 
     let telemetry = if let Some(snapshot) = &app.snapshot {
-        let memory = percent(
-            snapshot.system.memory_used_bytes,
-            snapshot.system.memory_total_bytes,
-        );
+        let shown = app.display_system(&snapshot.system);
+        let memory = percent(shown.memory_used_bytes, shown.memory_total_bytes);
         format!(
             "CPU {:>5.1}%  MEM {:>5.1}%  {:>4}P / {:>5}T",
-            snapshot.system.cpu_percent,
-            memory,
-            snapshot.system.process_count,
-            snapshot.system.thread_count
+            shown.cpu_percent, memory, shown.process_count, shown.thread_count
         )
     } else {
         "awaiting first telemetry frame".into()
@@ -1472,7 +1467,11 @@ fn render_masthead(frame: &mut Frame<'_>, app: &App, area: Rect) {
             .as_ref()
             .is_some_and(|snapshot| snapshot.system.etw_active);
         (
-            if etw { "LINKED / ETW" } else { "LINKED / ETW DEGRADED" },
+            if etw {
+                "LINKED / ETW"
+            } else {
+                "LINKED / ETW DEGRADED"
+            },
             if etw { palette().ok } else { palette().warn },
         )
     } else {
@@ -1480,16 +1479,14 @@ fn render_masthead(frame: &mut Frame<'_>, app: &App, area: Rect) {
     };
     let mut dateline = vec![Span::styled(link, Style::default().fg(link_color).bold())];
     if let Some(snapshot) = &app.snapshot {
-        let memory = percent(
-            snapshot.system.memory_used_bytes,
-            snapshot.system.memory_total_bytes,
-        );
+        let shown = app.display_system(&snapshot.system);
+        let memory = percent(shown.memory_used_bytes, shown.memory_total_bytes);
         dateline.push(Span::styled(
             format!(
                 " · CPU {:.1}% · MEM {memory:.1}% · {}P/{}T · v{}",
-                snapshot.system.cpu_percent,
-                snapshot.system.process_count,
-                snapshot.system.thread_count,
+                shown.cpu_percent,
+                shown.process_count,
+                shown.thread_count,
                 snapshot.service_version
             ),
             Style::default().fg(palette().muted),
@@ -1704,9 +1701,13 @@ fn render_overview_broadsheet(frame: &mut Frame<'_>, app: &App, area: Rect) {
         return;
     };
     let canvas = area.inner(Margin::new(1, 0));
-    let headline_height = if canvas.width >= HEADLINE_MIN_WIDTH { 5 } else { 2 };
-    let vertical = Layout::vertical([Constraint::Length(headline_height), Constraint::Min(8)])
-        .split(canvas);
+    let headline_height = if canvas.width >= HEADLINE_MIN_WIDTH {
+        5
+    } else {
+        2
+    };
+    let vertical =
+        Layout::vertical([Constraint::Length(headline_height), Constraint::Min(8)]).split(canvas);
     render_headline_figures(frame, app, vertical[0]);
     let columns = Layout::horizontal([
         Constraint::Percentage(56),
@@ -1737,15 +1738,15 @@ fn render_headline_figures(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let Some(snapshot) = &app.snapshot else {
         return;
     };
-    let memory = percent(
-        snapshot.system.memory_used_bytes,
-        snapshot.system.memory_total_bytes,
-    );
+    // The printed figures ease with smooth refresh; the trend arrows keep
+    // comparing raw samples so a mid-tween frame can never flip a direction.
+    let shown = app.display_system(&snapshot.system);
+    let memory = percent(shown.memory_used_bytes, shown.memory_total_bytes);
     let previous = app.live_history.iter().rev().nth(1);
     let figures: [(&str, String, &'static str, Color); 3] = [
         (
             "CPU LOAD %",
-            format!("{:.0}", snapshot.system.cpu_percent),
+            format!("{:.0}", shown.cpu_percent),
             headline_trend(
                 previous.map(|point| point.cpu_percent),
                 snapshot.system.cpu_percent,
@@ -1758,14 +1759,17 @@ fn render_headline_figures(frame: &mut Frame<'_>, app: &App, area: Rect) {
             format!("{memory:.0}"),
             headline_trend(
                 previous.map(|point| percent(point.memory_used_bytes, point.memory_total_bytes)),
-                memory,
+                percent(
+                    snapshot.system.memory_used_bytes,
+                    snapshot.system.memory_total_bytes,
+                ),
                 0.5,
             ),
             palette().alt,
         ),
         (
             "DISK MS",
-            format!("{:.1}", snapshot.system.disk_latency_ms),
+            format!("{:.1}", shown.disk_latency_ms),
             headline_trend(
                 previous.map(|point| point.disk_latency_ms),
                 snapshot.system.disk_latency_ms,
@@ -1893,7 +1897,10 @@ fn render_circulation(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let Some(snapshot) = &app.snapshot else {
         return;
     };
-    let busy = snapshot.system.cpu_percent.clamp(0.0, 100.0);
+    let busy = app
+        .display_system(&snapshot.system)
+        .cpu_percent
+        .clamp(0.0, 100.0);
     let block = field_block(" CIRCULATION — share of busy cpu ", palette().info);
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -1915,7 +1922,12 @@ fn render_circulation(frame: &mut Frame<'_>, app: &App, area: Rect) {
             .iter()
             .take(4)
             .enumerate()
-            .map(|(index, process)| (process.cpu_percent.max(0.0), cycle[index % cycle.len()]))
+            .map(|(index, process)| {
+                (
+                    app.display_process_cpu(process).max(0.0),
+                    cycle[index % cycle.len()],
+                )
+            })
             .collect::<Vec<_>>();
         let named = segments.iter().map(|(value, _)| *value).sum::<f64>();
         segments.push(((busy - named).max(0.0), palette().muted));
@@ -1932,10 +1944,7 @@ fn render_circulation(frame: &mut Frame<'_>, app: &App, area: Rect) {
                 continue;
             }
             let cells = (((value / total) * width as f64).round() as usize).clamp(1, width - used);
-            spans.push(Span::styled(
-                "█".repeat(cells),
-                Style::default().fg(*color),
-            ));
+            spans.push(Span::styled("█".repeat(cells), Style::default().fg(*color)));
             used += cells;
         }
         lines.push(Line::from(spans));
@@ -2089,16 +2098,14 @@ fn render_annunciator(frame: &mut Frame<'_>, app: &App, area: Rect) {
         })
         .collect::<Vec<_>>();
     let telemetry = if let Some(snapshot) = &app.snapshot {
-        let memory = percent(
-            snapshot.system.memory_used_bytes,
-            snapshot.system.memory_total_bytes,
-        );
+        let shown = app.display_system(&snapshot.system);
+        let memory = percent(shown.memory_used_bytes, shown.memory_total_bytes);
         format!(
             " CPU {:>5.1}%  MEM {:>5.1}%  {:>4}P / {:>5}T  v{}",
-            snapshot.system.cpu_percent,
+            shown.cpu_percent,
             memory,
-            snapshot.system.process_count,
-            snapshot.system.thread_count,
+            shown.process_count,
+            shown.thread_count,
             snapshot.service_version
         )
     } else {
@@ -2233,10 +2240,12 @@ fn pressure_map_items(app: &App) -> (Vec<crate::treemap::TreemapItem>, Vec<u32>)
     let mut items = Vec::with_capacity(processes.len());
     let mut pids = Vec::with_capacity(processes.len());
     for process in processes {
-        let cpu = process.cpu_percent / app.settings.cpu_percent.max(1.0);
+        // Tile heat eases with smooth refresh; tile *area* (weight) stays on
+        // the raw snapshot value so the layout never retiles mid-tween.
+        let cpu = app.display_process_cpu(process) / app.settings.cpu_percent.max(1.0);
         let memory_target = (snapshot.system.memory_total_bytes as f64 * 0.08).max(1.0);
-        let memory = process.working_set_bytes as f64 / memory_target;
-        let io = (process.read_bytes_per_sec + process.write_bytes_per_sec)
+        let memory = app.display_process_working_set(process) / memory_target;
+        let io = app.display_process_io(process)
             / (app.settings.io_mb_per_sec.max(1.0) * 1024.0 * 1024.0);
         let hottest = cpu.max(memory).max(io);
         let alerted = snapshot
@@ -2361,13 +2370,14 @@ fn render_pressure_field(frame: &mut Frame<'_>, app: &App, area: Rect) {
             )
         })
         .collect::<Vec<_>>();
-    let memory_now = percent(
-        snapshot.system.memory_used_bytes,
-        snapshot.system.memory_total_bytes,
-    );
+    // The chart itself stays per-snapshot (a tweened newest point would
+    // re-shade the whole field every frame); only the headline readouts
+    // ease with the rest of the numeric surfaces.
+    let shown = app.display_system(&snapshot.system);
+    let memory_now = percent(shown.memory_used_bytes, shown.memory_total_bytes);
     let title = format!(
         " ∿ PRESSURE FIELD  CPU {:>5.1}%  /  MEM {:>5.1}% ",
-        snapshot.system.cpu_percent, memory_now
+        shown.cpu_percent, memory_now
     );
     // Half-block cells paint a dense field; braille reads as scattered dots
     // for slowly-varying series at live-pane sizes.
@@ -2433,7 +2443,7 @@ fn render_suspect_matrix(frame: &mut Frame<'_>, app: &App, area: Rect) {
         .take(capacity)
         .enumerate()
         .map(|(index, process)| {
-            let heat = triage_heat(process, app);
+            let heat = displayed_triage_heat(process, app);
             let owner_style = if !process.responsive {
                 Style::default().fg(palette().crit).bold()
             } else if process.is_agent_candidate {
@@ -2466,7 +2476,7 @@ fn render_suspect_matrix(frame: &mut Frame<'_>, app: &App, area: Rect) {
                         Style::default().fg(heat_color(heat)),
                     ),
                 ])),
-                Cell::from(format!("{:>5.1}%", process.cpu_percent)),
+                Cell::from(format!("{:>5.1}%", app.display_process_cpu(process))),
                 Cell::from(format::bytes(process.working_set_bytes)),
                 Cell::from(format::rate(
                     process.read_bytes_per_sec + process.write_bytes_per_sec,
@@ -2533,7 +2543,10 @@ fn render_system_vector(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let Some(snapshot) = &app.snapshot else {
         return;
     };
-    let system = &snapshot.system;
+    // Smooth refresh eases the meter channels between samples; with the
+    // default event-driven setting this is the snapshot verbatim.
+    let system = app.display_system(&snapshot.system);
+    let system = &system;
     let memory = percent(system.memory_used_bytes, system.memory_total_bytes);
     let io = system.disk_read_bytes_per_sec + system.disk_write_bytes_per_sec;
     let meter_width = usize::from(area.width.saturating_sub(25).clamp(5, 14));
@@ -2562,8 +2575,7 @@ fn render_system_vector(frame: &mut Frame<'_>, app: &App, area: Rect) {
         // threshold-relative grammar as the I/O row above it.
         vector_line(
             "NET",
-            system.network_bytes_per_sec
-                / (app.settings.io_mb_per_sec.max(1.0) * 1024.0 * 1024.0),
+            system.network_bytes_per_sec / (app.settings.io_mb_per_sec.max(1.0) * 1024.0 * 1024.0),
             format::rate(system.network_bytes_per_sec),
             meter_width,
         ),
@@ -2666,7 +2678,10 @@ fn render_load_composition(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let Some(snapshot) = &app.snapshot else {
         return;
     };
-    let busy = snapshot.system.cpu_percent.clamp(0.0, 100.0);
+    let busy = app
+        .display_system(&snapshot.system)
+        .cpu_percent
+        .clamp(0.0, 100.0);
     let block = field_block(" ◔ LOAD COMPOSITION  share of busy cpu ", palette().ok);
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -2707,7 +2722,7 @@ fn render_load_composition(frame: &mut Frame<'_>, app: &App, area: Rect) {
             };
             (
                 format::truncate(&process.name, 9),
-                process.cpu_percent.max(0.0),
+                app.display_process_cpu(process).max(0.0),
                 color,
             )
         })
@@ -3022,14 +3037,42 @@ fn heat_color(heat: f64) -> Color {
 }
 
 fn triage_heat(process: &ProcessMetric, app: &App) -> f64 {
+    triage_heat_from(
+        process.cpu_percent,
+        process.read_bytes_per_sec + process.write_bytes_per_sec,
+        process.working_set_bytes as f64,
+        process,
+        app,
+    )
+}
+
+/// The heat the row *displays* this frame: the same formula as
+/// [`triage_heat`] over the smooth-refresh tweened inputs. Sorting always
+/// uses [`triage_heat`] so rows never reorder mid-tween.
+fn displayed_triage_heat(process: &ProcessMetric, app: &App) -> f64 {
+    triage_heat_from(
+        app.display_process_cpu(process),
+        app.display_process_io(process),
+        app.display_process_working_set(process),
+        process,
+        app,
+    )
+}
+
+fn triage_heat_from(
+    cpu_percent: f64,
+    io_rate: f64,
+    working_set: f64,
+    process: &ProcessMetric,
+    app: &App,
+) -> f64 {
     let Some(snapshot) = &app.snapshot else {
         return 0.0;
     };
-    let cpu = process.cpu_percent / app.settings.cpu_percent.max(1.0);
-    let io = (process.read_bytes_per_sec + process.write_bytes_per_sec)
-        / (app.settings.io_mb_per_sec.max(1.0) * 1024.0 * 1024.0);
+    let cpu = cpu_percent / app.settings.cpu_percent.max(1.0);
+    let io = io_rate / (app.settings.io_mb_per_sec.max(1.0) * 1024.0 * 1024.0);
     let memory_target = (snapshot.system.memory_total_bytes as f64 * 0.08).max(1.0);
-    let memory = process.working_set_bytes as f64 / memory_target;
+    let memory = working_set / memory_target;
     let handles = f64::from(process.handle_count) / 1_500.0;
     let threads = f64::from(process.thread_count) / 150.0;
     let weighted = cpu.clamp(0.0, 2.0) * 0.40
@@ -4739,7 +4782,7 @@ fn render_hardware(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let rows =
         Layout::vertical([Constraint::Percentage(58), Constraint::Percentage(42)]).split(area);
     render_thermal_panel(frame, app, hardware, inset(rows[0]));
-    render_clock_panel(frame, hardware, inset(rows[1]));
+    render_clock_panel(frame, app, hardware, inset(rows[1]));
 }
 
 /// The honest empty state: no source produced data, so the page says why
@@ -4798,14 +4841,17 @@ fn render_thermal_panel(frame: &mut Frame<'_>, app: &App, hardware: &HardwareMet
     }
     let capacity = usize::from(area.height.saturating_sub(3)).max(1);
     for (name, temperature) in sources.iter().take(capacity) {
-        let color = temperature_color(*temperature);
+        // The displayed reading eases between hardware samples; the raw
+        // snapshot value stays the tween target.
+        let temperature = app.display_gauge(&crate::tween::temp_key(name), *temperature);
+        let color = temperature_color(temperature);
         let mut spans = vec![
             Span::styled(
                 format!(" {:<19}", format::truncate(name, 18)),
                 Style::default().fg(palette().text).bold(),
             ),
             Span::styled(
-                meter(temperature_ratio(*temperature), meter_width),
+                meter(temperature_ratio(temperature), meter_width),
                 Style::default().fg(color),
             ),
             Span::styled(
@@ -4819,8 +4865,14 @@ fn render_thermal_panel(frame: &mut Frame<'_>, app: &App, hardware: &HardwareMet
                 .iter()
                 .find(|trace| trace.label == *name)
         {
+            // The sparkline's newest cell follows the eased reading so the
+            // tail never leads the meter; history cells stay verbatim.
+            let mut points = trace.points.clone();
+            if let Some(last) = points.back_mut() {
+                *last = temperature;
+            }
             spans.push(Span::styled(
-                format!("  {}", temperature_spark(&trace.points, spark_width - 2)),
+                format!("  {}", temperature_spark(&points, spark_width - 2)),
                 Style::default().fg(color),
             ));
         }
@@ -4851,13 +4903,16 @@ fn render_thermal_panel(frame: &mut Frame<'_>, app: &App, hardware: &HardwareMet
 const LIVE_SPARK_MAX: u16 = 60;
 
 /// CPU effective MHz plus per-GPU core/memory clocks and utilization.
-fn render_clock_panel(frame: &mut Frame<'_>, hardware: &HardwareMetrics, area: Rect) {
+fn render_clock_panel(frame: &mut Frame<'_>, app: &App, hardware: &HardwareMetrics, area: Rect) {
     let mut lines = Vec::new();
     match hardware.cpu_frequency_mhz {
         Some(frequency) => lines.push(Line::from(vec![
             Span::styled(" CPU  ", Style::default().fg(palette().muted).bold()),
             Span::styled(
-                format!("{frequency:>6.0} MHz"),
+                format!(
+                    "{:>6.0} MHz",
+                    app.display_gauge(crate::tween::CPU_CLOCK_KEY, frequency)
+                ),
                 Style::default().fg(palette().ok).bold(),
             ),
             Span::styled(
@@ -4880,23 +4935,27 @@ fn render_clock_panel(frame: &mut Frame<'_>, hardware: &HardwareMetrics, area: R
             format!(" {}", format::truncate(&gpu.name, content.max(2) - 1)),
             Style::default().fg(palette().alt).bold(),
         ));
-        let clock = |value: Option<f64>| match value {
-            Some(mhz) => format!("{mhz:>6.0} MHz"),
+        let clock = |key: String, value: Option<f64>| match value {
+            Some(mhz) => format!("{:>6.0} MHz", app.display_gauge(&key, mhz)),
             None => "     —    ".into(),
         };
         lines.push(Line::from(vec![
             Span::styled("   CORE ", Style::default().fg(palette().muted)),
             Span::styled(
-                clock(gpu.core_clock_mhz),
+                clock(crate::tween::core_clock_key(&gpu.name), gpu.core_clock_mhz),
                 Style::default().fg(palette().info).bold(),
             ),
             Span::styled("   MEM ", Style::default().fg(palette().muted)),
             Span::styled(
-                clock(gpu.memory_clock_mhz),
+                clock(
+                    crate::tween::memory_clock_key(&gpu.name),
+                    gpu.memory_clock_mhz,
+                ),
                 Style::default().fg(palette().info).bold(),
             ),
         ]));
         if let Some(utilization) = gpu.utilization_percent {
+            let utilization = app.display_gauge(&crate::tween::util_key(&gpu.name), utilization);
             let ratio = (utilization / 100.0).clamp(0.0, 1.0);
             lines.push(Line::from(vec![
                 Span::styled("   UTIL ", Style::default().fg(palette().muted)),
@@ -5121,7 +5180,7 @@ const HELP_GLOBAL: [(&str, &str); 11] = [
     ("q / Ctrl-C", "quit"),
     ("?", "keys overlay on any page"),
 ];
-const HELP_CONTEXTUAL: [(&str, &str); 19] = [
+const HELP_CONTEXTUAL: [(&str, &str); 20] = [
     ("/", "filter name / path / PID"),
     ("o", "cycle process sort"),
     ("g", "agent-only process focus"),
@@ -5142,6 +5201,10 @@ const HELP_CONTEXTUAL: [(&str, &str); 19] = [
     ("table header click", "sort by clicked column"),
     ("process right-click", "typed-PID confirmation"),
     ("Enter / e", "edit selected setting"),
+    (
+        "Enter on Refresh rate",
+        "cycle off / 30 / 60 fps smooth refresh",
+    ),
     ("s", "save settings"),
     ("Esc", "cancel input / modal"),
 ];
@@ -5709,7 +5772,10 @@ mod tests {
         let text = buffer_text(backend.buffer());
         // The NET row sits with the other meters and renders its rate in the
         // same format grammar as the I/O row.
-        assert!(text.contains(" NET"), "NET row missing from the System Vector");
+        assert!(
+            text.contains(" NET"),
+            "NET row missing from the System Vector"
+        );
         assert!(text.contains("2.50 MB/s"), "network rate missing: {text}");
         // Old services report no network counter; the row stays honest at
         // zero instead of disappearing.
@@ -6130,9 +6196,9 @@ mod tests {
                 area,
             )
         };
-        // Click the CLIENT timeout row (index 2) to start a typed edit.
+        // Click the CLIENT timeout row (index 3) to start a typed edit.
         // Rows begin at table.y + 1 + header_height(2).
-        click(&mut app, table.x + 2, table.y + 3 + 2);
+        click(&mut app, table.x + 2, table.y + 3 + 3);
         assert!(matches!(
             app.mode,
             InputMode::EditSetting {
@@ -6141,7 +6207,7 @@ mod tests {
             }
         ));
         // Clicking the row being edited keeps the edit.
-        click(&mut app, table.x + 4, table.y + 3 + 2);
+        click(&mut app, table.x + 4, table.y + 3 + 3);
         assert!(matches!(
             app.mode,
             InputMode::EditSetting {
@@ -6909,7 +6975,8 @@ mod tests {
             // quadrant (field_block), double (modal — not open here). Chart
             // axes may legitimately draw a plain └, so plain corners are
             // exempt.
-            for corner in ['╭', '╮', '╰', '╯', '▛', '▜', '▙', '▟', '╔', '╗', '╚', '╝'] {
+            for corner in ['╭', '╮', '╰', '╯', '▛', '▜', '▙', '▟', '╔', '╗', '╚', '╝']
+            {
                 assert!(!text.contains(corner), "{page:?} draws box corner {corner}");
             }
         }
@@ -7570,6 +7637,280 @@ mod tests {
         let backend = render(&mut app);
         let text = buffer_text(backend.buffer());
         assert!(text.contains("[9] GAUGE"), "rail bezel key for the page");
+    }
+
+    // ---- Smooth refresh (tween layer) ----------------------------------
+
+    #[test]
+    fn smooth_off_renders_targets_exactly_even_with_a_captured_previous_sample() {
+        let _guard = theme::test_support::activate(theme::ThemeId::Vitals);
+        for page in [Page::Overview, Page::Hardware] {
+            let mut plain = gallery_app();
+            plain.page = page;
+            let baseline = render(&mut plain);
+            // A wildly different previous sample sitting mid-tween — but the
+            // refresh preference is 0 (event-driven), so every display
+            // accessor must pass the snapshot through bit-identically.
+            let mut smoothed = gallery_app();
+            smoothed.page = page;
+            let mut previous = smoothed.snapshot.clone().expect("snapshot");
+            previous.system.cpu_percent = 99.0;
+            previous.system.disk_latency_ms = 900.0;
+            for process in &mut previous.processes {
+                process.cpu_percent = 77.0;
+            }
+            let arrived = std::time::Instant::now();
+            smoothed
+                .smooth
+                .begin(crate::tween::sample_from_snapshot(&previous), arrived);
+            smoothed.set_render_now(arrived + std::time::Duration::from_millis(100));
+            let with_state = render(&mut smoothed);
+            assert_eq!(baseline.buffer(), with_state.buffer(), "{page:?}");
+        }
+    }
+
+    #[test]
+    fn an_in_flight_tween_shows_intermediate_meter_values_at_a_fixed_instant() {
+        let _guard = theme::test_support::activate(theme::ThemeId::Vitals);
+        let mut app = gallery_app();
+        app.client_prefs.refresh_fps = 60;
+        if let Some(snapshot) = app.snapshot.as_mut() {
+            snapshot.system.cpu_percent = 40.0;
+        }
+        let mut previous = app.snapshot.clone().expect("snapshot");
+        previous.system.cpu_percent = 0.0;
+        let arrived = std::time::Instant::now();
+        app.smooth
+            .begin(crate::tween::sample_from_snapshot(&previous), arrived);
+        // Halfway through the 400 ms window cubic-out sits at exactly 0.875,
+        // so the CPU meter shows 0 + 40 × 0.875 = 35.0%.
+        app.set_render_now(arrived + crate::tween::TWEEN / 2);
+        let text = buffer_text(render(&mut app).buffer());
+        assert!(text.contains("35.0%"), "intermediate CPU reading renders");
+        assert!(!text.contains("40.0%"), "the target is not shown yet");
+        // Once the window elapses the target renders exactly.
+        app.set_render_now(arrived + crate::tween::TWEEN);
+        let text = buffer_text(render(&mut app).buffer());
+        assert!(text.contains("40.0%"), "settled frame shows the target");
+        assert!(!text.contains("35.0%"));
+    }
+
+    #[test]
+    fn gauges_tween_eases_the_thermal_reading_toward_the_sample() {
+        let _guard = theme::test_support::activate(theme::ThemeId::Vitals);
+        let mut app = gallery_app();
+        app.page = Page::Hardware;
+        app.client_prefs.refresh_fps = 30;
+        let mut previous = app.snapshot.clone().expect("snapshot");
+        previous.hardware.thermal_zones[0].temperature_c = 44.9;
+        let arrived = std::time::Instant::now();
+        app.smooth
+            .begin(crate::tween::sample_from_snapshot(&previous), arrived);
+        // t = 0.875 mid-window: 44.9 + (48.9 − 44.9) × 0.875 = 48.4 °C.
+        app.set_render_now(arrived + crate::tween::TWEEN / 2);
+        let text = buffer_text(render(&mut app).buffer());
+        assert!(text.contains("48.4°C"), "TZ00 shows the eased reading");
+        assert!(!text.contains("48.9°C"), "TZ00 target not shown mid-tween");
+        // Sources whose previous equals the target render it verbatim.
+        assert!(text.contains("62.3°C"));
+        assert!(text.contains("62.0°C"));
+    }
+
+    // ---- Frame-cost bench ----------------------------------------------
+    //
+    // `dev_bench_frame_costs` prices one full base draw (widget build +
+    // ratatui double-buffer diff on a TestBackend) per profile × page ×
+    // size, plus the TachyonFX motion pass and a crossterm-encoding
+    // estimate, so smooth-refresh decisions rest on measured numbers.
+
+    /// Per-frame timing summary over a sorted sample set, in microseconds.
+    fn frame_stats(mut samples: Vec<u128>) -> (f64, u128, u128) {
+        samples.sort_unstable();
+        let mean = samples.iter().sum::<u128>() as f64 / samples.len().max(1) as f64;
+        let p95 = samples[(samples.len().saturating_mul(95) / 100).min(samples.len() - 1)];
+        let max = *samples.last().expect("samples");
+        (mean, p95, max)
+    }
+
+    /// Nudge the live numeric surfaces a little every frame so the ratatui
+    /// buffer diff sees the realistic smooth-mode workload (changing meters)
+    /// instead of a fully static screen.
+    fn wobble(app: &mut App, step: usize) {
+        if let Some(snapshot) = app.snapshot.as_mut() {
+            snapshot.system.cpu_percent = 44.0 + (step % 8) as f64 * 0.4;
+            snapshot.system.memory_used_bytes =
+                32 * 1024 * 1024 * 1024 + (step as u64 % 8) * 64 * 1024 * 1024;
+            snapshot.system.disk_latency_ms = 1.6 + (step % 5) as f64 * 0.1;
+        }
+    }
+
+    /// Pin the app in a permanent mid-tween state (60 fps, t = 0.875) so
+    /// every display accessor does real interpolation work each frame.
+    fn arm_mid_tween(app: &mut App) {
+        app.client_prefs.refresh_fps = 60;
+        let mut previous = app.snapshot.clone().expect("snapshot");
+        previous.system.cpu_percent = 5.0;
+        for process in &mut previous.processes {
+            process.cpu_percent = (process.cpu_percent - 1.0).max(0.0);
+        }
+        let arrived = std::time::Instant::now();
+        app.smooth
+            .begin(crate::tween::sample_from_snapshot(&previous), arrived);
+        app.set_render_now(arrived + crate::tween::TWEEN / 2);
+    }
+
+    #[test]
+    #[ignore = "dev harness: prints a per-frame render-cost table; run with --ignored --nocapture"]
+    fn dev_bench_frame_costs() {
+        const FRAMES: usize = 500;
+        let sizes: [(u16, u16); 2] = [(120, 36), (170, 48)];
+        for smooth in [false, true] {
+            println!();
+            println!(
+                "== {} ==",
+                if smooth {
+                    "smooth (mid-tween, 60 fps display path)"
+                } else {
+                    "event-driven (tween inactive)"
+                }
+            );
+            println!(
+                "{:<9} {:<10} {:<8} {:>9} {:>8} {:>8}",
+                "profile", "page", "size", "mean_us", "p95_us", "max_us"
+            );
+            for theme_id in [
+                theme::ThemeId::Vitals,
+                theme::ThemeId::Avionics,
+                theme::ThemeId::Ledger,
+            ] {
+                let _guard = theme::test_support::activate(theme_id);
+                for (width, height) in sizes {
+                    for page in Page::ALL {
+                        let mut app = gallery_app();
+                        app.page = page;
+                        if smooth {
+                            arm_mid_tween(&mut app);
+                        }
+                        let mut terminal =
+                            Terminal::new(TestBackend::new(width, height)).expect("bench terminal");
+                        let mut samples = Vec::with_capacity(FRAMES);
+                        for step in 0..FRAMES {
+                            wobble(&mut app, step);
+                            let started = std::time::Instant::now();
+                            terminal
+                                .draw(|frame| draw(frame, &mut app))
+                                .expect("bench draw");
+                            samples.push(started.elapsed().as_micros());
+                        }
+                        let (mean, p95, max) = frame_stats(samples);
+                        println!(
+                            "{:<9} {:<10} {:<8} {:>9.1} {:>8} {:>8}",
+                            theme_id.name(),
+                            format!("{page:?}"),
+                            format!("{width}x{height}"),
+                            mean,
+                            p95,
+                            max
+                        );
+                    }
+                }
+            }
+        }
+        println!();
+        println!("== effect pass and crossterm-encoding estimates ==");
+        for theme_id in [
+            theme::ThemeId::Vitals,
+            theme::ThemeId::Avionics,
+            theme::ThemeId::Ledger,
+        ] {
+            let _guard = theme::test_support::activate(theme_id);
+            for (width, height) in sizes {
+                // Motion pass: the base Overview draw plus MotionSystem::render
+                // driven at 16 ms with a finite Page cue kept alive, so the
+                // table prices the effect pass the smooth loop composes over.
+                let mut app = gallery_app();
+                app.page = Page::Overview;
+                let mut motion = crate::effects::MotionSystem::new(&app, true);
+                let mut terminal =
+                    Terminal::new(TestBackend::new(width, height)).expect("bench terminal");
+                let mut samples = Vec::with_capacity(FRAMES);
+                for step in 0..FRAMES {
+                    wobble(&mut app, step);
+                    if !motion.is_animating() {
+                        // Re-arm a representative finite cue (page switch).
+                        app.page = if app.page == Page::Overview {
+                            Page::Processes
+                        } else {
+                            Page::Overview
+                        };
+                        motion.observe(&app);
+                    }
+                    let started = std::time::Instant::now();
+                    terminal
+                        .draw(|frame| {
+                            draw(frame, &mut app);
+                            motion.render(frame, std::time::Duration::from_millis(16));
+                        })
+                        .expect("bench draw");
+                    samples.push(started.elapsed().as_micros());
+                    let _ = motion.take_cleanup_frame();
+                }
+                let (mean, p95, max) = frame_stats(samples);
+                println!(
+                    "{:<9} {:<10} {:<8} {:>9.1} {:>8} {:>8}",
+                    theme_id.name(),
+                    "Ovw+fx",
+                    format!("{width}x{height}"),
+                    mean,
+                    p95,
+                    max
+                );
+            }
+        }
+        // Crossterm-encoding estimate: the same draw against a
+        // CrosstermBackend writing into a sink — prices the ANSI diff
+        // encoding a real terminal adds over TestBackend, but not the
+        // console's own write/refresh cost, which cannot be measured
+        // headlessly.
+        for theme_id in [theme::ThemeId::Vitals, theme::ThemeId::Ledger] {
+            let _guard = theme::test_support::activate(theme_id);
+            for (width, height) in sizes {
+                for smooth in [false, true] {
+                    let mut app = gallery_app();
+                    app.page = Page::Overview;
+                    if smooth {
+                        arm_mid_tween(&mut app);
+                    }
+                    let backend = ratatui::backend::CrosstermBackend::new(std::io::sink());
+                    let mut terminal = Terminal::with_options(
+                        backend,
+                        ratatui::TerminalOptions {
+                            viewport: ratatui::Viewport::Fixed(Rect::new(0, 0, width, height)),
+                        },
+                    )
+                    .expect("crossterm sink terminal");
+                    let mut samples = Vec::with_capacity(FRAMES);
+                    for step in 0..FRAMES {
+                        wobble(&mut app, step);
+                        let started = std::time::Instant::now();
+                        terminal
+                            .draw(|frame| draw(frame, &mut app))
+                            .expect("bench draw");
+                        samples.push(started.elapsed().as_micros());
+                    }
+                    let (mean, p95, max) = frame_stats(samples);
+                    println!(
+                        "{:<9} {:<10} {:<8} {:>9.1} {:>8} {:>8}",
+                        theme_id.name(),
+                        if smooth { "Ovw+ansiS" } else { "Ovw+ansi" },
+                        format!("{width}x{height}"),
+                        mean,
+                        p95,
+                        max
+                    );
+                }
+            }
+        }
     }
 
     #[test]

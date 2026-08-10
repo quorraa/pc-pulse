@@ -209,6 +209,7 @@ pub enum InputMode {
 pub enum SettingField {
     ClientTheme,
     ClientEffects,
+    ClientRefresh,
     ClientTimeout,
     SampleInterval,
     Retention,
@@ -233,7 +234,12 @@ pub enum SettingField {
 impl SettingField {
     /// Local terminal preferences: stored per user in `ui-prefs.json` and
     /// never sent to (or validated by) the collector service.
-    pub const CLIENT: [Self; 3] = [Self::ClientTheme, Self::ClientEffects, Self::ClientTimeout];
+    pub const CLIENT: [Self; 4] = [
+        Self::ClientTheme,
+        Self::ClientEffects,
+        Self::ClientRefresh,
+        Self::ClientTimeout,
+    ];
 
     /// Service-validated detector settings, saved through the pipe with `s`.
     pub const SERVICE: [Self; 18] = [
@@ -257,9 +263,10 @@ impl SettingField {
         Self::AgentPatterns,
     ];
 
-    pub const ALL: [Self; 21] = [
+    pub const ALL: [Self; 22] = [
         Self::ClientTheme,
         Self::ClientEffects,
+        Self::ClientRefresh,
         Self::ClientTimeout,
         Self::SampleInterval,
         Self::Retention,
@@ -284,7 +291,7 @@ impl SettingField {
     pub const fn is_client(self) -> bool {
         matches!(
             self,
-            Self::ClientTheme | Self::ClientEffects | Self::ClientTimeout
+            Self::ClientTheme | Self::ClientEffects | Self::ClientRefresh | Self::ClientTimeout
         )
     }
 
@@ -292,6 +299,7 @@ impl SettingField {
         match self {
             Self::ClientTheme => "Theme profile",
             Self::ClientEffects => "Motion effects",
+            Self::ClientRefresh => "Refresh rate",
             Self::ClientTimeout => "Oracle time budget",
             Self::SampleInterval => "Sample interval",
             Self::Retention => "History retention",
@@ -316,7 +324,7 @@ impl SettingField {
 
     pub const fn unit(self) -> &'static str {
         match self {
-            Self::ClientTheme | Self::ClientEffects => "local",
+            Self::ClientTheme | Self::ClientEffects | Self::ClientRefresh => "local",
             Self::ClientTimeout => "seconds",
             Self::SampleInterval | Self::SlowLaunch => "ms",
             Self::Retention => "days",
@@ -344,6 +352,11 @@ impl SettingField {
             Self::ClientEffects => {
                 "Whether brief motion effects play on page changes and new findings. Enter \
                  toggles; off is the reduced-motion mode."
+            }
+            Self::ClientRefresh => {
+                "How often this terminal redraws. Off draws only when something changes \
+                 (the default); 30 or 60 fps redraws continuously and smoothly animates \
+                 meters between telemetry samples. Enter cycles and remembers your choice."
             }
             Self::ClientTimeout => {
                 "How many seconds one Oracle analysis may run before it is cancelled. Saved \
@@ -428,7 +441,9 @@ impl SettingField {
         match self {
             // Client preferences live outside the service `Settings`; the
             // TUNE page reads them through `App::setting_value`.
-            Self::ClientTheme | Self::ClientEffects | Self::ClientTimeout => String::new(),
+            Self::ClientTheme | Self::ClientEffects | Self::ClientRefresh | Self::ClientTimeout => {
+                String::new()
+            }
             Self::SampleInterval => settings.sample_interval_ms.to_string(),
             Self::Retention => settings.retention_days.to_string(),
             Self::Sustained => settings.sustained_samples.to_string(),
@@ -457,7 +472,7 @@ impl SettingField {
 
     pub fn assign(self, settings: &mut Settings, input: &str) -> Result<(), String> {
         match self {
-            Self::ClientTheme | Self::ClientEffects | Self::ClientTimeout => {
+            Self::ClientTheme | Self::ClientEffects | Self::ClientRefresh | Self::ClientTimeout => {
                 return Err("local client preference — edited through its own handler".into());
             }
             Self::SampleInterval => {
@@ -778,6 +793,9 @@ pub struct App {
     /// folded in). `t` / `m` / TUNE edits update and persist them.
     pub client_prefs: UiPrefs,
     pub prefs_store: Option<PrefsStore>,
+    /// Smooth-refresh tween state: previous displayed sample, frame clock,
+    /// and the session frame governor. Inert while `refresh_fps` is 0.
+    pub(crate) smooth: crate::tween::SmoothState,
     /// Set when a theme change needs `terminal.clear()` on the next loop
     /// turn; drained by `take_terminal_clear`.
     needs_terminal_clear: bool,
@@ -876,6 +894,7 @@ impl App {
             help_overlay: None,
             client_prefs: UiPrefs::default(),
             prefs_store: None,
+            smooth: crate::tween::SmoothState::default(),
             needs_terminal_clear: false,
             effects_request: None,
             clipboard: Box::new(write_clipboard_via_clip),
@@ -918,6 +937,16 @@ impl App {
                     if reconnected {
                         self.status.clear();
                         self.status_is_error = false;
+                    }
+                    // Smooth refresh: capture the outgoing sample's displayed
+                    // values so the new one eases in from where the screen
+                    // is. Skipped entirely in event-driven mode, and when the
+                    // fetched snapshot repeats the same telemetry sample.
+                    if self.effective_refresh_fps() > 0
+                        && let Some(outgoing) = &self.snapshot
+                        && outgoing.system.timestamp_ms != snapshot.system.timestamp_ms
+                    {
+                        self.smooth.observe_snapshot(outgoing, Instant::now());
                     }
                     if self.live_history.back().map(|item| item.timestamp_ms)
                         != Some(snapshot.system.timestamp_ms)
@@ -1499,6 +1528,24 @@ impl App {
                 self.status_is_error = false;
                 self.persist_client_prefs();
             }
+            // The refresh row is a three-position switch: Enter cycles
+            // off → 30 → 60 and persists immediately. An explicit choice
+            // also lifts any session downgrade the frame governor imposed.
+            SettingField::ClientRefresh => {
+                let next = match prefs::normalize_refresh_fps(self.client_prefs.refresh_fps) {
+                    0 => 30,
+                    30 => 60,
+                    _ => 0,
+                };
+                self.client_prefs.refresh_fps = next;
+                self.smooth.reset_session();
+                self.status = format!(
+                    "Refresh rate: {} · saved for your user",
+                    refresh_label(next)
+                );
+                self.status_is_error = false;
+                self.persist_client_prefs();
+            }
             _ => {
                 self.mode = InputMode::EditSetting {
                     field,
@@ -1519,6 +1566,9 @@ impl App {
                 "off"
             }
             .into(),
+            SettingField::ClientRefresh => {
+                refresh_label(prefs::normalize_refresh_fps(self.client_prefs.refresh_fps)).into()
+            }
             SettingField::ClientTimeout => self.client_prefs.analyzer_timeout_secs.to_string(),
             _ => field.value(&self.settings),
         }
@@ -1551,6 +1601,107 @@ impl App {
     /// loop reconciles its `MotionSystem` with it.
     pub fn take_effects_request(&mut self) -> Option<bool> {
         self.effects_request.take()
+    }
+
+    // ---- Smooth refresh --------------------------------------------------
+
+    /// The refresh rate in force right now: the stored preference clamped to
+    /// a supported tier, further capped by any session downgrade the frame
+    /// governor imposed. `0` = event-driven.
+    pub fn effective_refresh_fps(&self) -> u32 {
+        let preferred = prefs::normalize_refresh_fps(self.client_prefs.refresh_fps);
+        match self.smooth.session_cap() {
+            Some(cap) => preferred.min(cap),
+            None => preferred,
+        }
+    }
+
+    /// Stamp the frame clock. The main loop calls this immediately before
+    /// every draw; render paths never consult `Instant::now` themselves.
+    pub fn set_render_now(&mut self, now: Instant) {
+        self.smooth.set_render_now(now);
+    }
+
+    /// Record one smooth frame's cost against its budget. On the third
+    /// consecutive overrun the session drops a tier (60 → 30 → off) and the
+    /// footer says so; returns `true` so the loop can repaint the message.
+    pub fn note_smooth_frame(&mut self, cost: Duration, budget: Duration) -> bool {
+        let current = self.effective_refresh_fps();
+        if current == 0 {
+            return false;
+        }
+        match self.smooth.note_frame(cost, budget, current) {
+            Some(next) => {
+                self.status = format!(
+                    "Refresh reduced to {} — frame budget exceeded",
+                    refresh_label(next)
+                );
+                self.status_is_error = false;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Eased tween progress for the current frame; exactly `1.0` whenever
+    /// smooth refresh is off, which keeps every display accessor a
+    /// pass-through on the default path.
+    fn tween_t(&self) -> f64 {
+        if self.effective_refresh_fps() == 0 {
+            1.0
+        } else {
+            self.smooth.t()
+        }
+    }
+
+    /// The system sample the meters display this frame: the tweened channels
+    /// ease from the previous sample, everything else is `target` verbatim.
+    pub fn display_system(&self, target: &SystemMetric) -> SystemMetric {
+        crate::tween::display_system(&self.smooth, target, self.tween_t())
+    }
+
+    /// The CPU share a process row displays this frame.
+    pub fn display_process_cpu(&self, process: &ProcessMetric) -> f64 {
+        crate::tween::display_process_channel(
+            &self.smooth,
+            process.pid,
+            process.cpu_percent,
+            |previous| previous.cpu_percent,
+            self.tween_t(),
+        )
+    }
+
+    /// The working-set bytes a heat computation uses this frame. Layout
+    /// weights must keep using the raw snapshot value — only heat eases.
+    pub fn display_process_working_set(&self, process: &ProcessMetric) -> f64 {
+        crate::tween::display_process_channel(
+            &self.smooth,
+            process.pid,
+            process.working_set_bytes as f64,
+            |previous| previous.working_set_bytes,
+            self.tween_t(),
+        )
+    }
+
+    /// The combined read+write rate a process row displays this frame.
+    pub fn display_process_io(&self, process: &ProcessMetric) -> f64 {
+        crate::tween::display_process_channel(
+            &self.smooth,
+            process.pid,
+            process.read_bytes_per_sec + process.write_bytes_per_sec,
+            |previous| previous.io_bytes_per_sec,
+            self.tween_t(),
+        )
+    }
+
+    /// The value a hardware gauge (temperature, clock, utilization) displays
+    /// this frame, keyed by the `crate::tween` gauge-key helpers.
+    pub fn display_gauge(&self, key: &str, target: f64) -> f64 {
+        let t = self.tween_t();
+        match self.smooth.previous_gauge(key) {
+            Some(previous) if t < 1.0 => crate::tween::lerp(previous, target, t),
+            _ => target,
+        }
     }
 
     /// `y` on Oracle: copy the latest successful analyzer answer.
@@ -2058,6 +2209,15 @@ impl App {
     }
 }
 
+/// The human label for a refresh tier, shared by the TUNE row and statuses.
+pub(crate) fn refresh_label(fps: u32) -> &'static str {
+    match fps {
+        0 => "off",
+        30 => "30 fps",
+        _ => "60 fps",
+    }
+}
+
 fn severity_rank(severity: Severity) -> u8 {
     match severity {
         Severity::Info => 0,
@@ -2205,6 +2365,71 @@ fn write_clipboard_via_clip(text: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "dev harness: prices the App::drain_events snapshot-ingest path; run with --ignored --nocapture"]
+    fn dev_bench_snapshot_ingest() {
+        use pcpulse_service::models::Snapshot;
+        const ROUNDS: usize = 500;
+        let (command_tx, _command_rx) = bounded(4);
+        let (event_tx, event_rx) = bounded(4);
+        let mut app = App::with_worker(
+            Worker {
+                commands: command_tx,
+                events: event_rx,
+                handle: None,
+            },
+            false,
+        );
+        // A gallery-sized snapshot: 15 processes on a populated system sample.
+        let mut template = Snapshot::default();
+        template.system.cpu_percent = 46.0;
+        template.system.memory_total_bytes = 64 * 1024 * 1024 * 1024;
+        template.system.memory_used_bytes = 32 * 1024 * 1024 * 1024;
+        for index in 0..15u32 {
+            template.processes.push(ProcessMetric {
+                timestamp_ms: 1_800_000_000_000,
+                pid: 5_000 + index * 4,
+                parent_pid: 1_000,
+                name: format!("worker-{index}.exe"),
+                executable_path: format!(r"C:\apps\worker-{index}.exe"),
+                cpu_percent: 3.0 + f64::from(index),
+                working_set_bytes: u64::from(index + 1) * 128 * 1024 * 1024,
+                private_bytes: u64::from(index + 1) * 96 * 1024 * 1024,
+                handle_count: 200 + index,
+                thread_count: 20 + index,
+                read_bytes_per_sec: 1024.0,
+                write_bytes_per_sec: 1024.0,
+                total_read_bytes: 0,
+                total_write_bytes: 0,
+                started_at_ms: 1_799_999_000_000,
+                session_id: 1,
+                responsive: true,
+                has_visible_window: false,
+                launch_duration_ms: None,
+                is_agent_candidate: false,
+            });
+        }
+        let mut samples = Vec::with_capacity(ROUNDS);
+        for round in 0..ROUNDS {
+            let mut snapshot = template.clone();
+            snapshot.system.timestamp_ms = 1_800_000_000_000 + round as i64 * 2_000;
+            event_tx
+                .send(WorkerEvent::Snapshot(Ok(snapshot)))
+                .expect("send snapshot");
+            let started = Instant::now();
+            assert!(app.drain_events());
+            samples.push(started.elapsed().as_micros());
+        }
+        samples.sort_unstable();
+        let mean = samples.iter().sum::<u128>() as f64 / samples.len() as f64;
+        println!(
+            "snapshot ingest (drain_events, 15 processes): mean {:.1} us  p95 {} us  max {} us",
+            mean,
+            samples[samples.len() * 95 / 100 - 1],
+            samples[samples.len() - 1]
+        );
+    }
 
     #[test]
     fn validates_setting_ranges() {
@@ -2770,7 +2995,7 @@ mod tests {
         for sort in [SettingSort::Name, SettingSort::Value, SettingSort::Unit] {
             app.setting_sort = sort;
             let fields = app.visible_setting_fields();
-            assert_eq!(&fields[..3], &SettingField::CLIENT, "{sort:?}");
+            assert_eq!(&fields[..4], &SettingField::CLIENT, "{sort:?}");
             assert_eq!(fields.len(), SettingField::ALL.len());
         }
         assert!(SettingField::ClientTheme.is_client());
@@ -2836,7 +3061,7 @@ mod tests {
         let mut app = App::new_inert();
         app.adopt_client_prefs(UiPrefs::default(), Some(store.clone()));
         app.page = Page::Settings;
-        app.setting_state.select(Some(2));
+        app.setting_state.select(Some(3));
 
         // Enter opens the ordinary typed edit, prefilled with the current value.
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
@@ -2865,6 +3090,86 @@ mod tests {
         assert!(matches!(app.mode, InputMode::EditSetting { .. }));
         assert_eq!(app.client_prefs.analyzer_timeout_secs, 600);
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn enter_on_the_refresh_row_cycles_off_30_60_and_persists() {
+        let (store, path) = scratch_prefs_store("refresh-cycle");
+        let mut app = App::new_inert();
+        app.adopt_client_prefs(UiPrefs::default(), Some(store.clone()));
+        app.page = Page::Settings;
+        app.setting_state.select(Some(2));
+        assert_eq!(app.setting_value(SettingField::ClientRefresh), "off");
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.client_prefs.refresh_fps, 30);
+        assert_eq!(app.setting_value(SettingField::ClientRefresh), "30 fps");
+        assert_eq!(app.effective_refresh_fps(), 30);
+        assert_eq!(store.load().refresh_fps, 30);
+        assert!(app.status.contains("Refresh rate: 30 fps"));
+        assert!(matches!(app.mode, InputMode::Normal), "no typed edit opens");
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.client_prefs.refresh_fps, 60);
+        assert_eq!(app.setting_value(SettingField::ClientRefresh), "60 fps");
+        assert_eq!(store.load().refresh_fps, 60);
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.client_prefs.refresh_fps, 0);
+        assert_eq!(app.setting_value(SettingField::ClientRefresh), "off");
+        assert_eq!(app.effective_refresh_fps(), 0);
+        assert_eq!(store.load().refresh_fps, 0);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn frame_overruns_walk_the_session_ladder_without_touching_the_pref() {
+        let budget = Duration::from_millis(16);
+        let over = Duration::from_millis(30);
+        let mut app = App::new_inert();
+        app.client_prefs.refresh_fps = 60;
+        assert_eq!(app.effective_refresh_fps(), 60);
+
+        // Two overruns then a good frame: no downgrade.
+        assert!(!app.note_smooth_frame(over, budget));
+        assert!(!app.note_smooth_frame(over, budget));
+        assert!(!app.note_smooth_frame(Duration::from_millis(2), budget));
+        assert_eq!(app.effective_refresh_fps(), 60);
+
+        // Three consecutive overruns: 60 -> 30 with the footer message.
+        assert!(!app.note_smooth_frame(over, budget));
+        assert!(!app.note_smooth_frame(over, budget));
+        assert!(app.note_smooth_frame(over, budget));
+        assert_eq!(app.effective_refresh_fps(), 30);
+        assert_eq!(
+            app.status,
+            "Refresh reduced to 30 fps — frame budget exceeded"
+        );
+        assert!(!app.status_is_error);
+
+        // Again: 30 -> off. The stored preference never changes.
+        assert!(!app.note_smooth_frame(over, budget));
+        assert!(!app.note_smooth_frame(over, budget));
+        assert!(app.note_smooth_frame(over, budget));
+        assert_eq!(app.effective_refresh_fps(), 0);
+        assert!(app.status.contains("Refresh reduced to off"));
+        assert_eq!(app.client_prefs.refresh_fps, 60, "session-only downgrade");
+
+        // Fully event-driven now: the governor is inert.
+        assert!(!app.note_smooth_frame(over, budget));
+
+        // An explicit TUNE choice lifts the cap for a fresh try.
+        app.page = Page::Settings;
+        app.setting_state.select(Some(2));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.client_prefs.refresh_fps, 0, "60 cycles to off");
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.client_prefs.refresh_fps, 30);
+        assert_eq!(
+            app.effective_refresh_fps(),
+            30,
+            "the explicit choice lifted the session cap"
+        );
     }
 
     fn key(code: KeyCode) -> KeyEvent {

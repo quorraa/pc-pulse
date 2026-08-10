@@ -29,6 +29,16 @@ pub const MIN_ANALYZER_TIMEOUT_SECS: u64 = 30;
 pub const MAX_ANALYZER_TIMEOUT_SECS: u64 = 1_800;
 pub const DEFAULT_ANALYZER_TIMEOUT_SECS: u64 = 300;
 
+/// Normalize a stored refresh-rate preference to the supported tiers:
+/// `0` stays event-driven, everything else snaps to 30 or 60 fps.
+pub fn normalize_refresh_fps(fps: u32) -> u32 {
+    match fps {
+        0 => 0,
+        1..=45 => 30,
+        _ => 60,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct UiPrefs {
@@ -36,6 +46,9 @@ pub struct UiPrefs {
     pub theme: ThemeId,
     pub effects: bool,
     pub analyzer_timeout_secs: u64,
+    /// Smooth-refresh rate: `0` = event-driven (default), else 30 or 60 fps
+    /// fixed-cadence drawing with tweened meters.
+    pub refresh_fps: u32,
 }
 
 impl Default for UiPrefs {
@@ -44,6 +57,7 @@ impl Default for UiPrefs {
             theme: ThemeId::Vitals,
             effects: true,
             analyzer_timeout_secs: DEFAULT_ANALYZER_TIMEOUT_SECS,
+            refresh_fps: 0,
         }
     }
 }
@@ -65,6 +79,7 @@ impl UiPrefs {
         self.analyzer_timeout_secs = self
             .analyzer_timeout_secs
             .clamp(MIN_ANALYZER_TIMEOUT_SECS, MAX_ANALYZER_TIMEOUT_SECS);
+        self.refresh_fps = normalize_refresh_fps(self.refresh_fps);
         self
     }
 }
@@ -162,12 +177,14 @@ mod tests {
             theme: ThemeId::Avionics,
             effects: false,
             analyzer_timeout_secs: 600,
+            refresh_fps: 30,
         };
         store.save(&prefs).unwrap();
         assert_eq!(store.load(), prefs);
         let raw = fs::read_to_string(&path).unwrap();
         assert!(raw.contains("\"avionics\""));
         assert!(raw.contains("analyzerTimeoutSecs"));
+        assert!(raw.contains("refreshFps"));
         let _ = fs::remove_file(path);
     }
 
@@ -193,6 +210,7 @@ mod tests {
             theme: ThemeId::Avionics,
             effects: true,
             analyzer_timeout_secs: 450,
+            refresh_fps: 60,
         };
         store.save(&stored).unwrap();
         let effective = store.load().overridden(Some(ThemeId::Vitals), true);
@@ -228,6 +246,46 @@ mod tests {
         assert_eq!(prefs.theme, ThemeId::Vitals, "unknown theme degrades");
         assert!(prefs.effects, "missing field keeps its default");
         assert_eq!(prefs.analyzer_timeout_secs, 900);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn refresh_fps_round_trips_and_clamps_to_supported_tiers() {
+        assert_eq!(normalize_refresh_fps(0), 0);
+        assert_eq!(normalize_refresh_fps(1), 30);
+        assert_eq!(normalize_refresh_fps(30), 30);
+        assert_eq!(normalize_refresh_fps(45), 30);
+        assert_eq!(normalize_refresh_fps(46), 60);
+        assert_eq!(normalize_refresh_fps(60), 60);
+        assert_eq!(normalize_refresh_fps(240), 60);
+        let (store, path) = scratch_store("refresh");
+        store
+            .save(&UiPrefs {
+                refresh_fps: 60,
+                ..UiPrefs::default()
+            })
+            .unwrap();
+        assert_eq!(store.load().refresh_fps, 60);
+        // A hand-edited or future value snaps to a supported tier on load,
+        // and an absent field keeps the event-driven default.
+        fs::write(&path, br#"{ "refreshFps": 144 }"#).unwrap();
+        assert_eq!(store.load().refresh_fps, 60);
+        fs::write(&path, br#"{ "refreshFps": 15 }"#).unwrap();
+        assert_eq!(store.load().refresh_fps, 30);
+        fs::write(&path, br#"{ "theme": "vitals" }"#).unwrap();
+        assert_eq!(store.load().refresh_fps, 0);
+        // Saving clamps too: the file never carries an unsupported tier.
+        store
+            .save(&UiPrefs {
+                refresh_fps: 200,
+                ..UiPrefs::default()
+            })
+            .unwrap();
+        assert!(
+            fs::read_to_string(&path)
+                .unwrap()
+                .contains("\"refreshFps\": 60")
+        );
         let _ = fs::remove_file(path);
     }
 

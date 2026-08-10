@@ -59,7 +59,7 @@ Nine views:
 4. **Findings** — active/resolved history with ownership, explanation, evidence, and recommendations.
 5. **Timeline** — persisted CPU, memory, and disk-latency charts over configurable windows.
 6. **Oracle** — evidence-aware chat with the dedicated systems analyzer and the live Windows diagnostic feed.
-7. **Settings** — all detector thresholds and notification state, plain-language explanations, plus per-user CLIENT settings (theme, motion effects, Oracle time budget).
+7. **Settings** — all detector thresholds and notification state, plain-language explanations, plus per-user CLIENT settings (theme, motion effects, refresh rate, Oracle time budget).
 8. **Keys** — the complete keyboard reference.
 9. **Gauges** — thermal-zone and GPU temperature meters with live history sparklines, plus CPU/GPU clocks and GPU utilization; degrades to an honest unavailable state when sensors are denied.
 
@@ -90,6 +90,7 @@ Important keys:
 | `s` | Save settings |
 | `r` | Refresh the current view |
 | `m` | Toggle finite TachyonFX motion effects; the choice is saved per user |
+| Refresh rate (Settings CLIENT row) | Off (event-driven, default) / 30 / 60 fps, saved per user; 30/60 draws on a fixed cadence with smooth interpolation of meters between telemetry samples, and drops a tier automatically if frames keep exceeding their budget |
 | `t` | Cycle presentation profiles (vitals / avionics / ledger); the choice is saved per user |
 | `?` | Open the keys overlay on top of any page; `Esc`, `?`, or a click closes it (the Keys page itself stays on `8`) |
 | `q` / `Ctrl-C` | Exit the TUI; the collector continues |

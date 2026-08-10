@@ -19,7 +19,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 fn main() {
@@ -239,13 +239,25 @@ fn run_loop(
     let mut dirty = true;
     let mut last_frame = Instant::now();
     let mut terminal_area = Rect::default();
+    // Smooth refresh: the next fixed-cadence frame deadline while the
+    // per-user refresh rate is 30/60 fps; `None` in event-driven mode.
+    let mut next_smooth_frame: Option<Instant> = None;
     loop {
         if app.drain_events() {
             motion.observe(&app);
             dirty = true;
         }
-        if dirty || motion.is_animating() {
+        let fps = app.effective_refresh_fps();
+        if fps == 0 {
+            next_smooth_frame = None;
+        }
+        let frame_budget = Duration::from_micros(1_000_000 / u64::from(fps.max(1)));
+        let smooth_due =
+            fps > 0 && next_smooth_frame.is_none_or(|deadline| Instant::now() >= deadline);
+        if dirty || motion.is_animating() || smooth_due {
             let elapsed = last_frame.elapsed();
+            let frame_started = Instant::now();
+            app.set_render_now(frame_started);
             terminal.draw(|frame| {
                 terminal_area = frame.area();
                 ui::draw(frame, &mut app);
@@ -253,8 +265,29 @@ fn run_loop(
             })?;
             last_frame = Instant::now();
             dirty = motion.take_cleanup_frame();
+            if fps > 0 {
+                // Guardrail: three consecutive budget overruns drop the
+                // session a tier so the TUI never consumes a core silently.
+                if app.note_smooth_frame(frame_started.elapsed(), frame_budget) {
+                    dirty = true;
+                    motion.observe(&app);
+                }
+                // Keep the cadence anchored to the previous deadline, but
+                // never schedule into the past after a slow frame.
+                let target = next_smooth_frame
+                    .map_or_else(|| frame_started + frame_budget, |at| at + frame_budget);
+                next_smooth_frame = Some(target.max(Instant::now()));
+            }
         }
-        if event::poll(motion.poll_interval())? {
+        // Event-driven mode polls on the motion system's cadence; smooth
+        // mode caps the wait at the remaining frame budget (take the min).
+        let poll_timeout = match next_smooth_frame {
+            Some(deadline) if app.effective_refresh_fps() > 0 => motion
+                .poll_interval()
+                .min(deadline.saturating_duration_since(Instant::now())),
+            _ => motion.poll_interval(),
+        };
+        if event::poll(poll_timeout)? {
             match event::read()? {
                 Event::Key(key) => {
                     if key.kind != KeyEventKind::Release
