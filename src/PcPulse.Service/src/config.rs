@@ -22,7 +22,16 @@ pub struct Settings {
     pub slow_launch_ms: u64,
     pub abandoned_agent_minutes: u32,
     pub notifications_enabled: bool,
+    /// Absolute CPU budget for the collector's own self-monitoring, as a
+    /// normalized percentage. Serde-defaulted so pre-1.15 settings files
+    /// load unchanged.
+    #[serde(default = "default_collector_cpu_percent")]
+    pub collector_cpu_percent: f64,
     pub agent_process_patterns: Vec<String>,
+}
+
+fn default_collector_cpu_percent() -> f64 {
+    0.2
 }
 
 impl Default for Settings {
@@ -45,6 +54,7 @@ impl Default for Settings {
             slow_launch_ms: 8_000,
             abandoned_agent_minutes: 30,
             notifications_enabled: true,
+            collector_cpu_percent: default_collector_cpu_percent(),
             agent_process_patterns: vec![
                 "codex".into(),
                 "claude".into(),
@@ -71,6 +81,9 @@ impl Settings {
         }
         if !(1.0..=100.0).contains(&self.cpu_percent) {
             bail!("cpuPercent must be between 1 and 100");
+        }
+        if !(0.05..=10.0).contains(&self.collector_cpu_percent) {
+            bail!("collectorCpuPercent must be between 0.05 and 10");
         }
         if self.agent_process_patterns.len() > 32
             || self.agent_process_patterns.iter().any(|x| x.len() > 64)

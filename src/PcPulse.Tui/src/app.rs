@@ -294,6 +294,7 @@ pub enum SettingField {
     Sustained,
     BaselineSigma,
     Cpu,
+    CollectorCpu,
     MemoryGrowth,
     HandleGrowth,
     ThreadGrowth,
@@ -320,12 +321,13 @@ impl SettingField {
     ];
 
     /// Service-validated detector settings, saved through the pipe with `s`.
-    pub const SERVICE: [Self; 18] = [
+    pub const SERVICE: [Self; 19] = [
         Self::SampleInterval,
         Self::Retention,
         Self::Sustained,
         Self::BaselineSigma,
         Self::Cpu,
+        Self::CollectorCpu,
         Self::MemoryGrowth,
         Self::HandleGrowth,
         Self::ThreadGrowth,
@@ -341,7 +343,7 @@ impl SettingField {
         Self::AgentPatterns,
     ];
 
-    pub const ALL: [Self; 22] = [
+    pub const ALL: [Self; 23] = [
         Self::ClientTheme,
         Self::ClientEffects,
         Self::ClientRefresh,
@@ -351,6 +353,7 @@ impl SettingField {
         Self::Sustained,
         Self::BaselineSigma,
         Self::Cpu,
+        Self::CollectorCpu,
         Self::MemoryGrowth,
         Self::HandleGrowth,
         Self::ThreadGrowth,
@@ -384,6 +387,7 @@ impl SettingField {
             Self::Sustained => "Sustained samples",
             Self::BaselineSigma => "Baseline deviation",
             Self::Cpu => "Process CPU",
+            Self::CollectorCpu => "Collector CPU ceiling",
             Self::MemoryGrowth => "Memory growth",
             Self::HandleGrowth => "Handle growth",
             Self::ThreadGrowth => "Thread growth",
@@ -408,6 +412,7 @@ impl SettingField {
             Self::Retention => "days",
             Self::BaselineSigma => "sigma",
             Self::Cpu => "%",
+            Self::CollectorCpu => "%",
             Self::MemoryGrowth | Self::KernelPool => "MB",
             Self::DiskLatency => "ms",
             Self::Io => "MB/s",
@@ -459,6 +464,11 @@ impl SettingField {
             Self::Cpu => {
                 "A process holding at least this share of the CPU for the sustained streak \
                  becomes a finding."
+            }
+            Self::CollectorCpu => {
+                "How much CPU PC Pulse's own collector may use before it flags itself. \
+                 Raise on slower machines if the collector-budget finding fires without a \
+                 real problem."
             }
             Self::MemoryGrowth => {
                 "How much a process's memory must keep growing over recent minutes before it \
@@ -527,6 +537,7 @@ impl SettingField {
             Self::Sustained => settings.sustained_samples.to_string(),
             Self::BaselineSigma => settings.baseline_sigma.to_string(),
             Self::Cpu => settings.cpu_percent.to_string(),
+            Self::CollectorCpu => settings.collector_cpu_percent.to_string(),
             Self::MemoryGrowth => settings.memory_growth_mb.to_string(),
             Self::HandleGrowth => settings.handle_growth.to_string(),
             Self::ThreadGrowth => settings.thread_growth.to_string(),
@@ -560,6 +571,9 @@ impl SettingField {
             Self::Sustained => settings.sustained_samples = parse_range(input, 2, 120)?,
             Self::BaselineSigma => settings.baseline_sigma = parse_float(input, 1.0, 10.0)?,
             Self::Cpu => settings.cpu_percent = parse_float(input, 1.0, 100.0)?,
+            Self::CollectorCpu => {
+                settings.collector_cpu_percent = parse_float(input, 0.05, 10.0)?
+            }
             Self::MemoryGrowth => settings.memory_growth_mb = parse_float(input, 16.0, 65_536.0)?,
             Self::HandleGrowth => settings.handle_growth = parse_range(input, 10, 100_000)?,
             Self::ThreadGrowth => settings.thread_growth = parse_range(input, 5, 10_000)?,

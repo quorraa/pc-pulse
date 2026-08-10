@@ -316,7 +316,7 @@ impl AlertEngine {
             if process.pid == std::process::id() {
                 let memory_mb = process.working_set_bytes as f64 / MIB;
                 let memory_breached = memory_mb >= 25.0;
-                let cpu_breached = process.cpu_percent >= 0.2;
+                let cpu_breached = process.cpu_percent >= settings.collector_cpu_percent;
                 let handles_breached = process.handle_count >= COLLECTOR_HANDLE_BUDGET;
                 if memory_breached || cpu_breached || handles_breached {
                     let mut budget_evidence = Vec::new();
@@ -329,7 +329,10 @@ impl AlertEngine {
                     if cpu_breached {
                         budget_evidence.push(evidence(
                             "Breached budget",
-                            format!("CPU {:.3}% >= 0.2%", process.cpu_percent),
+                            format!(
+                                "CPU {:.3}% >= {}%",
+                                process.cpu_percent, settings.collector_cpu_percent
+                            ),
                         ));
                     }
                     if handles_breached {
@@ -343,7 +346,13 @@ impl AlertEngine {
                     }
                     budget_evidence.extend([
                         evidence("Working set", format!("{memory_mb:.1} MB / 25 MB")),
-                        evidence("CPU", format!("{:.3}% / 0.2%", process.cpu_percent)),
+                        evidence(
+                            "CPU",
+                            format!(
+                                "{:.3}% / {}%",
+                                process.cpu_percent, settings.collector_cpu_percent
+                            ),
+                        ),
                         evidence(
                             "Handles",
                             format!("{} / {COLLECTOR_HANDLE_BUDGET}", process.handle_count),
@@ -681,6 +690,71 @@ mod tests {
         value.private_bytes = working_set_bytes;
         value.handle_count = handles;
         value
+    }
+
+    #[test]
+    fn collector_cpu_ceiling_follows_the_configured_setting() {
+        // 1% CPU breaches the 0.2% default but not a raised 5% ceiling —
+        // the budget alert must track settings.collector_cpu_percent, while
+        // the memory and handle budgets stay fixed.
+        let run = |ceiling: f64| {
+            let mut engine = AlertEngine::default();
+            let settings = Settings {
+                sustained_samples: 2,
+                collector_cpu_percent: ceiling,
+                ..Settings::default()
+            };
+            let mut system = SystemMetric::default();
+            for index in 0..7 {
+                system.timestamp_ms = 20 * 60_000 + index * 2_000;
+                engine.evaluate(
+                    &system,
+                    &[collector_process(system.timestamp_ms, 0, 1.0, 16 << 20, 200)],
+                    &settings,
+                );
+            }
+            engine
+                .active
+                .values()
+                .any(|alert| alert.kind == "collectorBudget")
+        };
+        assert!(run(0.2), "1% CPU must breach the 0.2% default ceiling");
+        assert!(!run(5.0), "1% CPU must not breach a raised 5% ceiling");
+
+        let raised = Settings {
+            collector_cpu_percent: 5.0,
+            ..Settings::default()
+        };
+        let evidence_uses_setting = {
+            let mut engine = AlertEngine::default();
+            let mut system = SystemMetric::default();
+            // Memory over its fixed 25 MB budget keeps the finding alive so
+            // the CPU evidence row's denominator can be read.
+            for index in 0..7 {
+                system.timestamp_ms = 20 * 60_000 + index * 2_000;
+                engine.evaluate(
+                    &system,
+                    &[collector_process(system.timestamp_ms, 0, 1.0, 40 << 20, 200)],
+                    &raised,
+                );
+            }
+            engine
+                .active
+                .values()
+                .find(|alert| alert.kind == "collectorBudget")
+                .and_then(|alert| {
+                    alert
+                        .evidence
+                        .iter()
+                        .find(|row| row.label == "CPU")
+                        .map(|row| row.value.clone())
+                })
+                .unwrap_or_default()
+        };
+        assert!(
+            evidence_uses_setting.contains("/ 5%"),
+            "CPU evidence must show the configured ceiling: {evidence_uses_setting}"
+        );
     }
 
     #[test]

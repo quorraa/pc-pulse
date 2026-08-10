@@ -20,7 +20,7 @@ This prevents a nearly constant process from generating alerts due to tiny float
 
 Per-process memory, handles, and thread counts use a bounded five-minute deque. A candidate must show absolute growth over at least the available minute-scale history and then remain abnormal for the sustained streak. The collector does not retain an unbounded sample list.
 
-Collector self-monitoring treats absolute budgets and growth as different conditions. Working set at or above 25 MB, CPU at or above 0.2%, or 600 or more handles creates a critical candidate and lists the breached dimension first. Working-set growth is suppressed during the first ten minutes, requires at least four minutes of history, and must rise by at least 1 MiB across early, middle, and recent window means. A one-time cache allocation or startup settling is not a trend. Confirmed mature growth is a warning until an absolute budget is crossed.
+Collector self-monitoring treats absolute budgets and growth as different conditions. Working set at or above 25 MB, CPU at or above the configured collector CPU ceiling (default 0.2%), or 600 or more handles creates a critical candidate and lists the breached dimension first. Working-set growth is suppressed during the first ten minutes, requires at least four minutes of history, and must rise by at least 1 MiB across early, middle, and recent window means. A one-time cache allocation or startup settling is not a trend. Confirmed mature growth is a warning until an absolute budget is crossed.
 
 A collector restart closes persisted open findings because monitoring continuity was interrupted. Conditions that remain present must satisfy their sustained streak again after restart.
 
