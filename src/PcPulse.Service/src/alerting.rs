@@ -487,6 +487,7 @@ impl AlertEngine {
                     acknowledged: false,
                     occurrence_count: 1,
                     resolved_at_ms: None,
+                    archived: false,
                 };
                 changed.push(alert.clone());
                 self.active.insert(candidate.key, alert);
@@ -533,6 +534,16 @@ impl AlertEngine {
     pub fn acknowledge(&mut self, id: &str) -> Option<Alert> {
         let alert = self.active.values_mut().find(|alert| alert.id == id)?;
         alert.acknowledged = true;
+        Some(alert.clone())
+    }
+
+    /// Set or clear the archive flag on a still-active alert, mirroring
+    /// [`Self::acknowledge`]. Keeping the flag on the engine's copy means
+    /// every later evaluation writes it back through `changed`, so an
+    /// archived active finding stays archived while it keeps updating.
+    pub fn set_archived(&mut self, id: &str, archived: bool) -> Option<Alert> {
+        let alert = self.active.values_mut().find(|alert| alert.id == id)?;
+        alert.archived = archived;
         Some(alert.clone())
     }
 }
@@ -714,6 +725,44 @@ mod tests {
                 .iter()
                 .any(|alert| alert.resolved_at_ms.is_some())
         );
+    }
+
+    #[test]
+    fn archived_flag_rides_every_later_update_of_an_active_finding() {
+        let mut engine = AlertEngine::default();
+        let settings = Settings {
+            sustained_samples: 3,
+            ..Settings::default()
+        };
+        let mut system = SystemMetric::default();
+        for index in 0..3 {
+            system.timestamp_ms = index * 2_000;
+            engine.evaluate(
+                &system,
+                &[process(system.timestamp_ms, 95.0, 20)],
+                &settings,
+            );
+        }
+        let id = engine.active.values().next().unwrap().id.clone();
+        let archived = engine.set_archived(&id, true).expect("active finding");
+        assert!(archived.archived);
+        assert!(engine.set_archived("unknown", true).is_none());
+
+        // The condition persists: the next evaluation's changed record (the
+        // one that reaches storage) must still carry the flag.
+        system.timestamp_ms += 2_000;
+        let evaluation =
+            engine.evaluate(&system, &[process(system.timestamp_ms, 95.0, 20)], &settings);
+        let updated = evaluation
+            .changed
+            .iter()
+            .find(|alert| alert.id == id)
+            .expect("updated finding");
+        assert!(updated.archived, "archive must survive detector updates");
+        assert!(evaluation.active.iter().any(|alert| alert.archived));
+
+        // Recovery clears it the same way.
+        assert!(!engine.set_archived(&id, false).unwrap().archived);
     }
 
     #[test]

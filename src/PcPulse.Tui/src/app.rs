@@ -150,6 +150,15 @@ pub enum AlertSort {
     FirstSeen,
 }
 
+/// Which findings the INCIDENTS list shows. `v` cycles: the default list
+/// (active + resolved, unarchived) → archived only → back.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AlertView {
+    #[default]
+    Current,
+    Archived,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingSort {
     Name,
@@ -628,6 +637,11 @@ pub enum WorkerCommand {
     LoadSettings,
     SaveSettings(Settings),
     Acknowledge(String),
+    /// Set (`true`) or clear (`false`) the archive flag on a finding.
+    Archive {
+        id: String,
+        archived: bool,
+    },
     Terminate(u32),
     /// Reconcile live polling with the effective refresh rate: `fps == 0`
     /// stops the `live` requests entirely (event-driven mode stays
@@ -807,6 +821,15 @@ fn worker_loop(commands: Receiver<WorkerCommand>, events: Sender<WorkerEvent>) {
                         let result = client.acknowledge(id).map(|_| "Finding acknowledged".into()).map_err(error_text);
                         let _ = events.send(WorkerEvent::Action(result));
                     }
+                    Ok(WorkerCommand::Archive { id, archived }) => {
+                        let done = if archived {
+                            "Finding archived — v shows archive"
+                        } else {
+                            "Finding recovered"
+                        };
+                        let result = client.archive(id, archived).map(|_| done.into()).map_err(error_text);
+                        let _ = events.send(WorkerEvent::Action(result));
+                    }
                     Ok(WorkerCommand::Terminate(pid)) => {
                         let result = client.terminate(pid, true).map(|_| format!("Termination request completed for PID {pid}")).map_err(error_text);
                         let _ = events.send(WorkerEvent::Action(result));
@@ -935,6 +958,9 @@ pub struct App {
     pub process_sort: ProcessSort,
     pub tree_sort: TreeSort,
     pub alert_sort: AlertSort,
+    /// The INCIDENTS list filter `v` cycles; archived findings are hidden
+    /// from the default view and shown alone in the archived view.
+    pub alert_view: AlertView,
     pub setting_sort: SettingSort,
     pub suspect_sort: SuspectSort,
     pub process_filter: String,
@@ -1045,6 +1071,7 @@ impl App {
             process_sort: ProcessSort::Cpu,
             tree_sort: TreeSort::Lineage,
             alert_sort: AlertSort::FirstSeen,
+            alert_view: AlertView::default(),
             setting_sort: SettingSort::Name,
             suspect_sort: SuspectSort::Heat,
             process_filter: String::new(),
@@ -1090,7 +1117,14 @@ impl App {
         while let Ok(event) = self.worker.events.try_recv() {
             changed = true;
             match event {
-                WorkerEvent::Snapshot(Ok(snapshot)) => {
+                WorkerEvent::Snapshot(Ok(mut snapshot)) => {
+                    // The one shared exclusion point for archived findings on
+                    // live surfaces: annunciator lamps, incident tapes, ledger
+                    // notices, open-finding counts, motion cues, and the
+                    // pressure map all read `snapshot.active_alerts`. The
+                    // INCIDENTS page reads the separately fetched
+                    // `self.alerts` archive, which keeps them reachable.
+                    snapshot.active_alerts.retain(|alert| !alert.archived);
                     let reconnected = !self.connected;
                     self.connected = true;
                     self.last_error = None;
@@ -1351,6 +1385,8 @@ impl App {
                 self.begin_termination();
             }
             KeyCode::Char('a') if self.page == Page::Alerts => self.acknowledge_selected(),
+            KeyCode::Char('z') if self.page == Page::Alerts => self.archive_selected(),
+            KeyCode::Char('v') if self.page == Page::Alerts => self.cycle_alert_view(),
             KeyCode::Char('i') if self.page == Page::Alerts => self.investigate_selected_finding(),
             KeyCode::Enter | KeyCode::Char('/')
                 if self.page == Page::Analyzer
@@ -1686,6 +1722,35 @@ impl App {
         }
     }
 
+    /// `z` on the Findings page: archive the selected finding — or, in the
+    /// archived view, recover it. The flip direction comes from the finding
+    /// itself, so the same key serves both views.
+    pub(crate) fn archive_selected(&mut self) {
+        if let Some(index) = self.alert_state.selected()
+            && let Some(alert) = self.visible_alerts().get(index).copied()
+        {
+            let _ = self.worker.commands.try_send(WorkerCommand::Archive {
+                id: alert.id.clone(),
+                archived: !alert.archived,
+            });
+        }
+    }
+
+    /// `v` on the Findings page: cycle the list filter — default (active +
+    /// resolved, unarchived) → archived only → back.
+    pub(crate) fn cycle_alert_view(&mut self) {
+        self.alert_view = match self.alert_view {
+            AlertView::Current => AlertView::Archived,
+            AlertView::Archived => AlertView::Current,
+        };
+        self.alert_state.select(Some(0));
+        self.status = match self.alert_view {
+            AlertView::Current => "Showing current findings — v shows archive".into(),
+            AlertView::Archived => "Showing archived findings — z recovers".into(),
+        };
+        self.status_is_error = false;
+    }
+
     pub(crate) fn begin_setting_edit(&mut self) {
         let index = self.setting_state.selected().unwrap_or(0);
         let Some(field) = self.visible_setting_fields().get(index).copied() else {
@@ -1997,10 +2062,11 @@ impl App {
 
     pub(crate) fn move_selection(&mut self, delta: isize) {
         let process_count = self.process_count();
+        let alert_count = self.visible_alerts().len();
         match self.page {
             Page::Processes => move_table(&mut self.process_state, process_count, delta),
             Page::Tree => move_table(&mut self.tree_state, self.tree.len(), delta),
-            Page::Alerts => move_table(&mut self.alert_state, self.alerts.len(), delta),
+            Page::Alerts => move_table(&mut self.alert_state, alert_count, delta),
             Page::Analyzer => {
                 if self.chat_history_focused {
                     move_list(
@@ -2025,9 +2091,10 @@ impl App {
 
     fn clamp_selection(&mut self) {
         let process_count = self.process_count();
+        let alert_count = self.visible_alerts().len();
         clamp_table(&mut self.process_state, process_count);
         clamp_table(&mut self.tree_state, self.tree.len());
-        clamp_table(&mut self.alert_state, self.alerts.len());
+        clamp_table(&mut self.alert_state, alert_count);
         clamp_list(&mut self.chat_session_state, self.chat_sessions.len() + 1);
         let action_count = self.plans.first().map_or(0, |plan| plan.actions.len());
         clamp_list(&mut self.plan_action_state, action_count);
@@ -2539,7 +2606,14 @@ impl App {
     }
 
     pub fn visible_alerts(&self) -> Vec<&Alert> {
-        let mut alerts: Vec<&Alert> = self.alerts.iter().collect();
+        let mut alerts: Vec<&Alert> = self
+            .alerts
+            .iter()
+            .filter(|alert| match self.alert_view {
+                AlertView::Current => !alert.archived,
+                AlertView::Archived => alert.archived,
+            })
+            .collect();
         alerts.sort_by(|left, right| match self.alert_sort {
             AlertSort::Severity => severity_rank(right.severity).cmp(&severity_rank(left.severity)),
             AlertSort::Title => left
@@ -3330,6 +3404,7 @@ mod tests {
             acknowledged: false,
             occurrence_count: 3,
             resolved_at_ms: None,
+            archived: false,
         }
     }
 
@@ -3492,6 +3567,110 @@ mod tests {
             commands
                 .try_iter()
                 .any(|command| matches!(command, WorkerCommand::RunChat { .. }))
+        );
+    }
+
+    #[test]
+    fn z_archives_the_selected_finding_and_the_default_list_hides_it() {
+        let (mut app, commands) = app_with_captive_worker();
+        app.page = Page::Alerts;
+        app.alerts = vec![investigation_alert()];
+        app.alert_state.select(Some(0));
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE));
+
+        let sent: Vec<WorkerCommand> = commands.try_iter().collect();
+        assert!(
+            sent.iter().any(|command| matches!(
+                command,
+                WorkerCommand::Archive { id, archived: true } if id == "finding-77"
+            )),
+            "z must send an archive command for the selected finding"
+        );
+
+        // The refreshed fetch returns the finding flagged; the default view
+        // must hide it while the archive view keeps it reachable.
+        app.alerts[0].archived = true;
+        assert!(app.visible_alerts().is_empty());
+        assert_eq!(app.alert_view, AlertView::Current);
+        app.cycle_alert_view();
+        assert_eq!(app.visible_alerts().len(), 1);
+    }
+
+    #[test]
+    fn v_cycles_the_view_and_z_recovers_archived_findings() {
+        let (mut app, commands) = app_with_captive_worker();
+        app.page = Page::Alerts;
+        let mut archived = investigation_alert();
+        archived.id = "finding-old".into();
+        archived.archived = true;
+        app.alerts = vec![investigation_alert(), archived];
+        app.alert_state.select(Some(0));
+
+        // Default view: only the unarchived finding.
+        assert_eq!(
+            app.visible_alerts()
+                .iter()
+                .map(|alert| alert.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["finding-77"]
+        );
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE));
+        assert_eq!(app.alert_view, AlertView::Archived);
+        assert!(app.status.contains("archived"));
+        assert_eq!(
+            app.visible_alerts()
+                .iter()
+                .map(|alert| alert.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["finding-old"]
+        );
+
+        // z in the archived view recovers (archived: false).
+        app.handle_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE));
+        let sent: Vec<WorkerCommand> = commands.try_iter().collect();
+        assert!(
+            sent.iter().any(|command| matches!(
+                command,
+                WorkerCommand::Archive { id, archived: false } if id == "finding-old"
+            )),
+            "z in the archive must send a recover command"
+        );
+
+        // The cycle closes: v returns to the default view.
+        app.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE));
+        assert_eq!(app.alert_view, AlertView::Current);
+    }
+
+    #[test]
+    fn archived_findings_never_reach_live_surfaces() {
+        use pcpulse_service::models::Snapshot;
+        let (commands, _command_rx) = bounded(8);
+        let (event_tx, events) = bounded(8);
+        let mut app = App::with_worker(
+            Worker {
+                commands,
+                events,
+                handle: None,
+            },
+            false,
+        );
+        let mut filed = investigation_alert();
+        filed.id = "finding-filed".into();
+        filed.archived = true;
+        let snapshot = Snapshot {
+            active_alerts: vec![investigation_alert(), filed],
+            ..Snapshot::default()
+        };
+        event_tx.send(WorkerEvent::Snapshot(Ok(snapshot))).unwrap();
+        assert!(app.drain_events());
+        // The single ingestion filter feeds every live surface: lamps,
+        // tapes, notices, counts, and motion cues all read active_alerts.
+        let active = &app.snapshot.as_ref().unwrap().active_alerts;
+        assert_eq!(
+            active.iter().map(|alert| alert.id.as_str()).collect::<Vec<_>>(),
+            vec!["finding-77"]
         );
     }
 

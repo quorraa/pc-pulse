@@ -832,6 +832,7 @@ mod tests {
             acknowledged: false,
             occurrence_count: 1,
             resolved_at_ms: None,
+            archived: false,
         }
     }
 

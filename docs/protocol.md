@@ -32,6 +32,7 @@ Errors do not disclose stack traces:
 | `updateSettings` | `settings` | Saved settings or a validation error |
 | `getProcessTree` | — | Current processes nested by parent PID |
 | `acknowledgeAlert` | `alertId` | Acknowledgment result |
+| `archiveAlert` | `alertId`, `archived` | Archive-flag result; `archived: false` recovers a finding |
 | `terminateProcess` | `pid`, `confirmed` | Termination result |
 
 ## The `live` channel
@@ -52,6 +53,8 @@ Gating semantics — the channel is strictly activity-gated so its idle cost is 
 Budget: while subscribed, the loop costs one `PdhCollectQueryData` over a seven-counter query plus one `GlobalMemoryStatusEx` every 125 ms (well under 0.01 % normalized CPU against the 0.2 % collector budget) and one extra PDH query handle set that exists only while a subscriber is active. Collections are never closer than 100 ms — PDH rate counters get noisy below that window.
 
 `protocolVersion` is unchanged (still 1): `live` is additive. A pre-1.11 service answers it with the ordinary unknown-command `invalidRequest` error, and the dashboard degrades cleanly — it notes the fact once, stops sending `live` for the session, and smooth mode continues on 2-second snapshots.
+
+`archiveAlert` (service 1.14+) sets or clears the `archived` flag alerts now carry. Archiving is presentation-only: detector semantics are untouched, so an archived active finding keeps updating, counting, and resolving normally — clients simply hide it from their default surfaces, and `getAgentContext` excludes archived findings from `recentAlerts` and the embedded snapshot's active list. Validation mirrors `acknowledgeAlert` (an unknown id answers ok with `archived: false`). `protocolVersion` is unchanged (still 1): the command and the field are additive — alerts without the field deserialize as unarchived, old clients ignore it, and a pre-archive service answers the command with the ordinary unknown-command `invalidRequest` error.
 
 `terminateProcess` is rejected unless `confirmed` is exactly `true`. The TUI sends it only after the user types the selected process's exact PID. The service independently rejects system/idle PIDs and its own PID.
 

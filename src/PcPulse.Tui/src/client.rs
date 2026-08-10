@@ -100,6 +100,13 @@ impl PipeClient {
         self.send(&PipeRequest::AcknowledgeAlert { alert_id })
     }
 
+    /// Set or clear a finding's presentation-only archive flag (`archived:
+    /// false` recovers it). Pre-archive services answer with the ordinary
+    /// unknown-command `invalidRequest` error.
+    pub fn archive(&self, alert_id: String, archived: bool) -> Result<serde_json::Value> {
+        self.send(&PipeRequest::ArchiveAlert { alert_id, archived })
+    }
+
     pub fn terminate(&self, pid: u32, confirmed: bool) -> Result<serde_json::Value> {
         self.send(&PipeRequest::TerminateProcess { pid, confirmed })
     }

@@ -159,6 +159,13 @@ pub struct Alert {
     pub acknowledged: bool,
     pub occurrence_count: u32,
     pub resolved_at_ms: Option<i64>,
+    /// Presentation-only archive flag: clients hide archived findings from
+    /// their default surfaces, but detector semantics are untouched — an
+    /// archived active finding keeps updating and resolving normally.
+    /// Absent in alerts persisted by pre-archive services; the default
+    /// keeps old JSON deserializing and the protocol version is unchanged.
+    #[serde(default)]
+    pub archived: bool,
 }
 
 /// One ACPI thermal zone reading, converted from decikelvin to Celsius.
@@ -633,6 +640,13 @@ pub enum PipeRequest {
     AcknowledgeAlert {
         alert_id: String,
     },
+    /// Set or clear an alert's presentation-only archive flag; `archived:
+    /// false` recovers a previously archived finding. Validation mirrors
+    /// `acknowledgeAlert` exactly.
+    ArchiveAlert {
+        alert_id: String,
+        archived: bool,
+    },
     TerminateProcess {
         pid: u32,
         confirmed: bool,
@@ -755,6 +769,69 @@ mod tests {
         }
         let restored: LiveSample = serde_json::from_str(&json).unwrap();
         assert_eq!(restored, sample);
+    }
+
+    #[test]
+    fn alert_without_archived_field_still_deserializes() {
+        // An alert persisted (or served) by a pre-archive service has no
+        // `archived` key; it must parse as unarchived, and the flag must
+        // ride the wire in camelCase for current alerts.
+        let alert = Alert {
+            id: "a-1".into(),
+            kind: "sustainedCpu".into(),
+            severity: Severity::Warning,
+            first_seen_ms: 1,
+            last_seen_ms: 2,
+            process_id: None,
+            process_name: None,
+            title: "t".into(),
+            explanation: "e".into(),
+            evidence: Vec::new(),
+            recommendation: "r".into(),
+            acknowledged: false,
+            occurrence_count: 1,
+            resolved_at_ms: None,
+            archived: true,
+        };
+        let mut old = serde_json::to_value(&alert).unwrap();
+        assert!(
+            old.as_object_mut().unwrap().remove("archived").is_some(),
+            "wire name"
+        );
+        let restored: Alert = serde_json::from_value(old).unwrap();
+        assert!(!restored.archived);
+        assert!(serde_json::to_string(&alert).unwrap().contains("\"archived\":true"));
+    }
+
+    #[test]
+    fn archive_command_round_trips_on_the_same_wire_shape_as_acknowledge() {
+        // Field spelling must match acknowledgeAlert exactly: the container
+        // rename_all camelCases the command tag, and struct-variant fields
+        // keep the same convention acknowledge already ships.
+        let acknowledge = serde_json::to_string(&PipeRequest::AcknowledgeAlert {
+            alert_id: "finding-1".into(),
+        })
+        .unwrap();
+        let archive = serde_json::to_string(&PipeRequest::ArchiveAlert {
+            alert_id: "finding-1".into(),
+            archived: true,
+        })
+        .unwrap();
+        assert!(archive.contains(r#""command":"archiveAlert""#));
+        let field = if acknowledge.contains("\"alertId\"") {
+            "\"alertId\""
+        } else {
+            "\"alert_id\""
+        };
+        assert!(archive.contains(field), "field convention must match: {archive}");
+        let request: PipeRequest = serde_json::from_str(&archive).unwrap();
+        match request {
+            PipeRequest::ArchiveAlert { alert_id, archived } => {
+                assert_eq!(alert_id, "finding-1");
+                assert!(archived);
+            }
+            other => panic!("unexpected parse: {other:?}"),
+        }
     }
 
     #[test]

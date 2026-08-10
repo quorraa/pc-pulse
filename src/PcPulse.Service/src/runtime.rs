@@ -204,6 +204,28 @@ impl AppState {
                 }
                 Ok(json!({ "acknowledged": persisted }))
             }
+            PipeRequest::ArchiveAlert { alert_id, archived } => {
+                let active = self
+                    .alerts
+                    .lock()
+                    .map_err(|_| anyhow!("alert lock poisoned"))?
+                    .set_archived(&alert_id, archived);
+                let persisted = self.storage.archive_alert(&alert_id, archived)?;
+                if let Some(alert) = active {
+                    let mut snapshot = self
+                        .snapshot
+                        .write()
+                        .map_err(|_| anyhow!("snapshot lock poisoned"))?;
+                    if let Some(item) = snapshot
+                        .active_alerts
+                        .iter_mut()
+                        .find(|item| item.id == alert_id)
+                    {
+                        *item = alert;
+                    }
+                }
+                Ok(json!({ "archived": persisted }))
+            }
             PipeRequest::TerminateProcess { pid, confirmed } => {
                 crate::metrics::terminate_process(pid, confirmed)?;
                 Ok(json!({ "terminated": true, "pid": pid }))
@@ -586,6 +608,63 @@ mod tests {
             PipeResponse::Error { code, message } => {
                 panic!("live must answer ok on a current service: {code} {message}")
             }
+        }
+    }
+
+    #[test]
+    fn archive_command_persists_the_flag_over_the_pipe_contract() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = test_state(&directory);
+        let alert = crate::models::Alert {
+            id: "finding-1".into(),
+            kind: "sustainedCpu".into(),
+            severity: crate::models::Severity::Warning,
+            first_seen_ms: 100,
+            last_seen_ms: 200,
+            process_id: Some(42),
+            process_name: Some("worker.exe".into()),
+            title: "Sustained CPU usage".into(),
+            explanation: "test".into(),
+            evidence: Vec::new(),
+            recommendation: "test".into(),
+            acknowledged: false,
+            occurrence_count: 1,
+            resolved_at_ms: None,
+            archived: false,
+        };
+        state.storage.upsert_alerts(&[alert]).unwrap();
+
+        // Mirror the pipe path exactly: serialize the wire command the way a
+        // client does, parse it back, dispatch it.
+        let wire = serde_json::to_string(&PipeRequest::ArchiveAlert {
+            alert_id: "finding-1".into(),
+            archived: true,
+        })
+        .unwrap();
+        let request: PipeRequest = serde_json::from_str(&wire).unwrap();
+        match state.handle(request) {
+            PipeResponse::Ok { data } => assert_eq!(data["archived"], true),
+            PipeResponse::Error { code, message } => panic!("archive failed: {code} {message}"),
+        }
+        assert!(state.storage.alerts(0, 10).unwrap()[0].archived);
+
+        // Recovery is the same command with archived=false; an unknown id
+        // answers ok with archived=false, exactly like acknowledge.
+        let recover = PipeRequest::ArchiveAlert {
+            alert_id: "finding-1".into(),
+            archived: false,
+        };
+        match state.handle(recover) {
+            PipeResponse::Ok { data } => assert_eq!(data["archived"], true),
+            PipeResponse::Error { code, message } => panic!("recover failed: {code} {message}"),
+        }
+        assert!(!state.storage.alerts(0, 10).unwrap()[0].archived);
+        match state.handle(PipeRequest::ArchiveAlert {
+            alert_id: "unknown".into(),
+            archived: true,
+        }) {
+            PipeResponse::Ok { data } => assert_eq!(data["archived"], false),
+            PipeResponse::Error { code, message } => panic!("unknown id errored: {code} {message}"),
         }
     }
 

@@ -215,7 +215,11 @@ fn poll_alerts(window: HWND, stopping: Arc<AtomicBool>) {
                     for alert in snapshot
                         .active_alerts
                         .iter()
-                        .filter(|alert| !alert.acknowledged && !seen.contains(&alert.id))
+                        // Acknowledged and archived findings are both
+                        // deliberate user decisions; neither pops a balloon.
+                        .filter(|alert| {
+                            !alert.acknowledged && !alert.archived && !seen.contains(&alert.id)
+                        })
                     {
                         notify_alert(window, alert);
                     }

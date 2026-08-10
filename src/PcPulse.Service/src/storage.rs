@@ -67,6 +67,13 @@ impl Storage {
              CREATE INDEX IF NOT EXISTS idx_optimization_plan_time
                ON optimization_plans(generated_at_ms DESC);",
         )?;
+        // Databases created before the archive feature lack the column; the
+        // flag itself also rides in the alert payload (like `acknowledged`),
+        // so the column and JSON stay in step.
+        add_column_if_missing(
+            &connection,
+            "ALTER TABLE alerts ADD COLUMN archived INTEGER NOT NULL DEFAULT 0",
+        )?;
         Ok(Self {
             connection: Mutex::new(connection),
         })
@@ -130,10 +137,11 @@ impl Storage {
         let transaction = connection.transaction()?;
         {
             let mut statement = transaction.prepare_cached(
-                "INSERT INTO alerts(id, first_seen_ms, last_seen_ms, resolved_at_ms, payload)
-                 VALUES (?1, ?2, ?3, ?4, ?5)
+                "INSERT INTO alerts(id, first_seen_ms, last_seen_ms, resolved_at_ms, archived, payload)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
                  ON CONFLICT(id) DO UPDATE SET last_seen_ms=excluded.last_seen_ms,
-                   resolved_at_ms=excluded.resolved_at_ms, payload=excluded.payload",
+                   resolved_at_ms=excluded.resolved_at_ms, archived=excluded.archived,
+                   payload=excluded.payload",
             )?;
             for alert in alerts {
                 statement.execute(params![
@@ -141,6 +149,7 @@ impl Storage {
                     alert.first_seen_ms,
                     alert.last_seen_ms,
                     alert.resolved_at_ms,
+                    alert.archived,
                     serde_json::to_string(alert)?
                 ])?;
             }
@@ -199,6 +208,31 @@ impl Storage {
         connection.execute(
             "UPDATE alerts SET payload=?2 WHERE id=?1",
             params![id, serde_json::to_string(&alert)?],
+        )?;
+        Ok(true)
+    }
+
+    /// Set or clear an alert's presentation-only archive flag. Mirrors
+    /// [`Self::acknowledge_alert`]: the flag lives in the JSON payload, and
+    /// the `archived` column is kept in step for the same row.
+    pub fn archive_alert(&self, id: &str, archived: bool) -> Result<bool> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow::anyhow!("database lock poisoned"))?;
+        let payload: Option<String> = connection
+            .query_row("SELECT payload FROM alerts WHERE id=?1", [id], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        let Some(payload) = payload else {
+            return Ok(false);
+        };
+        let mut alert: Alert = serde_json::from_str(&payload)?;
+        alert.archived = archived;
+        connection.execute(
+            "UPDATE alerts SET archived=?2, payload=?3 WHERE id=?1",
+            params![id, archived, serde_json::to_string(&alert)?],
         )?;
         Ok(true)
     }
@@ -396,6 +430,16 @@ impl Storage {
     }
 }
 
+/// Run an `ALTER TABLE … ADD COLUMN` migration, tolerating a database that
+/// already has the column (SQLite reports it as a duplicate-column error).
+fn add_column_if_missing(connection: &Connection, sql: &str) -> Result<()> {
+    match connection.execute(sql, []) {
+        Ok(_) => Ok(()),
+        Err(error) if error.to_string().contains("duplicate column name") => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
 fn query_json_rows<T: serde::de::DeserializeOwned>(
     connection: &Connection,
     sql: &str,
@@ -468,6 +512,7 @@ mod tests {
             acknowledged: false,
             occurrence_count: 1,
             resolved_at_ms: None,
+            archived: false,
         };
         storage.upsert_alerts(&[alert]).unwrap();
 
@@ -475,6 +520,86 @@ mod tests {
         let alerts = storage.alerts(0, 10).unwrap();
         assert_eq!(alerts[0].resolved_at_ms, Some(300));
         assert_eq!(storage.resolve_open_alerts(400).unwrap(), 0);
+    }
+
+    fn stored_alert(id: &str) -> Alert {
+        Alert {
+            id: id.into(),
+            kind: "sustainedCpu".into(),
+            severity: crate::models::Severity::Warning,
+            first_seen_ms: 100,
+            last_seen_ms: 200,
+            process_id: Some(42),
+            process_name: Some("worker.exe".into()),
+            title: "Sustained CPU usage".into(),
+            explanation: "test".into(),
+            evidence: Vec::new(),
+            recommendation: "test".into(),
+            acknowledged: false,
+            occurrence_count: 1,
+            resolved_at_ms: None,
+            archived: false,
+        }
+    }
+
+    #[test]
+    fn archive_flag_round_trips_and_recovers() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = Storage::open(&directory.path().join("history.db")).unwrap();
+        storage.upsert_alerts(&[stored_alert("finding-1")]).unwrap();
+
+        assert!(!storage.archive_alert("unknown", true).unwrap());
+        assert!(storage.archive_alert("finding-1", true).unwrap());
+        let alerts = storage.alerts(0, 10).unwrap();
+        assert!(alerts[0].archived, "payload must carry the flag");
+
+        // Recovery is the same command with archived=false.
+        assert!(storage.archive_alert("finding-1", false).unwrap());
+        assert!(!storage.alerts(0, 10).unwrap()[0].archived);
+    }
+
+    #[test]
+    fn archive_flag_survives_resolution_and_reopen() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("history.db");
+        {
+            let storage = Storage::open(&path).unwrap();
+            storage.upsert_alerts(&[stored_alert("finding-1")]).unwrap();
+            assert!(storage.archive_alert("finding-1", true).unwrap());
+            assert_eq!(storage.resolve_open_alerts(300).unwrap(), 1);
+        }
+        // Reopening runs the tolerant migration against a database that
+        // already has the column, and the persisted flag is intact.
+        let storage = Storage::open(&path).unwrap();
+        let alerts = storage.alerts(0, 10).unwrap();
+        assert!(alerts[0].archived);
+        assert_eq!(alerts[0].resolved_at_ms, Some(300));
+    }
+
+    #[test]
+    fn pre_archive_alert_payload_reads_as_unarchived() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = Storage::open(&directory.path().join("history.db")).unwrap();
+        // Simulate a row persisted by a pre-archive service: no `archived`
+        // key in the JSON payload.
+        let mut payload = serde_json::to_value(stored_alert("old-alert")).unwrap();
+        payload.as_object_mut().unwrap().remove("archived");
+        {
+            let connection = storage.connection.lock().unwrap();
+            connection
+                .execute(
+                    "INSERT INTO alerts(id, first_seen_ms, last_seen_ms, resolved_at_ms, payload)
+                     VALUES ('old-alert', 100, 200, NULL, ?1)",
+                    [serde_json::to_string(&payload).unwrap()],
+                )
+                .unwrap();
+        }
+        let alerts = storage.alerts(0, 10).unwrap();
+        assert_eq!(alerts.len(), 1);
+        assert!(!alerts[0].archived);
+        // And the old row can still be archived in place.
+        assert!(storage.archive_alert("old-alert", true).unwrap());
+        assert!(storage.alerts(0, 10).unwrap()[0].archived);
     }
 
     #[test]

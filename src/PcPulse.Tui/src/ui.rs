@@ -1,8 +1,8 @@
 use crate::{
     analyzer::ChatRole,
     app::{
-        AlertSort, App, InputMode, Page, ProcessSort, SettingField, SettingSort, SuspectSort,
-        TreeSort,
+        AlertSort, AlertView, App, InputMode, Page, ProcessSort, SettingField, SettingSort,
+        SuspectSort, TreeSort,
     },
     format,
     theme::{self, LayoutKind, palette},
@@ -1145,7 +1145,7 @@ fn rail_input_line(app: &App) -> Line<'static> {
                 Page::Overview => "2 hunt · 4 inc",
                 Page::Processes => "/ o g x",
                 Page::Tree => "j/k r x",
-                Page::Alerts => "j/k a i r",
+                Page::Alerts => "j/k a z v i r",
                 Page::Timeline => "[ ] r",
                 Page::Analyzer => "↵ ask e n h y",
                 Page::Settings => "↵ edit s",
@@ -3977,7 +3977,16 @@ fn render_alerts(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             .bottom_margin(1),
         )
         .block(accent_panel(
-            " ⚑ FINDING ARCHIVE · click headers to sort · a acknowledge ",
+            // The " · archived" suffix is the filter lamp: it tells the
+            // operator which list `v` currently shows.
+            match app.alert_view {
+                AlertView::Current => {
+                    " ⚑ FINDING ARCHIVE · click headers to sort · a acknowledge · z archive "
+                }
+                AlertView::Archived => {
+                    " ⚑ FINDING ARCHIVE · z recover · v back · archived "
+                }
+            },
             palette().warn,
         ))
         .row_highlight_style(row_highlight_style())
@@ -4005,14 +4014,22 @@ fn render_alert_detail(frame: &mut Frame<'_>, alert: Option<&Alert>, area: Rect)
         detail_line("Severity", format!("{:?}", alert.severity)),
         detail_line(
             "State",
-            if alert.resolved_at_ms.is_some() {
-                "resolved"
-            } else if alert.acknowledged {
-                "acknowledged"
-            } else {
-                "active"
-            }
-            .into(),
+            {
+                let lifecycle = if alert.resolved_at_ms.is_some() {
+                    "resolved"
+                } else if alert.acknowledged {
+                    "acknowledged"
+                } else {
+                    "active"
+                };
+                // Archive is orthogonal to lifecycle: an archived finding can
+                // still be active and updating.
+                if alert.archived {
+                    format!("{lifecycle} · archived")
+                } else {
+                    lifecycle.into()
+                }
+            },
         ),
         detail_line(
             "Owner",
@@ -5700,12 +5717,14 @@ const HELP_GLOBAL: [(&str, &str); 11] = [
     ("q / Ctrl-C", "quit"),
     ("?", "keys overlay on any page"),
 ];
-const HELP_CONTEXTUAL: [(&str, &str); 20] = [
+const HELP_CONTEXTUAL: [(&str, &str); 22] = [
     ("/", "filter name / path / PID"),
     ("o", "cycle process sort"),
     ("g", "agent-only process focus"),
     ("x", "typed-PID termination request"),
     ("a", "acknowledge finding"),
+    ("z", "archive finding; in the archived view, recover it"),
+    ("v", "cycle findings view (current / archived)"),
     ("i", "investigate the selected finding in Oracle"),
     ("[ / ]", "shorter / longer timeline"),
     ("Enter on Oracle", "ask the systems analyzer"),
@@ -5897,7 +5916,9 @@ fn page_hints(page: Page) -> &'static str {
         Page::Overview => "2 hunt  ·  4 incidents  ·  r sample",
         Page::Processes => "/ query  ·  o rank  ·  g agents  ·  x terminate",
         Page::Tree => "j/k trace  ·  r rebuild  ·  x terminate",
-        Page::Alerts => "j/k inspect  ·  a acknowledge  ·  i investigate  ·  r refresh",
+        Page::Alerts => {
+            "j/k inspect  ·  a acknowledge  ·  z archive  ·  v view  ·  i investigate  ·  r refresh"
+        }
         Page::Timeline => "[ ] window  ·  r reload",
         Page::Analyzer => {
             "Enter ask  ·  e edit last  ·  n new  ·  h vault (r rename · d delete)  ·  y copy  ·  [ ] evidence"
@@ -8049,6 +8070,7 @@ mod tests {
             acknowledged: false,
             occurrence_count: 1,
             resolved_at_ms: None,
+            archived: false,
         }
     }
 
@@ -8115,6 +8137,33 @@ mod tests {
                 .iter()
                 .any(|cell| cell.fg == palette().crit)
         );
+    }
+
+    #[test]
+    fn findings_page_hides_archived_by_default_and_v_flips_the_view() {
+        let _theme = theme::test_support::activate(theme::ThemeId::Vitals);
+        let mut app = sample_app();
+        app.page = Page::Alerts;
+        let mut filed = sample_alert("memoryGrowth", Severity::Warning);
+        filed.title = "Filed-away growth".into();
+        filed.archived = true;
+        app.alerts = vec![sample_alert("sustainedCpu", Severity::Critical), filed];
+        app.alert_state.select(Some(0));
+
+        let text = buffer_text(render(&mut app).buffer());
+        assert!(text.contains("Sustained pressure"));
+        assert!(!text.contains("Filed-away growth"), "default view hides archived");
+        assert!(text.contains("z archive"), "panel title advertises z");
+        assert!(text.contains("v view"), "footer advertises the view cycle");
+
+        app.cycle_alert_view();
+        let text = buffer_text(render(&mut app).buffer());
+        assert!(text.contains("Filed-away growth"));
+        assert!(!text.contains("Sustained pressure"), "archive view shows only archived");
+        assert!(text.contains("· archived"), "panel title carries the filter lamp");
+        assert!(text.contains("z recover"));
+        // The evidence pane states the orthogonal lifecycle · archive state.
+        assert!(text.contains("active · archived"));
     }
 
     fn sample_app() -> App {

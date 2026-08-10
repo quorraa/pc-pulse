@@ -75,6 +75,8 @@ Important keys:
 | `g` | Toggle agent-only process focus |
 | `x` | Begin a manual termination request; exact PID entry is required |
 | `a` | Acknowledge the selected finding |
+| `z` | Archive the selected finding — it leaves the default list, lamps, and tapes but keeps detecting; in the archived view, `z` recovers it |
+| `v` | Cycle the Findings view: current (active + resolved) / archived only |
 | `i` | Investigate the selected finding in Oracle — a new chat opens and the composed question is submitted with the finding's evidence; double-clicking the finding row does the same |
 | `[` / `]` | Shorten or lengthen the persisted timeline |
 | `Enter` or `/` on Oracle | Ask the embedded systems analyzer |

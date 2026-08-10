@@ -39,6 +39,11 @@ pub fn build_agent_context(source: AgentContextSource<'_>) -> AgentContext {
     let system_rollup = rollup_system(&history);
     let process_suspects = rollup_processes(&history.processes, snapshot, settings);
     let diagnostic_log_rollups = rollup_logs(logs);
+    // Archived findings are deliberately kept out of the evidence bundle —
+    // the user has filed them away, so they must stop reaching the analyzer
+    // as noise. Investigating one explicitly still works: the client injects
+    // the focused finding into the bundle itself.
+    alerts.retain(|alert| !alert.archived);
     alerts.truncate(MAX_RECENT_ALERTS);
     let effective_history_from_ms = history
         .system
@@ -48,6 +53,7 @@ pub fn build_agent_context(source: AgentContextSource<'_>) -> AgentContext {
         .chain(history.processes.first().map(|sample| sample.timestamp_ms))
         .min();
     let mut current = snapshot.clone();
+    current.active_alerts.retain(|alert| !alert.archived);
     current.processes = compact_current_processes(&current.processes, &alerts, settings);
     for process in &mut current.processes {
         process.executable_path = redact_user_profile(&process.executable_path);
@@ -464,6 +470,62 @@ mod tests {
         assert_eq!(grouped.len(), 1);
         assert_eq!(grouped[0].count, 2);
         assert_eq!(grouped[0].last_seen_ms, 200);
+    }
+
+    #[test]
+    fn archived_findings_are_excluded_from_the_evidence_bundle() {
+        use crate::models::{Alert, DiagnosticLogStatus, HistoryResponse, Severity};
+        let alert = |id: &str, archived: bool| Alert {
+            id: id.into(),
+            kind: "sustainedCpu".into(),
+            severity: Severity::Warning,
+            first_seen_ms: 1,
+            last_seen_ms: 2,
+            process_id: None,
+            process_name: None,
+            title: "t".into(),
+            explanation: "e".into(),
+            evidence: Vec::new(),
+            recommendation: "r".into(),
+            acknowledged: false,
+            occurrence_count: 1,
+            resolved_at_ms: None,
+            archived,
+        };
+        let snapshot = Snapshot {
+            active_alerts: vec![alert("live", false), alert("filed", true)],
+            ..Snapshot::default()
+        };
+        let context = build_agent_context(AgentContextSource {
+            now_ms: 1_000,
+            window_hours: 1,
+            snapshot: &snapshot,
+            settings: &Settings::default(),
+            history: HistoryResponse {
+                system: Vec::new(),
+                processes: Vec::new(),
+            },
+            logs: Vec::new(),
+            log_status: DiagnosticLogStatus::default(),
+            alerts: vec![alert("recent", false), alert("recent-filed", true)],
+        });
+        assert_eq!(
+            context
+                .recent_alerts
+                .iter()
+                .map(|alert| alert.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["recent"]
+        );
+        assert_eq!(
+            context
+                .current
+                .active_alerts
+                .iter()
+                .map(|alert| alert.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["live"]
+        );
     }
 
     #[test]

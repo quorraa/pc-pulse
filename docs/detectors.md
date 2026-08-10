@@ -24,6 +24,10 @@ Collector self-monitoring treats absolute budgets and growth as different condit
 
 A collector restart closes persisted open findings because monitoring continuity was interrupted. Conditions that remain present must satisfy their sustained streak again after restart.
 
+## Archived findings
+
+Findings can be archived (and recovered) from the client. The flag is presentation-only and orthogonal to the lifecycle above: an archived active finding keeps updating, keeps its streak, and resolves exactly as if it were not archived — nothing about detection, forensics, or attribution changes. Clients hide archived findings from their default list, lamps, tapes, and notices, and the agent-context evidence bundle excludes them so filed-away noise stops reaching the analyzer; explicitly investigating an archived finding still injects it into the bundle.
+
 ## Leak forensics
 
 While a handle-growth or thread-growth finding is active — for any process — the collector attaches two extra evidence captures to it:
