@@ -1223,6 +1223,18 @@ impl InterruptSource for WindowsInterruptSource {
     fn capture(&mut self, window_ms: u32, event_cap: u64) -> Result<InterruptCapture> {
         let mut session = SystemLoggerSession::start()?;
         self.sessions_started += 1;
+        // Field report (v1.9.0): three fast-phase captures left ~30 MB of
+        // heap residue from ETW consumer processing and tripped the
+        // collector's 25 MB budget — the same disease the forensics
+        // captures had in v1.7.1. Trim the working set on every exit path
+        // once a session has actually run.
+        struct TrimGuard;
+        impl Drop for TrimGuard {
+            fn drop(&mut self) {
+                crate::metrics::forensics::trim_working_set();
+            }
+        }
+        let _trim = TrimGuard;
         let state = Arc::new(CaptureState {
             cap: event_cap,
             processed: AtomicU64::new(0),

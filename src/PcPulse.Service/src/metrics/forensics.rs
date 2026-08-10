@@ -487,7 +487,7 @@ impl Drop for PageBuffer {
 /// buffers, soft page-ins accumulated while walking a ~16 MB table linger
 /// in the working set, and the collector budgets itself at 25 MB. Pages
 /// still in use fault back in cheaply.
-fn trim_working_set() {
+pub(crate) fn trim_working_set() {
     unsafe {
         let _ = K32EmptyWorkingSet(GetCurrentProcess());
     }
