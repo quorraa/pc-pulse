@@ -331,9 +331,11 @@ fn sampling_loop(state: &Arc<AppState>, stop: crossbeam_channel::Receiver<()>) -
     // Leak forensics is a strict no-op (zero syscalls) until a handle- or
     // thread-growth finding is active; then it captures at most once a minute.
     let mut forensics = ForensicsEngine::new(WindowsForensicsSource::default());
-    // ISR/DPC attribution is likewise a strict no-op until a dpcInterrupt
-    // finding is active; then it runs one bounded kernel trace when the
-    // finding fires and re-captures at most every ten minutes.
+    // ISR/DPC attribution is likewise a strict no-op (its per-sample
+    // activity ring is pure memory work) until a dpcInterrupt finding is
+    // active; then it runs one bounded kernel trace when the finding fires,
+    // re-captures on a two-minute cadence until it holds three successful
+    // traces, and backs off to every ten minutes.
     let mut interrupts = InterruptEngine::new(WindowsInterruptSource::default());
     let mut event_logs = EventLogCollector::default();
     let mut next_system_write = Instant::now();
@@ -370,6 +372,16 @@ fn sampling_loop(state: &Arc<AppState>, stop: crossbeam_channel::Receiver<()>) -
         forensics.observe(&evaluation.active, timestamp_ms);
         forensics.decorate(&mut evaluation.active);
         forensics.decorate(&mut evaluation.changed);
+        // The correlation window rides on every sample: system rates plus
+        // the freshest GPU utilization the hardware sampler produced.
+        let gpu_utilization = hardware
+            .gpus
+            .iter()
+            .filter_map(|gpu| gpu.utilization_percent)
+            .fold(None, |best: Option<f64>, value| {
+                Some(best.map_or(value, |current| current.max(value)))
+            });
+        interrupts.record_activity(&system, gpu_utilization);
         interrupts.observe(&evaluation.active, timestamp_ms);
         interrupts.decorate(&mut evaluation.active);
         interrupts.decorate(&mut evaluation.changed);

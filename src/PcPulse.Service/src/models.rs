@@ -10,6 +10,12 @@ pub struct SystemMetric {
     pub disk_latency_ms: f64,
     pub disk_read_bytes_per_sec: f64,
     pub disk_write_bytes_per_sec: f64,
+    /// `\Network Interface(*)\Bytes Total/sec` summed across instances.
+    /// Absent in snapshots persisted by services older than the interrupt
+    /// root-cause monitor; the default keeps old JSON deserializing and the
+    /// protocol version is unchanged.
+    #[serde(default)]
+    pub network_bytes_per_sec: f64,
     pub paged_pool_bytes: u64,
     pub nonpaged_pool_bytes: u64,
     pub dpc_rate: f64,
@@ -35,6 +41,7 @@ impl Default for SystemMetric {
             disk_latency_ms: 0.0,
             disk_read_bytes_per_sec: 0.0,
             disk_write_bytes_per_sec: 0.0,
+            network_bytes_per_sec: 0.0,
             paged_pool_bytes: 0,
             nonpaged_pool_bytes: 0,
             dpc_rate: 0.0,
@@ -648,6 +655,24 @@ mod tests {
         assert!(snapshot.hardware.thermal_zones.is_empty());
         assert!(snapshot.hardware.gpus.is_empty());
         assert!(!snapshot.hardware.detail.is_empty());
+    }
+
+    #[test]
+    fn system_metric_without_network_counter_still_deserializes() {
+        // A system sample persisted before the network counter existed has no
+        // `networkBytesPerSec` key; it must parse to an honest zero, and the
+        // new field must ride the wire in camelCase.
+        let mut old = serde_json::to_value(SystemMetric::default()).unwrap();
+        let map = old.as_object_mut().unwrap();
+        assert!(map.remove("networkBytesPerSec").is_some(), "wire name");
+        let restored: SystemMetric = serde_json::from_value(old).unwrap();
+        assert_eq!(restored.network_bytes_per_sec, 0.0);
+        let json = serde_json::to_string(&SystemMetric {
+            network_bytes_per_sec: 1_500_000.0,
+            ..SystemMetric::default()
+        })
+        .unwrap();
+        assert!(json.contains("\"networkBytesPerSec\":1500000.0"));
     }
 
     fn plan() -> OptimizationPlan {

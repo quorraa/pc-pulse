@@ -2557,6 +2557,16 @@ fn render_system_vector(frame: &mut Frame<'_>, app: &App, area: Rect) {
             format::rate(io),
             meter_width,
         ),
+        // Network has no detector threshold of its own; the I/O rate limit
+        // is the panel's reference scale so the NET meter reads in the same
+        // threshold-relative grammar as the I/O row above it.
+        vector_line(
+            "NET",
+            system.network_bytes_per_sec
+                / (app.settings.io_mb_per_sec.max(1.0) * 1024.0 * 1024.0),
+            format::rate(system.network_bytes_per_sec),
+            meter_width,
+        ),
         vector_line(
             "DPC",
             system.dpc_rate / app.settings.dpc_rate.max(1.0),
@@ -5692,6 +5702,26 @@ mod tests {
     }
 
     #[test]
+    fn system_vector_carries_a_net_row_in_io_grammar() {
+        let _theme = theme::test_support::activate(theme::ThemeId::Vitals);
+        let mut app = sample_app();
+        let backend = render(&mut app);
+        let text = buffer_text(backend.buffer());
+        // The NET row sits with the other meters and renders its rate in the
+        // same format grammar as the I/O row.
+        assert!(text.contains(" NET"), "NET row missing from the System Vector");
+        assert!(text.contains("2.50 MB/s"), "network rate missing: {text}");
+        // Old services report no network counter; the row stays honest at
+        // zero instead of disappearing.
+        if let Some(snapshot) = app.snapshot.as_mut() {
+            snapshot.system.network_bytes_per_sec = 0.0;
+        }
+        let text = buffer_text(render(&mut app).buffer());
+        assert!(text.contains(" NET"));
+        assert!(text.contains("0 B/s"));
+    }
+
+    #[test]
     fn suspect_heat_prioritizes_the_active_agent() {
         let app = sample_app();
         let active = &app.snapshot.as_ref().expect("snapshot").processes[0];
@@ -7188,6 +7218,7 @@ mod tests {
             disk_latency_ms: 1.8,
             disk_read_bytes_per_sec: 12.0 * 1024.0 * 1024.0,
             disk_write_bytes_per_sec: 3.0 * 1024.0 * 1024.0,
+            network_bytes_per_sec: 2.5 * 1024.0 * 1024.0,
             paged_pool_bytes: 2 * 1024 * 1024 * 1024,
             nonpaged_pool_bytes: 4 * 1024 * 1024 * 1024,
             dpc_rate: 44.0,

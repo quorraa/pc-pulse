@@ -37,19 +37,42 @@ Privacy boundary: forensics records kernel object type names and module base fil
 
 ## Interrupt attribution
 
-While a `dpcInterrupt` finding is active, the collector answers the question the PDH counters cannot: *which driver* is doing the interrupt work. It captures a short Windows kernel trace and attaches three evidence rows to the finding:
+While a `dpcInterrupt` finding is active, the collector answers the question the PDH counters cannot: *which driver* is doing the interrupt work — and, across repeated traces, *which device class* is the most likely root cause. It captures short Windows kernel traces and attaches these evidence rows to the finding:
 
-- `ISR/DPC attribution :: storport.sys 41% · ndis.sys 27% · nvlddmkm.sys 12%` — every interrupt service routine and DPC routine address in the trace, bucketed at 64 KiB granularity and mapped to the loaded kernel driver whose base address is nearest at-or-below (`EnumDeviceDrivers`); addresses below every driver base are `unattributed`.
-- `Top driver :: storport.sys — Microsoft Storage Port Driver` — the leading driver enriched with its version-resource description (or company name).
+- `Likely cause :: nvlddmkm.sys — NVIDIA Windows Kernel Mode Driver [gpu]` — the modal top driver across the finding's capture history, enriched with its version-resource description and mapped to a device class (storage, network, gpu, usb, audio, platform, other) by a keyword table over the driver name and description/company strings.
+- `Confidence :: high — top in 4/4 traces · 58% mean share` — the verdict tier from the rubric below, with the consistency and dominance figures behind it.
+- `Correlation :: gpu activity r=0.81 over 5 m` — the strongest Pearson correlation between the kernel-rate series and the class-matched activity series, or `insufficient signal` when the guards say r would be meaningless.
+- `ISR/DPC attribution :: storport.sys 41% · ndis.sys 27% · nvlddmkm.sys 12%` — every interrupt service routine and DPC routine address in the latest trace, bucketed at 64 KiB granularity and mapped to the loaded kernel driver whose base address is nearest at-or-below (`EnumDeviceDrivers`); addresses below every driver base are `unattributed`.
+- `Top driver :: storport.sys — Microsoft Storage Port Driver` — the latest trace's leading driver enriched with its version-resource description (or company name).
 - `Trace window :: 8 s · 214k events` — the actual span and decoded event count, with `(capped)` when the storm guard ended the capture early.
+
+When a class is identified, the finding's recommendation gains one class-specific sentence (e.g. "Update or roll back the storage driver first."); the `other` class appends nothing.
+
+Repeated tracing and adaptive cadence:
+
+- One capture when the finding fires, then re-captures at **two-minute spacing until the finding holds three successful captures**, then backed off to **once every ten minutes** while it stays active. A failed capture always arms the full ten-minute cooldown, so a denied session is not retried every two minutes. A finding that fires anew starts its own fast phase.
+- Each finding keeps a bounded ring of its **last eight successful attributions** (timestamp, per-driver shares, event totals, storm-cap flag). Zero-event and undecodable traces never enter the history.
+
+Correlation basis:
+
+- The runtime feeds the engine a rolling **five-minute window** of the two-second system samples: interrupt rate, DPC rate, disk read+write bytes/s, disk latency, summed network bytes/s (`\Network Interface(*)\Bytes Total/sec`), and the freshest GPU utilization from the hardware sampler when available.
+- Pearson r is computed between each kernel-rate series (interrupt rate and DPC rate) and every activity series matched to the verdict's class — storage → disk read+write bytes/s and disk latency; network → network bytes/s; gpu → GPU utilization — and the strongest |r| is reported. usb, audio, platform, and other have no honest activity series and never pretend to correlate.
+- Guards: at least **60 aligned samples** and a variance floor on **both** series (standard deviation above 1% of the series' own mean magnitude, with an absolute epsilon for flat series). Anything short of that is reported as `insufficient signal` — r over a near-constant series is numerically defined but meaningless. When NVML reports no GPU utilization, gpu correlation is skipped honestly rather than imputing zeros.
+
+Confidence rubric (verbatim from the implementation):
+
+- **Consistency** is the number of captures where the same driver is top; **dominance** is that driver's mean share and its mean margin over the runner-up; **correlation** is the best class-matched r.
+- **HIGH**: the top driver is consistent in ≥ 3 captures with ≥ 45% mean share AND (matching-class correlation r ≥ 0.6 OR dominance margin ≥ 25 points).
+- **MEDIUM**: consistent top in ≥ 2 captures with ≥ 30% mean share, or a single capture with ≥ 60% share.
+- **LOW**: everything else with at least one successful capture.
+- **Never fabricated**: with zero successful captures the finding keeps only the honest degraded note — no verdict rows, no class sentence.
 
 Mechanics and budget:
 
 - **Session isolation.** The capture uses a dedicated short-lived system logger session (`PcPulseIsrDpc`, `EVENT_TRACE_SYSTEM_LOGGER_MODE`, Windows 10 1703+ allows eight concurrently) enabling only the ISR and DPC kernel flags. The collector's long-lived process-lifecycle ETW session is a separate session and is never touched.
-- **Trigger and cooldown.** One capture when the finding fires, then at most one every ten minutes while it stays active. A failed capture also starts the cooldown, so a denied session is not retried on every sample. With no `dpcInterrupt` finding active the engine performs no syscalls at all.
 - **Bounded window.** Eight seconds of wall time, consumed in real time on a below-normal-priority thread, with a 400,000-event storm guard that stops the capture early and says so in the evidence. The session is stopped and the trace handle closed deterministically on every path, including errors (balance counters assert this in the probe harness).
-- **Expected cost.** During a genuine interrupt storm the consumer processes a burst of very small callbacks — a real but brief CPU spike for up to eight seconds, at below-normal priority, at most once per ten minutes; sustained collector CPU stays far under the 0.2% budget. Metric sampling pauses for the capture window and resumes with the next sample. The bucket map is a few hundred entries at most; ETW buffer memory (≤ 768 KiB) is returned when the session stops.
-- **Degraded modes.** If the session cannot start — unelevated collector, pre-1703 Windows, policy, or system-logger exhaustion — the finding carries an honest `capture degraded: …` note instead of attribution, exactly like leak forensics. If events arrive but their layout cannot be decoded, the evidence says so rather than guessing.
+- **Expected cost.** During a genuine interrupt storm the consumer processes a burst of very small callbacks — a real but brief CPU spike for up to eight seconds, at below-normal priority, at most once per two minutes during the short fast phase and once per ten minutes after it; sustained collector CPU stays far under the 0.2% budget. Metric sampling pauses for the capture window and resumes with the next sample. The bucket map is a few hundred entries at most; ETW buffer memory (≤ 768 KiB) is returned when the session stops. The activity ring and capture histories are pure bounded memory; with no `dpcInterrupt` finding active the engine performs no syscalls at all.
+- **Degraded modes.** If the session cannot start — unelevated collector, pre-1703 Windows, policy, or system-logger exhaustion — the finding carries an honest `capture degraded: …` note instead of attribution, exactly like leak forensics. If events arrive but their layout cannot be decoded, the evidence says so rather than guessing. A failed re-capture keeps the verdict earned by earlier successful traces alongside the degraded note.
 
 Privacy boundary: interrupt attribution records driver base file names and version-resource company/description strings only — never routine addresses, process data, or memory content.
 

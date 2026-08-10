@@ -51,6 +51,7 @@ impl MetricCollector {
         system.disk_latency_ms = pdh.disk_latency_ms;
         system.dpc_rate = pdh.dpc_rate;
         system.interrupt_rate = pdh.interrupt_rate;
+        system.network_bytes_per_sec = pdh.network_bytes_per_sec;
         system.disk_read_bytes_per_sec = processes.iter().map(|p| p.read_bytes_per_sec).sum();
         system.disk_write_bytes_per_sec = processes.iter().map(|p| p.write_bytes_per_sec).sum();
         system.etw_events_per_sec = etw.events_per_sec;

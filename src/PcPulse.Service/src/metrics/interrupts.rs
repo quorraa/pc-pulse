@@ -1,4 +1,4 @@
-//! ISR/DPC driver attribution for active `dpcInterrupt` findings.
+//! ISR/DPC root-cause monitoring for active `dpcInterrupt` findings.
 //!
 //! The DPC/interrupt detector can say *that* kernel interrupt work is
 //! sustained, but not *whose* code is running. While the finding is active,
@@ -7,6 +7,15 @@
 //! service routine and DPC routine address, and maps the buckets to loaded
 //! kernel drivers so the finding's evidence can read
 //! `storport.sys 41% · ndis.sys 27% · nvlddmkm.sys 12%`.
+//!
+//! On top of single-trace attribution the engine runs a root-cause verdict:
+//! repeated traces across the life of a finding (adaptive cadence, bounded
+//! per-finding history), classification of the top driver into a device
+//! class, Pearson correlation between the interrupt/DPC rate series and the
+//! class-matched device-activity series from the sampling loop, and a
+//! `Likely cause` / `Confidence` / `Correlation` evidence triple driven by a
+//! pure, unit-tested rubric. With zero successful captures no verdict is
+//! ever fabricated — the finding keeps today's honest degraded note.
 //!
 //! Session discipline: the classic NT Kernel Logger is a singleton and the
 //! collector's process-lifecycle session in `crate::etw` must never be
@@ -17,8 +26,11 @@
 //! exactly like leak forensics.
 //!
 //! Budget discipline: the engine performs **zero syscalls** while no
-//! `dpcInterrupt` finding is active. While one is active it captures once
-//! when the finding fires and then at most every [`CAPTURE_COOLDOWN_MS`].
+//! `dpcInterrupt` finding is active ([`InterruptEngine::record_activity`] is
+//! pure memory work). While one is active it captures once when the finding
+//! fires, then at [`FAST_CAPTURE_SPACING_MS`] spacing until the finding has
+//! [`FAST_PHASE_CAPTURES`] successful captures, then backs off to
+//! [`CAPTURE_COOLDOWN_MS`]; a failed capture always arms the full cooldown.
 //! Each capture is bounded: [`CAPTURE_WINDOW_MS`] of wall time, an
 //! [`EVENT_CAP`]-event storm guard, a below-normal-priority consumer thread,
 //! and a deterministic `ControlTrace(STOP)` + `CloseTrace` on every path.
@@ -27,9 +39,9 @@
 //! version-resource description/company strings of the top driver are ever
 //! recorded — never routine addresses, process data, or memory content.
 
-use crate::models::{Alert, Evidence};
+use crate::models::{Alert, Evidence, SystemMetric};
 use anyhow::{Result, bail};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::c_void;
 use std::mem::size_of;
 use std::ptr;
@@ -61,10 +73,34 @@ use windows::{
     core::{GUID, PCWSTR, PWSTR},
 };
 
-/// Re-captures run at most this often while a `dpcInterrupt` finding stays
-/// active. Interrupt captures are heavier than handle tables, so the cooldown
-/// is ten minutes rather than the forensics minute.
+/// Backed-off re-capture spacing once a finding has enough successful
+/// captures, and the unconditional spacing after any failed capture.
+/// Interrupt captures are heavier than handle tables, so the cooldown is ten
+/// minutes rather than the forensics minute.
 pub const CAPTURE_COOLDOWN_MS: i64 = 10 * 60_000;
+/// Fast-phase spacing: while an active finding has fewer than
+/// [`FAST_PHASE_CAPTURES`] successful captures, re-captures run this often so
+/// the verdict rubric gets its repeated traces quickly.
+pub const FAST_CAPTURE_SPACING_MS: i64 = 2 * 60_000;
+/// Successful captures a finding needs before the cadence backs off from
+/// [`FAST_CAPTURE_SPACING_MS`] to [`CAPTURE_COOLDOWN_MS`].
+pub const FAST_PHASE_CAPTURES: usize = 3;
+/// Bounded per-finding capture history: the ring keeps the last this many
+/// successful attributions.
+pub const CAPTURE_HISTORY: usize = 8;
+/// Device-activity samples older than this fall off the correlation ring.
+pub const ACTIVITY_WINDOW_MS: i64 = 5 * 60_000;
+/// Hard cap on the activity ring for aggressive sample intervals.
+const ACTIVITY_RING_CAP: usize = 512;
+/// Pearson r over fewer aligned samples than this is noise, not signal.
+pub const MIN_CORRELATION_SAMPLES: usize = 60;
+/// Variance floor: a series' standard deviation must exceed this fraction of
+/// its mean magnitude (with an absolute epsilon for all-zero series) before
+/// a correlation against it means anything.
+const MIN_RELATIVE_SPREAD: f64 = 0.01;
+/// Correlation at or above this counts as class-matching evidence in the
+/// confidence rubric.
+const CONFIDENCE_R_FLOOR: f64 = 0.6;
 /// Wall-clock length of one capture.
 pub const CAPTURE_WINDOW_MS: u32 = 8_000;
 /// Storm guard: once this many consumer callbacks have run, the capture
@@ -75,7 +111,18 @@ const DPC_INTERRUPT_KIND: &str = "dpcInterrupt";
 const ATTRIBUTION_LABEL: &str = "ISR/DPC attribution";
 const TOP_DRIVER_LABEL: &str = "Top driver";
 const WINDOW_LABEL: &str = "Trace window";
-const INTERRUPT_LABELS: [&str; 3] = [ATTRIBUTION_LABEL, TOP_DRIVER_LABEL, WINDOW_LABEL];
+const LIKELY_CAUSE_LABEL: &str = "Likely cause";
+const CONFIDENCE_LABEL: &str = "Confidence";
+const CORRELATION_LABEL: &str = "Correlation";
+const INTERRUPT_LABELS: [&str; 6] = [
+    LIKELY_CAUSE_LABEL,
+    CONFIDENCE_LABEL,
+    CORRELATION_LABEL,
+    ATTRIBUTION_LABEL,
+    TOP_DRIVER_LABEL,
+    WINDOW_LABEL,
+];
+const INSUFFICIENT_SIGNAL: &str = "insufficient signal";
 const UNATTRIBUTED: &str = "unattributed";
 /// Routine addresses are rounded down to 64 KiB so the bucket map stays tiny
 /// even during a storm concentrated on a handful of routines.
@@ -105,6 +152,404 @@ impl InterruptCapture {
     }
 }
 
+/// Coarse device class an attributed driver belongs to, used to pick the
+/// activity series to correlate against and the follow-up recommendation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceClass {
+    Storage,
+    Network,
+    Gpu,
+    Usb,
+    Audio,
+    Platform,
+    Other,
+}
+
+impl DeviceClass {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Storage => "storage",
+            Self::Network => "network",
+            Self::Gpu => "gpu",
+            Self::Usb => "usb",
+            Self::Audio => "audio",
+            Self::Platform => "platform",
+            Self::Other => "other",
+        }
+    }
+}
+
+/// Keyword table mapping driver base names (and version-resource
+/// description/company strings, which vote second) to device classes. First
+/// match in table order wins; anything unmatched is [`DeviceClass::Other`].
+const CLASS_KEYWORDS: &[(DeviceClass, &[&str])] = &[
+    (
+        DeviceClass::Storage,
+        &[
+            "storport", "stornvme", "storahci", "iastor", "amdsata", "disk", "nvme", "scsi",
+            "sata", "raid", "storage",
+        ],
+    ),
+    (
+        DeviceClass::Network,
+        &[
+            "ndis", "tcpip", "netio", "e1d", "e2f", "e1i", "rt640", "rtwlan", "netwtw", "mlx",
+            "vmxnet", "wlan", "wifi", "ethernet", "network",
+        ],
+    ),
+    (
+        DeviceClass::Gpu,
+        &[
+            "nvlddmkm", "amdkmdag", "igdkmd", "dxgkrnl", "dxgmms", "geforce", "radeon",
+            "graphics",
+        ],
+    ),
+    (
+        DeviceClass::Usb,
+        &["usbxhci", "usbport", "usbhub", "usbccgp", "usbehci", "winusb", "usb"],
+    ),
+    (
+        DeviceClass::Audio,
+        &["hdaudbus", "hdaudio", "portcls", "audio"],
+    ),
+    (
+        DeviceClass::Platform,
+        &["acpi", "intelppm", "amdppm", "processr", "hal"],
+    ),
+];
+
+/// One follow-up sentence per identified class, appended to the detector's
+/// recommendation. [`DeviceClass::Other`] deliberately appends nothing.
+const CLASS_RECOMMENDATIONS: &[(DeviceClass, &str)] = &[
+    (
+        DeviceClass::Storage,
+        "Update or roll back the storage driver first.",
+    ),
+    (
+        DeviceClass::Network,
+        "Update or roll back the network driver first.",
+    ),
+    (DeviceClass::Gpu, "Update or roll back the GPU driver first."),
+    (
+        DeviceClass::Usb,
+        "Update the USB controller driver and reseat recent USB devices first.",
+    ),
+    (
+        DeviceClass::Audio,
+        "Update or roll back the audio driver first.",
+    ),
+    (
+        DeviceClass::Platform,
+        "Update the chipset, ACPI, and power-management drivers first.",
+    ),
+];
+
+/// Maps a driver to its device class. The base file name votes first; the
+/// version-resource description/company string votes only when the name says
+/// nothing, so `nvlddmkm.sys` stays `gpu` even if its description mentioned
+/// networking.
+pub fn classify_driver(name: &str, description: Option<&str>) -> DeviceClass {
+    let name = name.to_ascii_lowercase();
+    for (class, keywords) in CLASS_KEYWORDS {
+        if keywords.iter().any(|keyword| name.contains(keyword)) {
+            return *class;
+        }
+    }
+    if let Some(description) = description {
+        let description = description.to_ascii_lowercase();
+        for (class, keywords) in CLASS_KEYWORDS {
+            if keywords.iter().any(|keyword| description.contains(keyword)) {
+                return *class;
+            }
+        }
+    }
+    DeviceClass::Other
+}
+
+fn class_recommendation(class: DeviceClass) -> Option<&'static str> {
+    CLASS_RECOMMENDATIONS
+        .iter()
+        .find(|(candidate, _)| *candidate == class)
+        .map(|(_, sentence)| *sentence)
+}
+
+/// One point of the device-activity ring the runtime feeds every sample.
+#[derive(Debug, Clone, Copy)]
+pub struct ActivityPoint {
+    pub timestamp_ms: i64,
+    pub interrupt_rate: f64,
+    pub dpc_rate: f64,
+    pub disk_bytes_per_sec: f64,
+    pub disk_latency_ms: f64,
+    pub network_bytes_per_sec: f64,
+    /// `None` whenever the hardware sampler has no GPU utilization; gpu
+    /// correlation is then skipped honestly instead of imputing zeros.
+    pub gpu_utilization_percent: Option<f64>,
+}
+
+/// One successful attribution in a finding's bounded capture history.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CaptureRecord {
+    pub timestamp_ms: i64,
+    /// Ranked per-driver share of decoded events in percent, largest first,
+    /// including the `unattributed` pseudo-driver.
+    pub shares: Vec<(String, f64)>,
+    pub total_events: u64,
+    pub capped: bool,
+}
+
+impl CaptureRecord {
+    /// The leading real driver of this capture, skipping `unattributed`.
+    fn top_driver(&self) -> Option<&str> {
+        self.shares
+            .iter()
+            .find(|(name, _)| name != UNATTRIBUTED)
+            .map(|(name, _)| name.as_str())
+    }
+
+    fn share_of(&self, driver: &str) -> f64 {
+        self.shares
+            .iter()
+            .find(|(name, _)| name == driver)
+            .map_or(0.0, |(_, share)| *share)
+    }
+
+    /// Margin (percentage points) of `driver` over the next-ranked entry,
+    /// defined only when `driver` is this capture's top real driver.
+    fn margin_over_second(&self, driver: &str) -> Option<f64> {
+        if self.top_driver() != Some(driver) {
+            return None;
+        }
+        let share = self.share_of(driver);
+        let runner_up = self
+            .shares
+            .iter()
+            .filter(|(name, _)| name != driver)
+            .map(|(_, other)| *other)
+            .fold(0.0_f64, f64::max);
+        Some(share - runner_up)
+    }
+}
+
+/// Verdict confidence tiers, in the exact rubric [`assess_confidence`]
+/// implements (documented verbatim in docs/detectors.md).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Confidence {
+    High,
+    Medium,
+    Low,
+}
+
+impl Confidence {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::High => "high",
+            Self::Medium => "medium",
+            Self::Low => "low",
+        }
+    }
+}
+
+/// The pure confidence rubric.
+///
+/// - HIGH: the top driver is consistent in ≥ 3 captures with ≥ 45% mean
+///   share AND (matching-class correlation r ≥ 0.6 OR dominance margin
+///   ≥ 25 points).
+/// - MEDIUM: consistent top in ≥ 2 captures with ≥ 30% mean share, or a
+///   single capture with ≥ 60% share.
+/// - LOW: everything else with at least one successful capture (the caller
+///   never invokes the rubric with zero captures).
+pub fn assess_confidence(
+    consistent_captures: usize,
+    total_captures: usize,
+    mean_share_percent: f64,
+    margin_points: f64,
+    matched_r: Option<f64>,
+) -> Confidence {
+    let correlated = matched_r.is_some_and(|r| r >= CONFIDENCE_R_FLOOR);
+    if consistent_captures >= 3
+        && mean_share_percent >= 45.0
+        && (correlated || margin_points >= 25.0)
+    {
+        Confidence::High
+    } else if (consistent_captures >= 2 && mean_share_percent >= 30.0)
+        || (total_captures == 1 && consistent_captures == 1 && mean_share_percent >= 60.0)
+    {
+        Confidence::Medium
+    } else {
+        Confidence::Low
+    }
+}
+
+/// The most-likely-cause summary distilled from a finding's capture history.
+#[derive(Debug, Clone, PartialEq)]
+pub struct VerdictCandidate {
+    pub driver: String,
+    /// Captures in the history (all successful by construction).
+    pub captures: usize,
+    /// Captures where `driver` is the top real driver.
+    pub consistent: usize,
+    /// Mean share of `driver` across every capture, percent.
+    pub mean_share: f64,
+    /// Mean margin over the runner-up across captures where `driver` leads.
+    pub margin: f64,
+}
+
+/// Picks the modal top driver across the capture history: the driver that
+/// leads the most captures, ties broken by higher mean share. `None` when no
+/// capture attributed a single real driver.
+pub fn modal_candidate(history: &[CaptureRecord]) -> Option<VerdictCandidate> {
+    let mut leads: HashMap<&str, usize> = HashMap::new();
+    for record in history {
+        if let Some(top) = record.top_driver() {
+            *leads.entry(top).or_insert(0) += 1;
+        }
+    }
+    let driver = leads
+        .iter()
+        .max_by(|a, b| {
+            a.1.cmp(b.1).then_with(|| {
+                let share_a: f64 = history.iter().map(|record| record.share_of(a.0)).sum();
+                let share_b: f64 = history.iter().map(|record| record.share_of(b.0)).sum();
+                share_a.total_cmp(&share_b).then_with(|| b.0.cmp(a.0))
+            })
+        })
+        .map(|(name, _)| (*name).to_string())?;
+    let captures = history.len();
+    let consistent = leads.get(driver.as_str()).copied().unwrap_or(0);
+    let mean_share = history
+        .iter()
+        .map(|record| record.share_of(&driver))
+        .sum::<f64>()
+        / captures.max(1) as f64;
+    let margins: Vec<f64> = history
+        .iter()
+        .filter_map(|record| record.margin_over_second(&driver))
+        .collect();
+    let margin = if margins.is_empty() {
+        0.0
+    } else {
+        margins.iter().sum::<f64>() / margins.len() as f64
+    };
+    Some(VerdictCandidate {
+        driver,
+        captures,
+        consistent,
+        mean_share,
+        margin,
+    })
+}
+
+/// Outcome of correlating the interrupt/DPC rate series against the activity
+/// series matched to a device class.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CorrelationOutcome {
+    Measured {
+        /// Which activity series produced the strongest correlation.
+        series: &'static str,
+        r: f64,
+        span_ms: i64,
+    },
+    /// Too few samples, a near-constant series, or no activity series for
+    /// the class (usb/audio/platform/other have none).
+    Insufficient,
+}
+
+impl CorrelationOutcome {
+    fn matched_r(&self) -> Option<f64> {
+        match self {
+            Self::Measured { r, .. } => Some(*r),
+            Self::Insufficient => None,
+        }
+    }
+}
+
+/// Pearson correlation coefficient with the honesty guards: `None` for
+/// mismatched or short series and for near-constant series on either side,
+/// where r would be numerically defined but meaningless.
+pub fn pearson(xs: &[f64], ys: &[f64]) -> Option<f64> {
+    if xs.len() != ys.len() || xs.len() < MIN_CORRELATION_SAMPLES {
+        return None;
+    }
+    let n = xs.len() as f64;
+    let mean_x = xs.iter().sum::<f64>() / n;
+    let mean_y = ys.iter().sum::<f64>() / n;
+    let mut covariance = 0.0;
+    let mut variance_x = 0.0;
+    let mut variance_y = 0.0;
+    for (x, y) in xs.iter().zip(ys) {
+        let dx = x - mean_x;
+        let dy = y - mean_y;
+        covariance += dx * dy;
+        variance_x += dx * dx;
+        variance_y += dy * dy;
+    }
+    if !spread_ok(mean_x, variance_x / n) || !spread_ok(mean_y, variance_y / n) {
+        return None;
+    }
+    Some(covariance / (variance_x.sqrt() * variance_y.sqrt()))
+}
+
+/// The variance floor: near-constant series (relative to their own
+/// magnitude) fail, as do outright flat ones.
+fn spread_ok(mean: f64, variance: f64) -> bool {
+    let std_dev = variance.max(0.0).sqrt();
+    std_dev > 1e-9 && std_dev >= mean.abs() * MIN_RELATIVE_SPREAD
+}
+
+/// Correlates both kernel-rate series (interrupt and DPC) against every
+/// activity series matched to `class`, returning the strongest |r|.
+///
+/// storage → disk read+write bytes/s and disk latency; network → summed
+/// network bytes/s; gpu → GPU utilization over the samples where the
+/// hardware sampler produced one. Other classes have no honest activity
+/// series and report [`CorrelationOutcome::Insufficient`].
+pub fn class_correlation(
+    activity: &VecDeque<ActivityPoint>,
+    class: DeviceClass,
+) -> CorrelationOutcome {
+    let span_ms = match (activity.front(), activity.back()) {
+        (Some(first), Some(last)) => last.timestamp_ms - first.timestamp_ms,
+        _ => return CorrelationOutcome::Insufficient,
+    };
+    type Extract = fn(&ActivityPoint) -> Option<f64>;
+    type Rate = fn(&ActivityPoint) -> f64;
+    let candidates: &[(&'static str, Extract)] = match class {
+        DeviceClass::Storage => &[
+            ("storage activity", |point| Some(point.disk_bytes_per_sec)),
+            ("disk latency", |point| Some(point.disk_latency_ms)),
+        ],
+        DeviceClass::Network => &[("network activity", |point| {
+            Some(point.network_bytes_per_sec)
+        })],
+        DeviceClass::Gpu => &[("gpu activity", |point| point.gpu_utilization_percent)],
+        _ => &[],
+    };
+    let rates: [Rate; 2] = [|point| point.interrupt_rate, |point| point.dpc_rate];
+    let mut best: Option<(&'static str, f64)> = None;
+    for (series, extract) in candidates {
+        for rate in &rates {
+            let mut xs = Vec::with_capacity(activity.len());
+            let mut ys = Vec::with_capacity(activity.len());
+            for point in activity {
+                if let Some(value) = extract(point) {
+                    xs.push(rate(point));
+                    ys.push(value);
+                }
+            }
+            if let Some(r) = pearson(&xs, &ys)
+                && best.is_none_or(|(_, current)| r.abs() > current.abs())
+            {
+                best = Some((series, r));
+            }
+        }
+    }
+    match best {
+        Some((series, r)) => CorrelationOutcome::Measured { series, r, span_ms },
+        None => CorrelationOutcome::Insufficient,
+    }
+}
+
 /// The syscall layer behind the engine, stubbed in unit tests.
 pub trait InterruptSource {
     /// Runs one bounded real-time ISR/DPC trace.
@@ -117,26 +562,42 @@ pub trait InterruptSource {
     fn driver_description(&mut self, base_name: &str) -> Option<String>;
 }
 
-/// Holds the latest attribution evidence per `dpcInterrupt` alert ID and the
-/// capture cooldown. Mirrors [`crate::metrics::forensics::ForensicsEngine`].
+/// Per-finding root-cause state: the latest evidence rows, the bounded ring
+/// of successful captures, and the class of the current verdict (for the
+/// recommendation sentence).
+#[derive(Debug, Default)]
+struct FindingState {
+    rows: Vec<Evidence>,
+    history: VecDeque<CaptureRecord>,
+    class: Option<DeviceClass>,
+}
+
+/// Holds the root-cause state per `dpcInterrupt` alert ID, the adaptive
+/// capture cadence, and the device-activity ring. Mirrors
+/// [`crate::metrics::forensics::ForensicsEngine`].
 pub struct InterruptEngine<S> {
     source: S,
-    /// Latest rows per alert ID; replaced wholesale by each capture so
-    /// evidence stays bounded.
-    latest: HashMap<String, Vec<Evidence>>,
-    /// Rows for findings that just resolved survive exactly one extra pass so
-    /// the resolution write-back keeps its final attribution state.
+    findings: HashMap<String, FindingState>,
+    /// Findings that just resolved survive exactly one extra pass so the
+    /// resolution write-back keeps their final attribution state.
     stale: HashSet<String>,
     last_capture_ms: Option<i64>,
+    last_capture_failed: bool,
+    /// Recent device-activity window fed by the runtime on every sample —
+    /// pure memory work, kept warm even with no finding active so the first
+    /// verdict already has a correlation window behind it.
+    activity: VecDeque<ActivityPoint>,
 }
 
 impl<S: InterruptSource> InterruptEngine<S> {
     pub fn new(source: S) -> Self {
         Self {
             source,
-            latest: HashMap::new(),
+            findings: HashMap::new(),
             stale: HashSet::new(),
             last_capture_ms: None,
+            last_capture_failed: false,
+            activity: VecDeque::new(),
         }
     }
 
@@ -148,27 +609,58 @@ impl<S: InterruptSource> InterruptEngine<S> {
         &mut self.source
     }
 
+    /// Feeds one sample of the device-activity ring the correlation runs
+    /// over. Called by the runtime on every sampling pass; performs no
+    /// syscalls. `gpu_utilization_percent` is the freshest hardware-sampler
+    /// GPU utilization, or `None` when NVML has nothing to say.
+    pub fn record_activity(&mut self, system: &SystemMetric, gpu_utilization_percent: Option<f64>) {
+        self.activity.push_back(ActivityPoint {
+            timestamp_ms: system.timestamp_ms,
+            interrupt_rate: system.interrupt_rate,
+            dpc_rate: system.dpc_rate,
+            disk_bytes_per_sec: system.disk_read_bytes_per_sec + system.disk_write_bytes_per_sec,
+            disk_latency_ms: system.disk_latency_ms,
+            network_bytes_per_sec: system.network_bytes_per_sec,
+            gpu_utilization_percent,
+        });
+        let cutoff = system.timestamp_ms - ACTIVITY_WINDOW_MS;
+        while self
+            .activity
+            .front()
+            .is_some_and(|point| point.timestamp_ms < cutoff)
+        {
+            self.activity.pop_front();
+        }
+        while self.activity.len() > ACTIVITY_RING_CAP {
+            self.activity.pop_front();
+        }
+    }
+
     /// Drives captures from the sampling cadence.
     ///
     /// With no active `dpcInterrupt` finding this returns before any source
     /// call — the engine is a strict no-op. While one is active, a capture
-    /// runs when the finding first fires and then at most once per
-    /// [`CAPTURE_COOLDOWN_MS`]. The capture itself blocks for up to
-    /// [`CAPTURE_WINDOW_MS`]; the sampling loop resumes afterwards.
+    /// runs when the finding first fires, then every
+    /// [`FAST_CAPTURE_SPACING_MS`] until each active finding holds
+    /// [`FAST_PHASE_CAPTURES`] successful captures, then every
+    /// [`CAPTURE_COOLDOWN_MS`]. A failed capture arms the full cooldown
+    /// exactly as before, so a denied session is not retried every two
+    /// minutes. The capture itself blocks for up to [`CAPTURE_WINDOW_MS`];
+    /// the sampling loop resumes afterwards.
     pub fn observe(&mut self, active: &[Alert], now_ms: i64) {
         let ids: HashSet<String> = active
             .iter()
             .filter(|alert| alert.kind == DPC_INTERRUPT_KIND)
             .map(|alert| alert.id.clone())
             .collect();
-        // Grace pass: rows for findings that resolved on the *previous* pass
-        // are dropped now; findings resolving on this pass keep their final
+        // Grace pass: state for findings that resolved on the *previous* pass
+        // is dropped now; findings resolving on this pass keep their final
         // rows for the resolution write-back.
         let stale = &self.stale;
-        self.latest
+        self.findings
             .retain(|id, _| ids.contains(id) || !stale.contains(id));
         self.stale = self
-            .latest
+            .findings
             .keys()
             .filter(|id| !ids.contains(*id))
             .cloned()
@@ -176,50 +668,94 @@ impl<S: InterruptSource> InterruptEngine<S> {
 
         if ids.is_empty() {
             self.last_capture_ms = None;
+            self.last_capture_failed = false;
             return;
         }
+        let spacing = if self.last_capture_failed {
+            CAPTURE_COOLDOWN_MS
+        } else if ids.iter().any(|id| {
+            self.findings
+                .get(id)
+                .is_none_or(|state| state.history.len() < FAST_PHASE_CAPTURES)
+        }) {
+            FAST_CAPTURE_SPACING_MS
+        } else {
+            CAPTURE_COOLDOWN_MS
+        };
         let due = self
             .last_capture_ms
-            .is_none_or(|last| now_ms.saturating_sub(last) >= CAPTURE_COOLDOWN_MS);
-        let has_new = ids.iter().any(|id| !self.latest.contains_key(id));
+            .is_none_or(|last| now_ms.saturating_sub(last) >= spacing);
+        let has_new = ids.iter().any(|id| !self.findings.contains_key(id));
         if !due && !has_new {
             return;
         }
-        // The cooldown counts from every capture attempt, including degraded
+        // The cadence counts from every capture attempt, including degraded
         // ones — a failing session must not be retried on every sample.
         self.last_capture_ms = Some(now_ms);
-        let rows = match self.source.capture(CAPTURE_WINDOW_MS, EVENT_CAP) {
-            Ok(capture) => self.build_rows(&capture),
-            Err(error) => vec![evidence(
-                ATTRIBUTION_LABEL,
-                format!("capture degraded: {error:#}"),
-            )],
-        };
-        for id in ids {
-            self.latest.insert(id, rows.clone());
-        }
-    }
-
-    /// Attaches the latest attribution rows to matching alerts, replacing any
-    /// attribution rows already present so evidence never accumulates.
-    pub fn decorate(&self, alerts: &mut [Alert]) {
-        for alert in alerts.iter_mut() {
-            if let Some(rows) = self.latest.get(&alert.id) {
-                alert
-                    .evidence
-                    .retain(|item| !INTERRUPT_LABELS.contains(&item.label.as_str()));
-                alert.evidence.extend(rows.iter().cloned());
+        match self.source.capture(CAPTURE_WINDOW_MS, EVENT_CAP) {
+            Ok(capture) => {
+                self.last_capture_failed = false;
+                let (record, capture_rows) = self.build_capture(&capture, now_ms);
+                for id in ids {
+                    let state = self.findings.entry(id.clone()).or_default();
+                    if let Some(record) = &record {
+                        state.history.push_back(record.clone());
+                        while state.history.len() > CAPTURE_HISTORY {
+                            state.history.pop_front();
+                        }
+                    }
+                    self.rebuild_rows(&id, &capture_rows);
+                }
+            }
+            Err(error) => {
+                self.last_capture_failed = true;
+                let degraded = vec![evidence(
+                    ATTRIBUTION_LABEL,
+                    format!("capture degraded: {error:#}"),
+                )];
+                for id in ids {
+                    self.findings.entry(id.clone()).or_default();
+                    // A finding with earlier successful captures keeps its
+                    // verdict; one with none keeps only the honest note.
+                    self.rebuild_rows(&id, &degraded);
+                }
             }
         }
     }
 
-    fn build_rows(&mut self, capture: &InterruptCapture) -> Vec<Evidence> {
+    /// Attaches the latest root-cause rows to matching alerts, replacing any
+    /// rows already present so evidence never accumulates, and keeps the
+    /// class recommendation sentence in sync on the recommendation text.
+    pub fn decorate(&self, alerts: &mut [Alert]) {
+        for alert in alerts.iter_mut() {
+            if let Some(state) = self.findings.get(&alert.id) {
+                alert
+                    .evidence
+                    .retain(|item| !INTERRUPT_LABELS.contains(&item.label.as_str()));
+                alert.evidence.extend(state.rows.iter().cloned());
+                apply_class_recommendation(&mut alert.recommendation, state.class);
+            }
+        }
+    }
+
+    /// Turns one raw capture into (successful attribution record, this
+    /// capture's attribution/top-driver/window rows). The record is `None`
+    /// for zero-event and undecodable captures, which therefore never enter
+    /// a verdict history.
+    fn build_capture(
+        &mut self,
+        capture: &InterruptCapture,
+        now_ms: i64,
+    ) -> (Option<CaptureRecord>, Vec<Evidence>) {
         let window = format_trace_window(capture);
         if capture.total_events() == 0 {
-            return vec![
-                evidence(ATTRIBUTION_LABEL, "no ISR/DPC events in the trace window".into()),
-                evidence(WINDOW_LABEL, window),
-            ];
+            return (
+                None,
+                vec![
+                    evidence(ATTRIBUTION_LABEL, "no ISR/DPC events in the trace window".into()),
+                    evidence(WINDOW_LABEL, window),
+                ],
+            );
         }
         let mut drivers = self.source.driver_bases();
         drivers.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
@@ -233,12 +769,98 @@ impl<S: InterruptSource> InterruptEngine<S> {
             ));
         }
         rows.push(evidence(WINDOW_LABEL, window));
-        rows
+        let record = ranked_to_record(&ranked, capture, now_ms);
+        (record, rows)
+    }
+
+    /// Rebuilds a finding's evidence rows: verdict triple first (whenever the
+    /// finding has at least one successful capture), then the per-capture
+    /// rows. With zero successful captures only the honest capture rows
+    /// remain — no verdict is ever fabricated.
+    fn rebuild_rows(&mut self, id: &str, capture_rows: &[Evidence]) {
+        let history: Vec<CaptureRecord> = self
+            .findings
+            .get(id)
+            .map(|state| state.history.iter().cloned().collect())
+            .unwrap_or_default();
+        let verdict = modal_candidate(&history).map(|candidate| {
+            let description = self.source.driver_description(&candidate.driver);
+            let class = classify_driver(&candidate.driver, description.as_deref());
+            let correlation = class_correlation(&self.activity, class);
+            let confidence = assess_confidence(
+                candidate.consistent,
+                candidate.captures,
+                candidate.mean_share,
+                candidate.margin,
+                correlation.matched_r(),
+            );
+            (candidate, description, class, correlation, confidence)
+        });
+        let Some(state) = self.findings.get_mut(id) else {
+            return;
+        };
+        let mut rows = Vec::with_capacity(6);
+        state.class = None;
+        if let Some((candidate, description, class, correlation, confidence)) = verdict {
+            rows.push(evidence(
+                LIKELY_CAUSE_LABEL,
+                format_likely_cause(&candidate.driver, description.as_deref(), class),
+            ));
+            rows.push(evidence(
+                CONFIDENCE_LABEL,
+                format_confidence(confidence, &candidate),
+            ));
+            rows.push(evidence(CORRELATION_LABEL, format_correlation(&correlation)));
+            state.class = Some(class);
+        }
+        rows.extend(capture_rows.iter().cloned());
+        state.rows = rows;
     }
 
     #[cfg(test)]
     fn debug_counts(&self) -> (usize, usize) {
-        (self.latest.len(), self.stale.len())
+        (self.findings.len(), self.stale.len())
+    }
+}
+
+/// Converts ranked per-driver counts into a percentage [`CaptureRecord`];
+/// `None` when nothing decoded (total zero), so undecodable captures never
+/// feed the verdict.
+fn ranked_to_record(
+    ranked: &[(String, u64)],
+    capture: &InterruptCapture,
+    now_ms: i64,
+) -> Option<CaptureRecord> {
+    let total: u64 = ranked.iter().map(|(_, count)| count).sum();
+    if total == 0 {
+        return None;
+    }
+    let shares = ranked
+        .iter()
+        .map(|(name, count)| (name.clone(), *count as f64 * 100.0 / total as f64))
+        .collect();
+    Some(CaptureRecord {
+        timestamp_ms: now_ms,
+        shares,
+        total_events: capture.total_events(),
+        capped: capture.capped,
+    })
+}
+
+/// Strips any previously appended class sentence, then appends the sentence
+/// for the current class — idempotent across repeated decoration and stable
+/// when the verdict's class changes.
+fn apply_class_recommendation(recommendation: &mut String, class: Option<DeviceClass>) {
+    for (_, sentence) in CLASS_RECOMMENDATIONS {
+        if let Some(stripped) = recommendation.strip_suffix(sentence) {
+            *recommendation = stripped.trim_end().to_string();
+        }
+    }
+    if let Some(sentence) = class.and_then(class_recommendation) {
+        if !recommendation.is_empty() && !recommendation.ends_with(' ') {
+            recommendation.push(' ');
+        }
+        recommendation.push_str(sentence);
     }
 }
 
@@ -302,6 +924,53 @@ fn format_top_driver(name: &str, description: Option<&str>) -> String {
     match description {
         Some(description) => truncate_value(&format!("{name} — {description}"), MAX_VALUE_CHARS),
         None => name.to_string(),
+    }
+}
+
+/// `nvlddmkm.sys — NVIDIA Windows Kernel Mode Driver [gpu]`, truncating the
+/// description part so the class tag always survives within the value bound.
+fn format_likely_cause(name: &str, description: Option<&str>, class: DeviceClass) -> String {
+    let suffix = format!(" [{}]", class.as_str());
+    let base = match description {
+        Some(description) => format!("{name} — {description}"),
+        None => name.to_string(),
+    };
+    let mut value = truncate_value(&base, MAX_VALUE_CHARS.saturating_sub(suffix.chars().count()));
+    value.push_str(&suffix);
+    value
+}
+
+/// `high — top in 4/4 traces · 58% mean share`.
+fn format_confidence(confidence: Confidence, candidate: &VerdictCandidate) -> String {
+    truncate_value(
+        &format!(
+            "{} — top in {}/{} traces · {:.0}% mean share",
+            confidence.as_str(),
+            candidate.consistent,
+            candidate.captures,
+            candidate.mean_share
+        ),
+        MAX_VALUE_CHARS,
+    )
+}
+
+/// `gpu activity r=0.81 over 5 m`, or the honest `insufficient signal`.
+fn format_correlation(outcome: &CorrelationOutcome) -> String {
+    match outcome {
+        CorrelationOutcome::Measured { series, r, span_ms } => truncate_value(
+            &format!("{series} r={r:.2} over {}", format_span(*span_ms)),
+            MAX_VALUE_CHARS,
+        ),
+        CorrelationOutcome::Insufficient => INSUFFICIENT_SIGNAL.into(),
+    }
+}
+
+/// `5 m` at minute scale, `45 s` below it.
+fn format_span(span_ms: i64) -> String {
+    if span_ms >= 60_000 {
+        format!("{} m", (span_ms + 30_000) / 60_000)
+    } else {
+        format!("{} s", (span_ms.max(0) + 500) / 1_000)
     }
 }
 
@@ -899,26 +1568,77 @@ mod tests {
     }
 
     #[test]
-    fn capture_on_first_fire_then_cooldown_gates_recapture() {
+    fn adaptive_cadence_runs_a_fast_phase_then_backs_off() {
         let mut engine = InterruptEngine::new(StubSource::default());
         engine.source_mut().capture = capture(&[(0xFFFF_F800_0001_0000, 100)]);
         engine.source_mut().drivers = drivers(&[(0xFFFF_F800_0000_0000, "storport.sys")]);
         let alerts = [dpc_alert("d1")];
         engine.observe(&alerts, 0);
         assert_eq!(engine.source().capture_calls, 1, "captures when it fires");
-        engine.observe(&alerts, 2_000);
-        engine.observe(&alerts, 9 * 60_000);
-        assert_eq!(engine.source().capture_calls, 1, "cooldown holds");
-        engine.observe(&alerts, 10 * 60_000);
-        assert_eq!(engine.source().capture_calls, 2, "recaptures after ten minutes");
+        engine.observe(&alerts, 60_000);
+        assert_eq!(engine.source().capture_calls, 1, "fast spacing holds at one minute");
+        engine.observe(&alerts, 2 * 60_000);
+        assert_eq!(engine.source().capture_calls, 2, "second trace two minutes in");
+        engine.observe(&alerts, 3 * 60_000);
+        assert_eq!(engine.source().capture_calls, 2, "fast spacing still two minutes");
+        engine.observe(&alerts, 4 * 60_000);
+        assert_eq!(engine.source().capture_calls, 3, "third trace completes the fast phase");
+        engine.observe(&alerts, 6 * 60_000);
+        engine.observe(&alerts, 13 * 60_000);
+        assert_eq!(engine.source().capture_calls, 3, "backed off to the ten-minute cooldown");
+        engine.observe(&alerts, 14 * 60_000);
+        assert_eq!(engine.source().capture_calls, 4, "recaptures after ten minutes");
         // Resolution: rows survive exactly one grace pass, then clear.
-        engine.observe(&[], 11 * 60_000);
+        engine.observe(&[], 15 * 60_000);
         assert_eq!(engine.debug_counts(), (1, 1), "final rows kept for write-back");
-        engine.observe(&[], 12 * 60_000);
+        engine.observe(&[], 16 * 60_000);
         assert_eq!(engine.debug_counts(), (0, 0), "grace pass expired");
-        // A refire is a new alert ID and captures immediately.
-        engine.observe(&[dpc_alert("d2")], 13 * 60_000);
-        assert_eq!(engine.source().capture_calls, 3);
+        // A refire is a new alert ID: it captures immediately and re-enters
+        // the fast phase with an empty history of its own.
+        engine.observe(&[dpc_alert("d2")], 17 * 60_000);
+        assert_eq!(engine.source().capture_calls, 5);
+        engine.observe(&[dpc_alert("d2")], 19 * 60_000);
+        assert_eq!(engine.source().capture_calls, 6, "fresh finding is in the fast phase");
+    }
+
+    #[test]
+    fn a_new_finding_joining_reenters_the_fast_phase() {
+        let mut engine = InterruptEngine::new(StubSource::default());
+        engine.source_mut().capture = capture(&[(0xFFFF_F800_0001_0000, 100)]);
+        engine.source_mut().drivers = drivers(&[(0xFFFF_F800_0000_0000, "storport.sys")]);
+        let first = [dpc_alert("d1")];
+        for now in [0, 2 * 60_000, 4 * 60_000] {
+            engine.observe(&first, now);
+        }
+        assert_eq!(engine.source().capture_calls, 3, "d1 finished its fast phase");
+        // d2 fires: an immediate capture despite the backoff, and the next
+        // spacing is the fast two minutes because d2's history is short.
+        let both = [dpc_alert("d1"), dpc_alert("d2")];
+        engine.observe(&both, 5 * 60_000);
+        assert_eq!(engine.source().capture_calls, 4, "new finding captures immediately");
+        engine.observe(&both, 7 * 60_000);
+        assert_eq!(engine.source().capture_calls, 5, "fast spacing for the new finding");
+    }
+
+    #[test]
+    fn capture_history_ring_is_bounded_per_finding() {
+        let mut engine = InterruptEngine::new(StubSource::default());
+        engine.source_mut().capture = capture(&[(0xFFFF_F800_0001_0000, 100)]);
+        engine.source_mut().drivers = drivers(&[(0xFFFF_F800_0000_0000, "storport.sys")]);
+        let alerts = [dpc_alert("d1")];
+        let mut now = 0;
+        for _ in 0..12 {
+            engine.observe(&alerts, now);
+            now += CAPTURE_COOLDOWN_MS;
+        }
+        assert_eq!(engine.source().capture_calls, 12);
+        let state = engine.findings.get("d1").expect("finding state");
+        assert_eq!(state.history.len(), CAPTURE_HISTORY, "ring keeps the last eight");
+        assert_eq!(
+            state.history.front().map(|record| record.timestamp_ms),
+            Some(4 * CAPTURE_COOLDOWN_MS),
+            "oldest surviving record is the fifth capture"
+        );
     }
 
     #[test]
@@ -1064,6 +1784,11 @@ mod tests {
             1,
             "a failing session is not retried on every sample"
         );
+        // Failure arms the full ten-minute cooldown, never the fast spacing.
+        engine.observe(&alerts, FAST_CAPTURE_SPACING_MS);
+        assert_eq!(engine.source().capture_calls, 1, "no fast retry after a failure");
+        engine.observe(&alerts, CAPTURE_COOLDOWN_MS);
+        assert_eq!(engine.source().capture_calls, 2, "retried after the cooldown");
         engine.decorate(&mut alerts);
         let attribution = alerts[0]
             .evidence
@@ -1073,6 +1798,41 @@ mod tests {
             .unwrap_or_default();
         assert!(attribution.contains("capture degraded"));
         assert!(attribution.contains("elevated collector"));
+        // Never fabricate: zero successful captures means no verdict rows
+        // and no class sentence on the recommendation.
+        for label in [LIKELY_CAUSE_LABEL, CONFIDENCE_LABEL, CORRELATION_LABEL] {
+            assert!(
+                !alerts[0].evidence.iter().any(|item| item.label == label),
+                "no {label} row without a successful capture"
+            );
+        }
+        assert!(alerts[0].recommendation.is_empty(), "no class sentence appended");
+    }
+
+    #[test]
+    fn a_failed_recapture_keeps_the_verdict_from_earlier_traces() {
+        let mut engine = InterruptEngine::new(StubSource::default());
+        engine.source_mut().capture = capture(&[(0xFFFF_F800_0001_0000, 100)]);
+        engine.source_mut().drivers = drivers(&[(0xFFFF_F800_0000_0000, "storport.sys")]);
+        let mut alerts = [dpc_alert("d1")];
+        for now in [0, 2 * 60_000, 4 * 60_000] {
+            engine.observe(&alerts, now);
+        }
+        engine.source_mut().fail_capture = true;
+        engine.observe(&alerts, 14 * 60_000);
+        engine.decorate(&mut alerts);
+        let likely = alerts[0]
+            .evidence
+            .iter()
+            .find(|item| item.label == LIKELY_CAUSE_LABEL)
+            .expect("verdict survives a degraded recapture");
+        assert!(likely.value.contains("storport.sys"));
+        let attribution = alerts[0]
+            .evidence
+            .iter()
+            .find(|item| item.label == ATTRIBUTION_LABEL)
+            .expect("attribution row");
+        assert!(attribution.value.contains("capture degraded"));
     }
 
     #[test]
@@ -1097,6 +1857,353 @@ mod tests {
             0,
             "no driver enumeration without events"
         );
+        // An empty trace is not a successful attribution: no verdict rows.
+        for label in [LIKELY_CAUSE_LABEL, CONFIDENCE_LABEL, CORRELATION_LABEL] {
+            assert!(
+                !alerts[0].evidence.iter().any(|item| item.label == label),
+                "no {label} row for an empty trace"
+            );
+        }
+    }
+
+    fn activity_sample(timestamp_ms: i64) -> SystemMetric {
+        SystemMetric {
+            timestamp_ms,
+            interrupt_rate: 10_000.0,
+            dpc_rate: 4_000.0,
+            disk_read_bytes_per_sec: 1_000_000.0,
+            disk_write_bytes_per_sec: 500_000.0,
+            disk_latency_ms: 1.0,
+            network_bytes_per_sec: 100_000.0,
+            ..SystemMetric::default()
+        }
+    }
+
+    /// Feeds a five-minute window where the interrupt rate tracks GPU
+    /// utilization (and nothing else varies).
+    fn feed_gpu_correlated_activity<S: InterruptSource>(engine: &mut InterruptEngine<S>) {
+        for index in 0..150_i64 {
+            let utilization = (index % 50) as f64 * 2.0;
+            let mut sample = activity_sample(index * 2_000);
+            sample.interrupt_rate = 10_000.0 + utilization * 100.0;
+            engine.record_activity(&sample, Some(utilization));
+        }
+    }
+
+    #[test]
+    fn activity_ring_is_bounded_by_window_and_cap() {
+        let mut engine = InterruptEngine::new(StubSource::default());
+        // 20 minutes of 2-second samples: only the last five minutes stay.
+        for index in 0..600_i64 {
+            engine.record_activity(&activity_sample(index * 2_000), None);
+        }
+        let last = 599 * 2_000;
+        assert_eq!(
+            engine.activity.front().map(|point| point.timestamp_ms),
+            Some(last - ACTIVITY_WINDOW_MS)
+        );
+        assert_eq!(engine.activity.len(), 151);
+        assert_eq!(engine.source().capture_calls, 0, "ring feeding makes no source calls");
+        // A pathological sub-window burst still respects the hard cap.
+        let mut engine = InterruptEngine::new(StubSource::default());
+        for index in 0..600_i64 {
+            engine.record_activity(&activity_sample(index * 100), None);
+        }
+        assert_eq!(engine.activity.len(), 512);
+    }
+
+    #[test]
+    fn classification_table_maps_names_and_lets_descriptions_vote() {
+        use DeviceClass::*;
+        for (name, expected) in [
+            ("storport.sys", Storage),
+            ("stornvme.sys", Storage),
+            ("iaStorVD.sys", Storage),
+            ("disk.sys", Storage),
+            ("ndis.sys", Network),
+            ("tcpip.sys", Network),
+            ("rt640x64.sys", Network),
+            ("Netwtw10.sys", Network),
+            ("nvlddmkm.sys", Gpu),
+            ("amdkmdag.sys", Gpu),
+            ("igdkmd64.sys", Gpu),
+            ("USBXHCI.SYS", Usb),
+            ("usbport.sys", Usb),
+            ("HDAudBus.sys", Audio),
+            ("portcls.sys", Audio),
+            ("ACPI.sys", Platform),
+            ("intelppm.sys", Platform),
+            ("amdppm.sys", Platform),
+            ("hal.dll", Platform),
+            ("mystery.sys", Other),
+            ("ntoskrnl.exe", Other),
+        ] {
+            assert_eq!(classify_driver(name, None), expected, "{name}");
+        }
+        // Description/company strings vote when the name says nothing…
+        assert_eq!(
+            classify_driver("xyz64.sys", Some("Contoso Ethernet Adapter Driver")),
+            Network
+        );
+        assert_eq!(
+            classify_driver("cwk.sys", Some("Creative Audio Driver")),
+            Audio
+        );
+        // …but the name vote wins over a chatty description.
+        assert_eq!(
+            classify_driver("nvlddmkm.sys", Some("also handles network streaming")),
+            Gpu
+        );
+        assert_eq!(classify_driver("thing.sys", Some("Widget Runtime")), Other);
+    }
+
+    #[test]
+    fn pearson_needs_samples_and_variance_on_both_sides() {
+        let xs: Vec<f64> = (0..80).map(f64::from).collect();
+        let doubled: Vec<f64> = xs.iter().map(|x| 2.0 * x + 1.0).collect();
+        let inverted: Vec<f64> = xs.iter().map(|x| -x).collect();
+        assert!((pearson(&xs, &doubled).unwrap() - 1.0).abs() < 1e-9);
+        assert!((pearson(&xs, &inverted).unwrap() + 1.0).abs() < 1e-9);
+        // Fewer than 60 aligned samples is not signal.
+        assert_eq!(pearson(&xs[..59], &doubled[..59]), None);
+        assert_eq!(pearson(&xs, &doubled[..79]), None, "mismatched lengths");
+        // A flat series has no variance to correlate with.
+        assert_eq!(pearson(&xs, &vec![5.0; 80]), None);
+        // Near-constant relative to its own magnitude fails the floor even
+        // though the variance is numerically nonzero.
+        let jittered: Vec<f64> = (0..80).map(|i| 1_000.0 + f64::from(i % 2) * 1e-4).collect();
+        assert_eq!(pearson(&xs, &jittered), None);
+    }
+
+    #[test]
+    fn class_correlation_matches_series_or_reports_insufficient_signal() {
+        let mut engine = InterruptEngine::new(StubSource::default());
+        feed_gpu_correlated_activity(&mut engine);
+        match class_correlation(&engine.activity, DeviceClass::Gpu) {
+            CorrelationOutcome::Measured { series, r, span_ms } => {
+                assert_eq!(series, "gpu activity");
+                assert!(r > 0.99, "engineered perfect correlation, got {r}");
+                assert_eq!(span_ms, 149 * 2_000);
+            }
+            CorrelationOutcome::Insufficient => panic!("expected a measured correlation"),
+        }
+        // The disk and network series are flat in this window, so the
+        // storage and network classes fail the variance floor honestly.
+        assert_eq!(
+            class_correlation(&engine.activity, DeviceClass::Storage),
+            CorrelationOutcome::Insufficient
+        );
+        assert_eq!(
+            class_correlation(&engine.activity, DeviceClass::Network),
+            CorrelationOutcome::Insufficient
+        );
+        // Classes without an activity series never pretend to correlate.
+        assert_eq!(
+            class_correlation(&engine.activity, DeviceClass::Usb),
+            CorrelationOutcome::Insufficient
+        );
+        // No GPU telemetry at all: gpu correlation is skipped, not imputed.
+        let mut blind = InterruptEngine::new(StubSource::default());
+        for index in 0..150_i64 {
+            blind.record_activity(&activity_sample(index * 2_000), None);
+        }
+        assert_eq!(
+            class_correlation(&blind.activity, DeviceClass::Gpu),
+            CorrelationOutcome::Insufficient
+        );
+        // A short window is insufficient even with variance.
+        let mut short = InterruptEngine::new(StubSource::default());
+        for index in 0..30_i64 {
+            let mut sample = activity_sample(index * 2_000);
+            sample.interrupt_rate = 10_000.0 + index as f64 * 100.0;
+            short.record_activity(&sample, Some(index as f64));
+        }
+        assert_eq!(
+            class_correlation(&short.activity, DeviceClass::Gpu),
+            CorrelationOutcome::Insufficient
+        );
+    }
+
+    fn record(timestamp_ms: i64, shares: &[(&str, f64)]) -> CaptureRecord {
+        CaptureRecord {
+            timestamp_ms,
+            shares: shares
+                .iter()
+                .map(|(name, share)| ((*name).to_string(), *share))
+                .collect(),
+            total_events: 10_000,
+            capped: false,
+        }
+    }
+
+    #[test]
+    fn modal_candidate_summarizes_consistency_share_and_margin() {
+        let history = [
+            record(0, &[("a.sys", 50.0), ("b.sys", 30.0), (UNATTRIBUTED, 20.0)]),
+            record(1, &[("a.sys", 45.0), ("b.sys", 40.0), (UNATTRIBUTED, 15.0)]),
+            record(2, &[("b.sys", 60.0), ("a.sys", 31.0), (UNATTRIBUTED, 9.0)]),
+        ];
+        let candidate = modal_candidate(&history).expect("candidate");
+        assert_eq!(candidate.driver, "a.sys");
+        assert_eq!(candidate.captures, 3);
+        assert_eq!(candidate.consistent, 2);
+        assert!((candidate.mean_share - 42.0).abs() < 1e-9);
+        // Margins over #2 in the captures a.sys leads: 20 and 5.
+        assert!((candidate.margin - 12.5).abs() < 1e-9);
+        // A trace where only unattributed buckets exist yields no candidate.
+        assert_eq!(modal_candidate(&[record(0, &[(UNATTRIBUTED, 100.0)])]), None);
+        assert_eq!(modal_candidate(&[]), None);
+    }
+
+    #[test]
+    fn confidence_rubric_tiers() {
+        use Confidence::*;
+        // HIGH by class-matched correlation.
+        assert_eq!(assess_confidence(3, 3, 50.0, 10.0, Some(0.7)), High);
+        // HIGH by dominance margin without correlation.
+        assert_eq!(assess_confidence(4, 4, 45.0, 25.0, None), High);
+        // Correlation below the 0.6 floor cannot lift it to HIGH…
+        assert_eq!(assess_confidence(3, 3, 50.0, 10.0, Some(0.59)), Medium);
+        // …and a negative correlation never counts as a match.
+        assert_eq!(assess_confidence(3, 3, 50.0, 10.0, Some(-0.9)), Medium);
+        // Share below 45 blocks HIGH regardless of correlation.
+        assert_eq!(assess_confidence(3, 3, 40.0, 30.0, Some(0.9)), Medium);
+        // MEDIUM: consistent in two with 30% share.
+        assert_eq!(assess_confidence(2, 3, 30.0, 0.0, None), Medium);
+        // MEDIUM: single capture with a 60% share.
+        assert_eq!(assess_confidence(1, 1, 60.0, 20.0, None), Medium);
+        // LOW: single capture below 60%.
+        assert_eq!(assess_confidence(1, 1, 59.0, 59.0, None), Low);
+        // LOW: inconsistent top across several captures.
+        assert_eq!(assess_confidence(1, 4, 80.0, 80.0, None), Low);
+        // LOW: consistent but weak share.
+        assert_eq!(assess_confidence(2, 4, 20.0, 0.0, None), Low);
+    }
+
+    #[test]
+    fn verdict_rows_reach_the_finding_with_class_and_recommendation() {
+        let mut engine = InterruptEngine::new(StubSource::default());
+        engine.source_mut().capture = capture(&[(0xFFFF_F800_0001_0000, 100)]);
+        engine.source_mut().drivers = drivers(&[(0xFFFF_F800_0000_0000, "nvlddmkm.sys")]);
+        engine.source_mut().descriptions.insert(
+            "nvlddmkm.sys".into(),
+            "NVIDIA Windows Kernel Mode Driver".into(),
+        );
+        feed_gpu_correlated_activity(&mut engine);
+        let mut alerts = [dpc_alert("d1")];
+        alerts[0].recommendation = "Check recently connected devices.".into();
+        for now in [0, 2 * 60_000, 4 * 60_000, 14 * 60_000] {
+            engine.observe(&alerts, now);
+        }
+        engine.decorate(&mut alerts);
+        engine.decorate(&mut alerts); // decoration must stay idempotent
+        let value = |label: &str| {
+            alerts[0]
+                .evidence
+                .iter()
+                .find(|item| item.label == label)
+                .map(|item| item.value.clone())
+                .unwrap_or_else(|| panic!("{label} row missing"))
+        };
+        assert_eq!(
+            value(LIKELY_CAUSE_LABEL),
+            "nvlddmkm.sys — NVIDIA Windows Kernel Mode Driver [gpu]"
+        );
+        assert_eq!(
+            value(CONFIDENCE_LABEL),
+            "high — top in 4/4 traces · 100% mean share"
+        );
+        let correlation = value(CORRELATION_LABEL);
+        assert!(
+            correlation.starts_with("gpu activity r=1.00 over"),
+            "unexpected correlation row: {correlation}"
+        );
+        assert!(value(ATTRIBUTION_LABEL).contains("nvlddmkm.sys 100%"));
+        assert!(
+            alerts[0]
+                .evidence
+                .iter()
+                .all(|item| item.value.chars().count() <= MAX_VALUE_CHARS)
+        );
+        assert_eq!(
+            alerts[0].recommendation,
+            "Check recently connected devices. Update or roll back the GPU driver first."
+        );
+        // One verdict row each, even after repeated decoration.
+        for label in [LIKELY_CAUSE_LABEL, CONFIDENCE_LABEL, CORRELATION_LABEL] {
+            assert_eq!(
+                alerts[0]
+                    .evidence
+                    .iter()
+                    .filter(|item| item.label == label)
+                    .count(),
+                1,
+                "{label} must be replaced, not appended"
+            );
+        }
+    }
+
+    #[test]
+    fn class_recommendation_is_idempotent_and_swaps_with_the_class() {
+        let base = "Check recently connected devices.";
+        let mut recommendation = base.to_string();
+        apply_class_recommendation(&mut recommendation, Some(DeviceClass::Storage));
+        assert_eq!(
+            recommendation,
+            format!("{base} Update or roll back the storage driver first.")
+        );
+        apply_class_recommendation(&mut recommendation, Some(DeviceClass::Storage));
+        assert_eq!(
+            recommendation,
+            format!("{base} Update or roll back the storage driver first."),
+            "appending twice must not duplicate"
+        );
+        apply_class_recommendation(&mut recommendation, Some(DeviceClass::Network));
+        assert_eq!(
+            recommendation,
+            format!("{base} Update or roll back the network driver first."),
+            "a changed verdict swaps the sentence"
+        );
+        apply_class_recommendation(&mut recommendation, Some(DeviceClass::Other));
+        assert_eq!(recommendation, base, "the other class appends nothing");
+        apply_class_recommendation(&mut recommendation, None);
+        assert_eq!(recommendation, base);
+    }
+
+    #[test]
+    fn verdict_formatting_is_bounded_and_exact() {
+        let candidate = VerdictCandidate {
+            driver: "nvlddmkm.sys".into(),
+            captures: 4,
+            consistent: 4,
+            mean_share: 58.4,
+            margin: 30.0,
+        };
+        assert_eq!(
+            format_confidence(Confidence::High, &candidate),
+            "high — top in 4/4 traces · 58% mean share"
+        );
+        let long = format_likely_cause("nvlddmkm.sys", Some(&"N".repeat(200)), DeviceClass::Gpu);
+        assert!(long.ends_with(" [gpu]"), "class tag survives truncation: {long}");
+        assert!(long.chars().count() <= MAX_VALUE_CHARS);
+        assert_eq!(
+            format_likely_cause("ndis.sys", None, DeviceClass::Network),
+            "ndis.sys [network]"
+        );
+        assert_eq!(
+            format_correlation(&CorrelationOutcome::Measured {
+                series: "gpu activity",
+                r: 0.812,
+                span_ms: 5 * 60_000,
+            }),
+            "gpu activity r=0.81 over 5 m"
+        );
+        assert_eq!(
+            format_correlation(&CorrelationOutcome::Insufficient),
+            "insufficient signal"
+        );
+        assert_eq!(format_span(45_000), "45 s");
+        assert_eq!(format_span(298_000), "5 m");
     }
 
     #[test]
@@ -1175,9 +2282,42 @@ mod tests {
                     println!("  {name:<20} {percent:>3}% ({count})  {description}");
                 }
                 println!("evidence rows:");
-                let rows = engine.build_rows(&result);
+                let (record, rows) = engine.build_capture(&result, 0);
                 for row in &rows {
                     println!("  {} = {}", row.label, row.value);
+                }
+                // The verdict a real finding would carry after this single
+                // trace. The probe has no device-activity ring behind it, so
+                // the correlation line honestly reads "insufficient signal".
+                match record.and_then(|record| modal_candidate(&[record])) {
+                    None => println!("verdict: none (no attributable events)"),
+                    Some(candidate) => {
+                        let description = engine.source_mut().driver_description(&candidate.driver);
+                        let class = classify_driver(&candidate.driver, description.as_deref());
+                        let correlation = class_correlation(&engine.activity, class);
+                        let confidence = assess_confidence(
+                            candidate.consistent,
+                            candidate.captures,
+                            candidate.mean_share,
+                            candidate.margin,
+                            correlation.matched_r(),
+                        );
+                        println!(
+                            "verdict: {} = {}",
+                            LIKELY_CAUSE_LABEL,
+                            format_likely_cause(&candidate.driver, description.as_deref(), class)
+                        );
+                        println!(
+                            "verdict: {} = {}",
+                            CONFIDENCE_LABEL,
+                            format_confidence(confidence, &candidate)
+                        );
+                        println!(
+                            "verdict: {} = {}",
+                            CORRELATION_LABEL,
+                            format_correlation(&correlation)
+                        );
+                    }
                 }
                 if result.total_events() > 0 {
                     assert!(
