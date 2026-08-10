@@ -172,16 +172,27 @@ impl<S: DumpSource> DumpEngine<S> {
             .filter(|meta| now_ms.saturating_sub(meta.modified_ms) <= CRASH_COUNT_WINDOW_MS)
             .count();
 
+        // Dumps older than the crash-count window are history, not incidents:
+        // "seen" by the scanner is discovery time, and surfacing a months-old
+        // dump as a fresh finding misleads. They still show in the count row.
+        let stale_dumps = discovered
+            .iter()
+            .filter(|meta| now_ms.saturating_sub(meta.modified_ms) > CRASH_COUNT_WINDOW_MS)
+            .count();
+
         let mut changed = Vec::new();
         let mut present = std::collections::HashSet::new();
         for meta in &discovered {
+            if now_ms.saturating_sub(meta.modified_ms) > CRASH_COUNT_WINDOW_MS {
+                continue;
+            }
             let key = (meta.path.clone(), meta.modified_ms);
             let Some(outcome) = self.triage_cache.get(&key) else {
                 continue;
             };
             let id = finding_id(meta);
             present.insert(id.clone());
-            let candidate = build_alert(&id, meta, outcome, now_ms, recent_crashes);
+            let candidate = build_alert(&id, meta, outcome, now_ms, recent_crashes, stale_dumps);
             match self.active.get_mut(&id) {
                 Some(alert) => {
                     alert.last_seen_ms = now_ms;
@@ -233,7 +244,17 @@ fn build_alert(
     outcome: &TriageOutcome,
     now_ms: i64,
     recent_crashes: usize,
+    stale_dumps: usize,
 ) -> Alert {
+    // The crash moment is the file's modified time — the finding's timeline
+    // anchors there, and the row states it absolutely so an old dump can
+    // never masquerade as a fresh incident.
+    let crashed_row = evidence(
+        "Crashed",
+        chrono::DateTime::from_timestamp_millis(meta.modified_ms)
+            .map(|stamp| stamp.format("%Y-%m-%d %H:%M UTC").to_string())
+            .unwrap_or_else(|| format!("{} ago", format_age(now_ms - meta.modified_ms))),
+    );
     let dump_row = evidence(
         "Dump",
         format!(
@@ -246,8 +267,13 @@ fn build_alert(
     let count_row = evidence(
         "Crash count",
         format!(
-            "{recent_crashes} dump{} in 30 days",
-            if recent_crashes == 1 { "" } else { "s" }
+            "{recent_crashes} dump{} in 30 days{}",
+            if recent_crashes == 1 { "" } else { "s" },
+            if stale_dumps > 0 {
+                format!(" · {stale_dumps} older on disk")
+            } else {
+                String::new()
+            }
         ),
     );
     let mut severity = Severity::Warning;
@@ -311,13 +337,14 @@ fn build_alert(
             "Check the file's permissions and integrity; with the Debugging Tools installed, run the full WinDbg analysis on it.",
         ),
     };
+    rows.push(crashed_row);
     rows.push(dump_row);
     rows.push(count_row);
     Alert {
         id: id.to_string(),
         kind: CRASH_DUMP_KIND.into(),
         severity,
-        first_seen_ms: now_ms,
+        first_seen_ms: meta.modified_ms,
         last_seen_ms: now_ms,
         process_id: None,
         process_name,
@@ -956,7 +983,8 @@ mod tests {
         let mut engine = engine_with(
             vec![
                 meta(r"C:\Windows\Minidump\fresh.dmp", now - HOUR_MS),
-                meta(r"C:\Windows\Minidump\stale.dmp", now - 90 * 24 * HOUR_MS),
+                // Older than 48 h (warning) but inside the 30-day incident window.
+                meta(r"C:\Windows\Minidump\stale.dmp", now - 5 * 24 * HOUR_MS),
             ],
             vec![
                 (r"C:\Windows\Minidump\fresh.dmp", kernel.clone()),
@@ -995,7 +1023,7 @@ mod tests {
             .iter()
             .find(|e| e.label == "Crash count")
             .expect("count row");
-        assert_eq!(count.value, "1 dump in 30 days");
+        assert_eq!(count.value, "2 dumps in 30 days");
     }
 
     #[test]
@@ -1068,11 +1096,53 @@ mod tests {
     }
 
     #[test]
+    fn old_dumps_are_counted_but_never_raised_and_findings_anchor_to_crash_time() {
+        let now = 100 * 24 * HOUR_MS;
+        let kernel = DumpTriage::Kernel {
+            bugcheck_code: 0x133,
+            parameters: [0; 4],
+        };
+        let mut engine = engine_with(
+            vec![
+                meta(r"C:\Windows\Minidump\recent.dmp", now - 2 * HOUR_MS),
+                meta(r"C:\Windows\Minidumpncient.dmp", now - 90 * 24 * HOUR_MS),
+            ],
+            vec![
+                (r"C:\Windows\Minidump\recent.dmp", kernel.clone()),
+                (r"C:\Windows\Minidumpncient.dmp", kernel),
+            ],
+        );
+        engine.observe(now - FIRST_SCAN_DELAY_MS);
+        let changed = engine.observe(now);
+        // The ancient dump raises no finding; it stays in the count row.
+        assert_eq!(changed.len(), 1);
+        let finding = &changed[0];
+        assert!(finding.evidence.iter().any(|e| e.value.contains("recent.dmp")));
+        assert_eq!(
+            finding.first_seen_ms,
+            now - 2 * HOUR_MS,
+            "finding timeline anchors to the crash moment, not discovery"
+        );
+        assert!(
+            finding
+                .evidence
+                .iter()
+                .any(|e| e.label == "Crashed" && e.value.contains("UTC"))
+        );
+        let count = finding
+            .evidence
+            .iter()
+            .find(|e| e.label == "Crash count")
+            .expect("count row");
+        assert_eq!(count.value, "1 dump in 30 days · 1 older on disk");
+    }
+
+    #[test]
     fn disappearing_dump_resolves_its_finding() {
         let now = 40 * 24 * HOUR_MS;
         let path = r"C:\Windows\Minidump\gone.dmp";
         let mut engine = engine_with(
-            vec![meta(path, 1_000)],
+            vec![meta(path, now - HOUR_MS)],
             vec![(
                 path,
                 DumpTriage::Kernel {
@@ -1100,7 +1170,10 @@ mod tests {
     #[test]
     fn degraded_triage_still_surfaces_the_dump() {
         let now = 40 * 24 * HOUR_MS;
-        let mut engine = engine_with(vec![meta(r"C:\Windows\MEMORY.DMP", 1_000)], Vec::new());
+        let mut engine = engine_with(
+            vec![meta(r"C:\Windows\MEMORY.DMP", 40 * 24 * HOUR_MS - HOUR_MS)],
+            Vec::new(),
+        );
         engine.source_mut().fail_triage = true;
         engine.observe(0);
         let changed = engine.observe(now);
