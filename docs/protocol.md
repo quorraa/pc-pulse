@@ -2,7 +2,7 @@
 
 PC Pulse protocol version 1 uses one UTF-8 JSON object per message on `\\.\pipe\PcPulse.v1`. The pipe is local-only, message-mode, duplex, and capped at 1 MiB in both directions. The dashboard opens a fresh connection for each request so service shutdown cannot be held open by an idle client.
 
-Every request has a camel-case `command`. Successful responses are:
+Every request has a camel-case `command`; request parameter fields are snake_case (`alert_id`, `from_ms`) while response payload fields are camelCase — the two directions deliberately differ, and the tables below show the exact wire spellings. Successful responses are:
 
 ```json
 {"status":"ok","data":{}}
@@ -21,18 +21,18 @@ Errors do not disclose stack traces:
 | `ping` | — | Protocol and service versions |
 | `getSnapshot` | — | Latest system sample, all live processes, active alerts |
 | `live` | — | Most recent high-rate system-only sample; also marks live-channel liveness (see below) |
-| `getHistory` | `fromMs`, `toMs`, `limit` | System and process samples; transport-safe limit is clamped to 750 |
-| `getSystemHistory` | `fromMs`, `toMs`, `limit` | System-only history downsampled evenly across the requested window; limit is clamped to 800 |
-| `getAlerts` | `fromMs`, `limit` | Active/resolved alert history; transport-safe limit is clamped to 300 |
-| `getDiagnosticLogs` | `fromMs`, `limit` | Redacted high-signal Application/System event records plus collector health; transport-safe limit is clamped to 200 |
-| `getAgentContext` | `windowHours` | Bounded, redacted system/process/log rollups and exact evidence references; 1–24 hours |
+| `getHistory` | `from_ms`, `to_ms`, `limit` | System and process samples; transport-safe limit is clamped to 750 |
+| `getSystemHistory` | `from_ms`, `to_ms`, `limit` | System-only history downsampled evenly across the requested window; limit is clamped to 800 |
+| `getAlerts` | `from_ms`, `limit` | Active/resolved alert history; transport-safe limit is clamped to 300 |
+| `getDiagnosticLogs` | `from_ms`, `limit` | Redacted high-signal Application/System event records plus collector health; transport-safe limit is clamped to 200 |
+| `getAgentContext` | `window_hours` | Bounded, redacted system/process/log rollups and exact evidence references; 1–24 hours |
 | `getOptimizationPlans` | `limit` | Previously validated systems-analyzer plans; transport-safe limit is clamped to 5 |
 | `saveOptimizationPlan` | `plan` | Validate and persist a schema-v1 display-only optimization plan |
 | `getSettings` | — | Validated detector settings |
 | `updateSettings` | `settings` | Saved settings or a validation error |
 | `getProcessTree` | — | Current processes nested by parent PID |
-| `acknowledgeAlert` | `alertId` | Acknowledgment result |
-| `archiveAlert` | `alertId`, `archived` | Archive-flag result; `archived: false` recovers a finding |
+| `acknowledgeAlert` | `alert_id` | Acknowledgment result |
+| `archiveAlert` | `alert_id`, `archived` | Archive-flag result; `archived: false` recovers a finding |
 | `terminateProcess` | `pid`, `confirmed` | Termination result |
 
 ## The `live` channel

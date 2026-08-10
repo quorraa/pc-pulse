@@ -818,12 +818,11 @@ mod tests {
         })
         .unwrap();
         assert!(archive.contains(r#""command":"archiveAlert""#));
-        let field = if acknowledge.contains("\"alertId\"") {
-            "\"alertId\""
-        } else {
-            "\"alert_id\""
-        };
-        assert!(archive.contains(field), "field convention must match: {archive}");
+        // The documented wire contract (docs/protocol.md): command tags are
+        // camelCase (container rename_all), struct-variant FIELDS are
+        // snake_case — serde's container rename_all does not reach them.
+        assert!(acknowledge.contains("\"alert_id\""), "wire: {acknowledge}");
+        assert!(archive.contains("\"alert_id\""), "wire: {archive}");
         let request: PipeRequest = serde_json::from_str(&archive).unwrap();
         match request {
             PipeRequest::ArchiveAlert { alert_id, archived } => {
@@ -832,6 +831,27 @@ mod tests {
             }
             other => panic!("unexpected parse: {other:?}"),
         }
+    }
+
+    #[test]
+    fn request_fields_are_snake_case_on_the_wire_as_documented() {
+        let history: PipeRequest = serde_json::from_str(
+            r#"{"command":"getHistory","from_ms":1,"to_ms":2,"limit":10}"#,
+        )
+        .expect("documented snake_case fields must parse");
+        assert!(matches!(history, PipeRequest::GetHistory { .. }));
+        let context: PipeRequest =
+            serde_json::from_str(r#"{"command":"getAgentContext","window_hours":2}"#)
+                .expect("documented snake_case fields must parse");
+        assert!(matches!(context, PipeRequest::GetAgentContext { .. }));
+        // The camelCase spelling protocol.md previously documented never
+        // worked; keep it failing loudly rather than silently half-working.
+        assert!(
+            serde_json::from_str::<PipeRequest>(
+                r#"{"command":"acknowledgeAlert","alertId":"x"}"#
+            )
+            .is_err()
+        );
     }
 
     #[test]
