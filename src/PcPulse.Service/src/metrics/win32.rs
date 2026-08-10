@@ -238,7 +238,9 @@ impl ProcessCollector {
     }
 }
 
-pub fn system_metric(timestamp_ms: i64) -> Result<SystemMetric> {
+/// `(total, used)` physical memory in bytes — one `GlobalMemoryStatusEx`
+/// call, shared by the 2-second snapshot and the high-rate live sampler.
+pub(super) fn physical_memory() -> Result<(u64, u64)> {
     let mut memory = MEMORYSTATUSEX {
         dwLength: size_of::<MEMORYSTATUSEX>() as u32,
         ..Default::default()
@@ -246,6 +248,14 @@ pub fn system_metric(timestamp_ms: i64) -> Result<SystemMetric> {
     unsafe {
         GlobalMemoryStatusEx(&mut memory)?;
     }
+    Ok((
+        memory.ullTotalPhys,
+        memory.ullTotalPhys.saturating_sub(memory.ullAvailPhys),
+    ))
+}
+
+pub fn system_metric(timestamp_ms: i64) -> Result<SystemMetric> {
+    let (memory_total_bytes, memory_used_bytes) = physical_memory()?;
     let mut performance = PERFORMANCE_INFORMATION {
         cb: size_of::<PERFORMANCE_INFORMATION>() as u32,
         ..Default::default()
@@ -258,8 +268,8 @@ pub fn system_metric(timestamp_ms: i64) -> Result<SystemMetric> {
     }
     Ok(SystemMetric {
         timestamp_ms,
-        memory_total_bytes: memory.ullTotalPhys,
-        memory_used_bytes: memory.ullTotalPhys.saturating_sub(memory.ullAvailPhys),
+        memory_total_bytes,
+        memory_used_bytes,
         paged_pool_bytes: performance.KernelPaged.saturating_mul(performance.PageSize) as u64,
         nonpaged_pool_bytes: performance
             .KernelNonpaged

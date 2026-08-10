@@ -90,7 +90,7 @@ Important keys:
 | `s` | Save settings |
 | `r` | Refresh the current view |
 | `m` | Toggle finite TachyonFX motion effects; the choice is saved per user |
-| Refresh rate (Settings CLIENT row) | Off (event-driven, default) / 30 / 60 fps, saved per user; 30/60 draws on a fixed cadence with smooth interpolation of meters between telemetry samples, and drops a tier automatically if frames keep exceeding their budget |
+| Refresh rate (Settings CLIENT row) | Off (event-driven, default) / 30 / 60 fps, saved per user; 30/60 draws on a fixed cadence with smooth interpolation of meters between telemetry samples, and drops a tier automatically if frames keep exceeding their budget. With a v1.11+ service, smooth mode streams system telemetry live at up to 8 Hz; per-process data stays on the two-second cadence |
 | `t` | Cycle presentation profiles (vitals / avionics / ledger); the choice is saved per user |
 | `?` | Open the keys overlay on top of any page; `Esc`, `?`, or a click closes it (the Keys page itself stays on `8`) |
 | `q` / `Ctrl-C` | Exit the TUI; the collector continues |

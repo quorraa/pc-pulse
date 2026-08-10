@@ -59,6 +59,49 @@ impl Default for SystemMetric {
     }
 }
 
+/// One high-rate system-level telemetry sample for smooth-mode clients.
+///
+/// Produced by the dedicated live PDH query (no process enumeration) at up
+/// to 8 Hz while a client keeps requesting `live`. `available` is `false`
+/// when the sampler has not yet warmed — rate counters need a prior
+/// collection, so the first ~125 ms after the live loop starts honestly
+/// report no data instead of fabricated zero rates.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct LiveSample {
+    pub available: bool,
+    pub timestamp_ms: i64,
+    pub cpu_percent: f64,
+    pub memory_used_bytes: u64,
+    pub memory_total_bytes: u64,
+    pub disk_read_bytes_per_sec: f64,
+    pub disk_write_bytes_per_sec: f64,
+    pub disk_latency_ms: f64,
+    pub network_bytes_per_sec: f64,
+    pub dpc_rate: f64,
+    pub interrupt_rate: f64,
+}
+
+impl LiveSample {
+    /// The honest "not warmed up yet" payload served before the live loop
+    /// holds a rate-valid collection.
+    pub fn unavailable(timestamp_ms: i64) -> Self {
+        Self {
+            available: false,
+            timestamp_ms,
+            cpu_percent: 0.0,
+            memory_used_bytes: 0,
+            memory_total_bytes: 0,
+            disk_read_bytes_per_sec: 0.0,
+            disk_write_bytes_per_sec: 0.0,
+            disk_latency_ms: 0.0,
+            network_bytes_per_sec: 0.0,
+            dpc_rate: 0.0,
+            interrupt_rate: 0.0,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ProcessMetric {
@@ -551,6 +594,10 @@ impl OptimizationPlan {
 pub enum PipeRequest {
     Ping,
     GetSnapshot,
+    /// Most recent high-rate system sample. Also marks live-channel
+    /// liveness: the sampler starts on the first request and stops after
+    /// ten seconds without one.
+    Live,
     GetHistory {
         from_ms: i64,
         to_ms: i64,
@@ -673,6 +720,49 @@ mod tests {
         })
         .unwrap();
         assert!(json.contains("\"networkBytesPerSec\":1500000.0"));
+    }
+
+    #[test]
+    fn live_sample_round_trips_in_camel_case() {
+        let sample = LiveSample {
+            available: true,
+            timestamp_ms: 1_800_000_000_000,
+            cpu_percent: 37.5,
+            memory_used_bytes: 17_179_869_184,
+            memory_total_bytes: 34_359_738_368,
+            disk_read_bytes_per_sec: 1_048_576.0,
+            disk_write_bytes_per_sec: 524_288.0,
+            disk_latency_ms: 1.4,
+            network_bytes_per_sec: 250_000.0,
+            dpc_rate: 1_200.0,
+            interrupt_rate: 9_500.0,
+        };
+        let json = serde_json::to_string(&sample).unwrap();
+        for key in [
+            "\"available\"",
+            "\"timestampMs\"",
+            "\"cpuPercent\"",
+            "\"memoryUsedBytes\"",
+            "\"memoryTotalBytes\"",
+            "\"diskReadBytesPerSec\"",
+            "\"diskWriteBytesPerSec\"",
+            "\"diskLatencyMs\"",
+            "\"networkBytesPerSec\"",
+            "\"dpcRate\"",
+            "\"interruptRate\"",
+        ] {
+            assert!(json.contains(key), "wire name {key} missing from {json}");
+        }
+        let restored: LiveSample = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored, sample);
+    }
+
+    #[test]
+    fn live_command_parses_from_its_wire_name() {
+        let request: PipeRequest = serde_json::from_str(r#"{"command":"live"}"#).unwrap();
+        assert!(matches!(request, PipeRequest::Live));
+        let json = serde_json::to_string(&PipeRequest::Live).unwrap();
+        assert_eq!(json, r#"{"command":"live"}"#);
     }
 
     fn plan() -> OptimizationPlan {

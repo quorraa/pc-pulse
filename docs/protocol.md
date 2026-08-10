@@ -20,6 +20,7 @@ Errors do not disclose stack traces:
 |---|---|---|
 | `ping` | — | Protocol and service versions |
 | `getSnapshot` | — | Latest system sample, all live processes, active alerts |
+| `live` | — | Most recent high-rate system-only sample; also marks live-channel liveness (see below) |
 | `getHistory` | `fromMs`, `toMs`, `limit` | System and process samples; transport-safe limit is clamped to 750 |
 | `getSystemHistory` | `fromMs`, `toMs`, `limit` | System-only history downsampled evenly across the requested window; limit is clamped to 800 |
 | `getAlerts` | `fromMs`, `limit` | Active/resolved alert history; transport-safe limit is clamped to 300 |
@@ -32,6 +33,25 @@ Errors do not disclose stack traces:
 | `getProcessTree` | — | Current processes nested by parent PID |
 | `acknowledgeAlert` | `alertId` | Acknowledgment result |
 | `terminateProcess` | `pid`, `confirmed` | Termination result |
+
+## The `live` channel
+
+`live` (service 1.11+) serves the smooth-refresh dashboard fresh system numbers at up to 8 Hz without touching the 2-second snapshot pipeline. The payload is one JSON object:
+
+```json
+{"available":true,"timestampMs":0,"cpuPercent":0,"memoryUsedBytes":0,"memoryTotalBytes":0,"diskReadBytesPerSec":0,"diskWriteBytesPerSec":0,"diskLatencyMs":0,"networkBytesPerSec":0,"dpcRate":0,"interruptRate":0}
+```
+
+Gating semantics — the channel is strictly activity-gated so its idle cost is zero syscalls, zero threads, zero handles:
+
+- The first `live` request starts a dedicated sampling loop that collects every 125 ms on its **own** PDH query, so high-rate collection can never skew the main 2-second query's rate windows. There is no process enumeration on this path.
+- Every request marks liveness; the loop stops (closing its PDH handles) after 10 seconds without a request.
+- Rate counters need a prior collection, so requests during the loop's warm-up (~125 ms after start, including the request that started it) return `available: false` with zeroed fields rather than fabricated rates. Clients must ignore unavailable samples.
+- Responses always return the most recent completed sample; the service keeps no ring and no history for this channel.
+
+Budget: while subscribed, the loop costs one `PdhCollectQueryData` over a seven-counter query plus one `GlobalMemoryStatusEx` every 125 ms (well under 0.01 % normalized CPU against the 0.2 % collector budget) and one extra PDH query handle set that exists only while a subscriber is active. Collections are never closer than 100 ms — PDH rate counters get noisy below that window.
+
+`protocolVersion` is unchanged (still 1): `live` is additive. A pre-1.11 service answers it with the ordinary unknown-command `invalidRequest` error, and the dashboard degrades cleanly — it notes the fact once, stops sending `live` for the session, and smooth mode continues on 2-second snapshots.
 
 `terminateProcess` is rejected unless `confirmed` is exactly `true`. The TUI sends it only after the user types the selected process's exact PID. The service independently rejects system/idle PIDs and its own PID.
 

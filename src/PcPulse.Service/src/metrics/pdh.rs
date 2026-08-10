@@ -8,7 +8,7 @@ use windows::{
     core::PCWSTR,
 };
 
-const ERROR_SUCCESS: u32 = 0;
+pub(super) const ERROR_SUCCESS: u32 = 0;
 /// PDH's "call again with this buffer size" status for array counters.
 const PDH_MORE_DATA: u32 = 0x8000_07D2;
 
@@ -126,7 +126,7 @@ impl Drop for PdhCollector {
     }
 }
 
-unsafe fn add_counter(query: PDH_HQUERY, path: &str) -> Result<PDH_HCOUNTER> {
+pub(super) unsafe fn add_counter(query: PDH_HQUERY, path: &str) -> Result<PDH_HCOUNTER> {
     let wide: Vec<u16> = path.encode_utf16().chain(Some(0)).collect();
     let mut counter = PDH_HCOUNTER::default();
     let status = unsafe { PdhAddEnglishCounterW(query, PCWSTR(wide.as_ptr()), 0, &mut counter) };
@@ -140,7 +140,7 @@ unsafe fn add_counter(query: PDH_HQUERY, path: &str) -> Result<PDH_HCOUNTER> {
 /// values. A `_Total` pseudo-instance (not normally present for "Network
 /// Interface") is skipped so nothing is counted twice; any status other than
 /// success degrades to zero rather than failing the sample.
-unsafe fn formatted_wildcard_sum(counter: PDH_HCOUNTER) -> f64 {
+pub(super) unsafe fn formatted_wildcard_sum(counter: PDH_HCOUNTER) -> f64 {
     unsafe {
         let mut buffer_bytes = 0u32;
         let mut item_count = 0u32;
@@ -185,7 +185,7 @@ unsafe fn formatted_wildcard_sum(counter: PDH_HCOUNTER) -> f64 {
     }
 }
 
-unsafe fn formatted(counter: PDH_HCOUNTER) -> f64 {
+pub(super) unsafe fn formatted(counter: PDH_HCOUNTER) -> f64 {
     let mut value = PDH_FMT_COUNTERVALUE::default();
     let status = unsafe { PdhGetFormattedCounterValue(counter, PDH_FMT_DOUBLE, None, &mut value) };
     if status != ERROR_SUCCESS || value.CStatus != ERROR_SUCCESS {

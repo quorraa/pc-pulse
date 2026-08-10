@@ -8,6 +8,7 @@ use crate::{
         MetricCollector,
         forensics::{ForensicsEngine, WindowsForensicsSource},
         interrupts::{InterruptEngine, WindowsInterruptSource},
+        live::LiveEngine,
     },
     models::{
         DiagnosticLogResponse, DiagnosticLogStatus, PipeRequest, PipeResponse, ProcessMetric,
@@ -38,6 +39,9 @@ pub struct AppState {
     pub log_status: Mutex<DiagnosticLogStatus>,
     issued_contexts: Mutex<VecDeque<IssuedContext>>,
     pub settings_path: PathBuf,
+    /// Activity-gated high-rate telemetry for smooth-mode clients: zero
+    /// idle cost, started by the first `live` request, stopped on idle.
+    pub live: LiveEngine,
 }
 
 impl AppState {
@@ -57,6 +61,7 @@ impl AppState {
                 "protocolVersion": crate::PROTOCOL_VERSION,
                 "serviceVersion": env!("CARGO_PKG_VERSION")
             })),
+            PipeRequest::Live => Ok(serde_json::to_value(self.live.request())?),
             PipeRequest::GetSnapshot => Ok(serde_json::to_value(
                 self.snapshot
                     .read()
@@ -300,6 +305,7 @@ pub fn run(data_dir: &Path, stop: crossbeam_channel::Receiver<()>) -> Result<()>
         log_status: Mutex::new(DiagnosticLogStatus::default()),
         issued_contexts: Mutex::new(VecDeque::new()),
         settings_path,
+        live: LiveEngine::windows(),
     });
     let pipe_stop = Arc::new(AtomicBool::new(false));
     let pipe_state = Arc::clone(&state);
@@ -536,10 +542,8 @@ mod tests {
         assert_eq!(tree[0].children[0].children[0].process.pid, 12);
     }
 
-    #[test]
-    fn saved_plan_must_match_a_recent_issued_context() {
-        let directory = tempfile::tempdir().unwrap();
-        let state = AppState {
+    fn test_state(directory: &tempfile::TempDir) -> AppState {
+        AppState {
             snapshot: RwLock::new(Snapshot::default()),
             settings: RwLock::new(Settings::default()),
             storage: Arc::new(Storage::open(&directory.path().join("history.db")).unwrap()),
@@ -547,7 +551,35 @@ mod tests {
             log_status: Mutex::new(DiagnosticLogStatus::default()),
             issued_contexts: Mutex::new(VecDeque::new()),
             settings_path: directory.path().join("settings.json"),
-        };
+            live: LiveEngine::windows(),
+        }
+    }
+
+    #[test]
+    fn live_command_serves_a_sample_payload_over_the_pipe_contract() {
+        use crate::models::LiveSample;
+        let directory = tempfile::tempdir().unwrap();
+        let state = test_state(&directory);
+        // Mirror the pipe path exactly: parse the wire command, dispatch it,
+        // and require a decodable ok payload. The engine has not warmed
+        // (this may be the request that starts it), so `available` must be
+        // false — never fabricated rates.
+        let request: PipeRequest = serde_json::from_str(r#"{"command":"live"}"#).unwrap();
+        match state.handle(request) {
+            PipeResponse::Ok { data } => {
+                let sample: LiveSample = serde_json::from_value(data).unwrap();
+                assert!(!sample.available, "unwarmed live channel must say so");
+            }
+            PipeResponse::Error { code, message } => {
+                panic!("live must answer ok on a current service: {code} {message}")
+            }
+        }
+    }
+
+    #[test]
+    fn saved_plan_must_match_a_recent_issued_context() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = test_state(&directory);
         let now_ms = Utc::now().timestamp_millis();
         let snapshot = Snapshot::default();
         let settings = Settings::default();

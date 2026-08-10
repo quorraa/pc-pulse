@@ -3,8 +3,8 @@ use pcpulse_service::{
     PIPE_NAME,
     config::Settings,
     models::{
-        AgentContext, Alert, DiagnosticLogResponse, HistoryResponse, OptimizationPlan, PipeRequest,
-        PipeResponse, ProcessNode, Snapshot,
+        AgentContext, Alert, DiagnosticLogResponse, HistoryResponse, LiveSample, OptimizationPlan,
+        PipeRequest, PipeResponse, ProcessNode, Snapshot,
     },
 };
 use serde::de::DeserializeOwned;
@@ -34,6 +34,13 @@ impl PipeClient {
 
     pub fn snapshot(&self) -> Result<Snapshot> {
         self.send(&PipeRequest::GetSnapshot)
+    }
+
+    /// The most recent high-rate system sample; also keeps the service's
+    /// live sampling loop alive. Old services answer with an
+    /// `invalidRequest` error, which callers treat as "not supported".
+    pub fn live(&self) -> Result<LiveSample> {
+        self.send(&PipeRequest::Live)
     }
 
     pub fn history(&self, from_ms: i64, to_ms: i64, limit: u32) -> Result<HistoryResponse> {

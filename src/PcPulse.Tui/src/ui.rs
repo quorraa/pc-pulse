@@ -2350,18 +2350,39 @@ fn clean_ceiling(value: f64) -> f64 {
     10.0 * magnitude
 }
 
+/// The pressure-field point sources: the 2-second snapshot history, plus —
+/// in smooth mode with a live-capable service — the 8 Hz live tail. The
+/// snapshot series is truncated where the tail begins so the two cadences
+/// never overdraw the same span; the x-axis is timestamp-based, so mixed
+/// spacing is naturally tolerated.
+fn pressure_field_points(app: &App) -> Vec<&pcpulse_service::models::SystemMetric> {
+    let tail_active = app.effective_refresh_fps() > 0 && !app.live_tail.is_empty();
+    if !tail_active {
+        return app.live_history.iter().collect();
+    }
+    let cutoff = app
+        .live_tail
+        .front()
+        .map(|point| point.timestamp_ms)
+        .unwrap_or(i64::MAX);
+    app.live_history
+        .iter()
+        .filter(|point| point.timestamp_ms < cutoff)
+        .chain(app.live_tail.iter())
+        .collect()
+}
+
 fn render_pressure_field(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let Some(snapshot) = &app.snapshot else {
         return;
     };
-    let (minimum, maximum) = time_span(app.live_history.iter().map(|point| point.timestamp_ms));
-    let cpu = app
-        .live_history
+    let points = pressure_field_points(app);
+    let (minimum, maximum) = time_span(points.iter().map(|point| point.timestamp_ms));
+    let cpu = points
         .iter()
         .map(|point| (point.timestamp_ms as f64, point.cpu_percent))
         .collect::<Vec<_>>();
-    let memory = app
-        .live_history
+    let memory = points
         .iter()
         .map(|point| {
             (
@@ -5629,7 +5650,7 @@ mod tests {
     use super::*;
     use crate::app::{HardwareTrace, TreeRow};
     use pcpulse_service::models::{
-        GpuMetrics, ProcessMetric, ProcessNode, Snapshot, SystemMetric, ThermalZone,
+        GpuMetrics, LiveSample, ProcessMetric, ProcessNode, Snapshot, SystemMetric, ThermalZone,
     };
     use ratatui::{Terminal, backend::TestBackend, buffer::Buffer};
     use std::collections::VecDeque;
@@ -5651,6 +5672,100 @@ mod tests {
             assert_ne!(p.text, p.muted, "{}", profile.name);
             assert_ne!(p.border, p.border_hot, "{}", profile.name);
         }
+    }
+
+    fn test_live_sample(timestamp_ms: i64, cpu: f64) -> LiveSample {
+        LiveSample {
+            available: true,
+            timestamp_ms,
+            cpu_percent: cpu,
+            memory_used_bytes: 8_000_000_000,
+            memory_total_bytes: 16_000_000_000,
+            disk_read_bytes_per_sec: 0.0,
+            disk_write_bytes_per_sec: 0.0,
+            disk_latency_ms: 1.0,
+            network_bytes_per_sec: 0.0,
+            dpc_rate: 0.0,
+            interrupt_rate: 0.0,
+        }
+    }
+
+    #[test]
+    fn pressure_field_merges_the_live_tail_without_overdrawing_snapshots() {
+        let _theme = theme::test_support::activate(theme::ThemeId::Vitals);
+        let mut app = sample_app();
+        let base = app.snapshot.as_ref().expect("snapshot").system.clone();
+        app.live_history.clear();
+        for step in 0..10_i64 {
+            let mut point = base.clone();
+            point.timestamp_ms = step * 2_000;
+            app.live_history.push_back(point);
+        }
+        for step in 0..8_i64 {
+            let mut point = base.clone();
+            point.timestamp_ms = 15_000 + step * 125;
+            app.live_tail.push_back(point);
+        }
+        // Event-driven mode ignores the tail entirely (byte-identical to a
+        // build without the live channel).
+        app.client_prefs.refresh_fps = 0;
+        assert_eq!(pressure_field_points(&app).len(), 10);
+        // Smooth mode splices: snapshot points strictly before the tail's
+        // start, then the whole high-res tail, in chronological order.
+        app.client_prefs.refresh_fps = 30;
+        let points = pressure_field_points(&app);
+        assert_eq!(points.len(), 8 + 8, "ts 0..14000 from history, tail after");
+        assert!(
+            points
+                .iter()
+                .zip(points.iter().skip(1))
+                .all(|(left, right)| left.timestamp_ms < right.timestamp_ms),
+            "mixed cadences must still be chronological"
+        );
+        assert_eq!(points[7].timestamp_ms, 14_000);
+        assert_eq!(points[8].timestamp_ms, 15_000);
+        // The overview still renders with the mixed-cadence chart.
+        let backend = render(&mut app);
+        assert!(buffer_text(backend.buffer()).contains("PRESSURE FIELD"));
+    }
+
+    #[test]
+    fn live_updates_do_not_fire_the_sample_motion_cue() {
+        let _theme = theme::test_support::activate(theme::ThemeId::Vitals);
+        let mut app = sample_app();
+        app.client_prefs.refresh_fps = 30;
+        let mut motion = crate::effects::MotionSystem::new(&app, true);
+        let mut terminal = Terminal::new(TestBackend::new(120, 36)).expect("terminal");
+        // Settle the startup composition so is_animating() is a clean probe:
+        // any queued cue afterwards flips it back to true.
+        for _ in 0..60 {
+            if !motion.is_animating() {
+                break;
+            }
+            terminal
+                .draw(|frame| motion.render(frame, std::time::Duration::from_millis(100)))
+                .expect("draw");
+            let _ = motion.take_cleanup_frame();
+        }
+        assert!(!motion.is_animating(), "startup must settle");
+
+        // Live samples re-target the tween and extend the tail, but the
+        // Sample motion cue keys off snapshot.system.timestamp_ms — which
+        // live updates never touch. 8 Hz data must not strobe the shimmer.
+        let base_ts = app.snapshot.as_ref().expect("snapshot").system.timestamp_ms;
+        app.apply_live(test_live_sample(base_ts + 125, 90.0));
+        assert_eq!(app.live_tail.len(), 1, "the live update was applied");
+        motion.observe(&app);
+        assert!(
+            !motion.is_animating(),
+            "a live sample must not queue any motion cue"
+        );
+
+        // Sanity check on the probe itself: a genuine snapshot timestamp
+        // change does queue the Sample cue.
+        app.snapshot.as_mut().expect("snapshot").system.timestamp_ms = base_ts + 2_000;
+        motion.observe(&app);
+        assert!(motion.is_animating(), "the probe still detects snapshots");
     }
 
     #[test]

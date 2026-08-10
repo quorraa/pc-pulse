@@ -11,7 +11,8 @@ use pcpulse_service::{
     config::Settings,
     models::{
         Alert, DiagnosticLogResponse, DiagnosticLogStatus, HardwareMetrics, HistoryResponse,
-        OptimizationPlan, ProcessMetric, ProcessNode, Severity, Snapshot, SystemMetric,
+        LiveSample, OptimizationPlan, ProcessMetric, ProcessNode, Severity, Snapshot,
+        SystemMetric,
     },
 };
 use ratatui::{
@@ -30,6 +31,11 @@ use std::{
 };
 
 const LIVE_HISTORY_CAPACITY: usize = 180;
+/// The high-res pressure-field tail: ~180 seconds of 8 Hz live samples.
+const LIVE_TAIL_CAPACITY: usize = 1_440;
+/// The live channel's request ceiling: never faster than 8 Hz, matching the
+/// service's 125 ms collection cadence.
+const LIVE_MAX_HZ: u32 = 8;
 /// Two left clicks on the same finding row within this window count as a
 /// double-click and open an investigation.
 const DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(400);
@@ -560,12 +566,23 @@ pub enum WorkerCommand {
     SaveSettings(Settings),
     Acknowledge(String),
     Terminate(u32),
+    /// Reconcile live polling with the effective refresh rate: `fps == 0`
+    /// stops the `live` requests entirely (event-driven mode stays
+    /// byte-identical to pre-live behavior); otherwise the worker polls at
+    /// `min(8 Hz, fps)` between the unchanged 2-second snapshot fetches.
+    ConfigureLive {
+        fps: u32,
+    },
     Stop,
 }
 
 #[derive(Debug)]
 pub enum WorkerEvent {
     Snapshot(Result<Snapshot, String>),
+    /// A high-rate system sample from the `live` pipe command. `Err` means
+    /// the service does not understand the command (pre-v1.11); the worker
+    /// sends it at most once per session and stops asking.
+    Live(Result<LiveSample, String>),
     Alerts(Result<Vec<Alert>, String>),
     History(Result<HistoryResponse, String>),
     Tree(Result<Vec<ProcessNode>, String>),
@@ -608,10 +625,36 @@ impl Drop for Worker {
     }
 }
 
+/// How often the worker polls `live` for a refresh tier: `None` at 0 fps
+/// (event-driven mode sends no live requests at all), else `min(8 Hz, fps)`
+/// expressed as a request spacing — 125 ms for both 30 and 60 fps.
+pub(crate) fn live_poll_interval(fps: u32) -> Option<Duration> {
+    if fps == 0 {
+        None
+    } else {
+        Some(Duration::from_millis(
+            1_000 / u64::from(fps.min(LIVE_MAX_HZ)),
+        ))
+    }
+}
+
+/// Whether a `live` failure means the service predates the command (the
+/// pre-v1.11 collector answers unknown commands with `invalidRequest`), as
+/// opposed to a transient pipe error worth retrying.
+pub(crate) fn live_unsupported_error(error: &anyhow::Error) -> bool {
+    format!("{error:#}").contains("(invalidRequest)")
+}
+
 fn worker_loop(commands: Receiver<WorkerCommand>, events: Sender<WorkerEvent>) {
     let client = PipeClient;
     let mut next_snapshot = Instant::now();
     let mut analyzer: Option<(JoinHandle<()>, Arc<AtomicBool>)> = None;
+    // Live polling rides the same thread between snapshot fetches; inert
+    // until a ConfigureLive command arms it, sticky-off for the session once
+    // the service proves it predates the command.
+    let mut live_every: Option<Duration> = None;
+    let mut next_live = Instant::now();
+    let mut live_unsupported = false;
     loop {
         if analyzer
             .as_ref()
@@ -620,7 +663,11 @@ fn worker_loop(commands: Receiver<WorkerCommand>, events: Sender<WorkerEvent>) {
         {
             let _ = handle.join();
         }
-        let wait = next_snapshot.saturating_duration_since(Instant::now());
+        let mut deadline = next_snapshot;
+        if live_every.is_some() && !live_unsupported {
+            deadline = deadline.min(next_live);
+        }
+        let wait = deadline.saturating_duration_since(Instant::now());
         select! {
             recv(commands) -> command => {
                 match command {
@@ -702,6 +749,10 @@ fn worker_loop(commands: Receiver<WorkerCommand>, events: Sender<WorkerEvent>) {
                         let _ = events.send(WorkerEvent::Action(result));
                         next_snapshot = Instant::now();
                     }
+                    Ok(WorkerCommand::ConfigureLive { fps }) => {
+                        live_every = live_poll_interval(fps);
+                        next_live = Instant::now();
+                    }
                     Ok(WorkerCommand::Stop) | Err(_) => {
                         if let Some((handle, cancellation)) = analyzer.take() {
                             cancellation.store(true, Ordering::Release);
@@ -712,8 +763,32 @@ fn worker_loop(commands: Receiver<WorkerCommand>, events: Sender<WorkerEvent>) {
                 }
             }
             default(wait) => {
-                let _ = events.send(WorkerEvent::Snapshot(client.snapshot().map_err(error_text)));
-                next_snapshot = Instant::now() + Duration::from_secs(2);
+                // The unchanged 2-second full-snapshot cadence.
+                if Instant::now() >= next_snapshot {
+                    let _ = events.send(WorkerEvent::Snapshot(client.snapshot().map_err(error_text)));
+                    next_snapshot = Instant::now() + Duration::from_secs(2);
+                }
+                // The lightweight live request between snapshot polls.
+                if let Some(every) = live_every
+                    && !live_unsupported
+                    && Instant::now() >= next_live
+                {
+                    match client.live() {
+                        Ok(sample) => {
+                            let _ = events.send(WorkerEvent::Live(Ok(sample)));
+                        }
+                        Err(error) if live_unsupported_error(&error) => {
+                            // Pre-v1.11 collector: note once, stop asking
+                            // for the rest of the session.
+                            live_unsupported = true;
+                            let _ = events.send(WorkerEvent::Live(Err(error_text(error))));
+                        }
+                        // Transient pipe trouble: the snapshot path owns
+                        // connection status; just try again next tick.
+                        Err(_) => {}
+                    }
+                    next_live = Instant::now() + every;
+                }
             }
         }
     }
@@ -735,6 +810,20 @@ pub struct App {
     pub status: String,
     pub status_is_error: bool,
     pub live_history: VecDeque<SystemMetric>,
+    /// The high-res pressure-field tail: system samples from the 8 Hz live
+    /// channel, kept apart from the 2-second [`Self::live_history`] so
+    /// mixed cadences never disturb the snapshot chart invariants. Bounded
+    /// to [`LIVE_TAIL_CAPACITY`] (~180 s at 8 Hz); consulted by the chart
+    /// only while smooth mode is on.
+    pub live_tail: VecDeque<SystemMetric>,
+    /// Sticky for the session: the service answered `live` with an
+    /// unknown-command error (pre-v1.11), so smooth mode runs on 2-second
+    /// snapshots exactly as v1.10.0 and no further live requests are sent.
+    pub live_unsupported: bool,
+    /// The last fps value handed to the worker's live poller, so refresh
+    /// changes send exactly one ConfigureLive each. `None` = never sent
+    /// (the worker default is off, so 0 fps needs no message).
+    live_fps_sent: Option<u32>,
     /// GAUGES sparklines: one bounded trace per temperature source, fed
     /// only when a snapshot carries a fresh hardware sample.
     pub hardware_history: Vec<HardwareTrace>,
@@ -852,6 +941,9 @@ impl App {
                 .unwrap_or_else(|| "Connecting to collector…".into()),
             status_is_error: history_error.is_some(),
             live_history: VecDeque::with_capacity(LIVE_HISTORY_CAPACITY),
+            live_tail: VecDeque::new(),
+            live_unsupported: false,
+            live_fps_sent: None,
             hardware_history: Vec::new(),
             hardware_history_ms: 0,
             persisted_history: HistoryResponse {
@@ -966,7 +1058,13 @@ impl App {
                 WorkerEvent::Snapshot(Err(error)) => {
                     self.connected = false;
                     self.last_error = Some(error);
+                    // A dead collector ends the live stream too: fall back
+                    // to the snapshot tween rather than holding stale live
+                    // values on screen.
+                    self.smooth.clear_live();
                 }
+                WorkerEvent::Live(Ok(sample)) => self.apply_live(sample),
+                WorkerEvent::Live(Err(_)) => self.note_live_unsupported(),
                 WorkerEvent::Alerts(Ok(alerts)) => {
                     self.alerts = alerts;
                     self.clamp_selection();
@@ -1539,6 +1637,7 @@ impl App {
                 };
                 self.client_prefs.refresh_fps = next;
                 self.smooth.reset_session();
+                self.sync_live_polling();
                 self.status = format!(
                     "Refresh rate: {} · saved for your user",
                     refresh_label(next)
@@ -1579,6 +1678,9 @@ impl App {
     pub fn adopt_client_prefs(&mut self, prefs: UiPrefs, store: Option<PrefsStore>) {
         self.client_prefs = prefs;
         self.prefs_store = store;
+        // A stored 30/60 fps preference arms the worker's live poller from
+        // the first frame; at 0 fps nothing is sent.
+        self.sync_live_polling();
     }
 
     /// Write the current client preferences to disk; without a store (tests,
@@ -1632,6 +1734,7 @@ impl App {
         }
         match self.smooth.note_frame(cost, budget, current) {
             Some(next) => {
+                self.sync_live_polling();
                 self.status = format!(
                     "Refresh reduced to {} — frame budget exceeded",
                     refresh_label(next)
@@ -1656,8 +1759,82 @@ impl App {
 
     /// The system sample the meters display this frame: the tweened channels
     /// ease from the previous sample, everything else is `target` verbatim.
+    /// While the live channel is streaming (smooth mode on a v1.11+
+    /// service), the tweened channels come from the live layer instead —
+    /// the same surfaces, fresher targets; pass-through fields still come
+    /// from the snapshot `target`.
     pub fn display_system(&self, target: &SystemMetric) -> SystemMetric {
+        if self.effective_refresh_fps() > 0
+            && let Some(live) = self.smooth.display_live_system()
+        {
+            return crate::tween::lerp_system_channels(&live, target, 0.0);
+        }
         crate::tween::display_system(&self.smooth, target, self.tween_t())
+    }
+
+    /// Ingest one live sample: re-target the system tween from what the
+    /// screen currently shows toward the fresh values, and extend the
+    /// high-res pressure-field tail. Per-process surfaces are untouched —
+    /// they stay on the 2-second snapshot cadence, data-honest.
+    pub(crate) fn apply_live(&mut self, sample: LiveSample) {
+        if self.effective_refresh_fps() == 0 || !sample.available || self.live_unsupported {
+            return;
+        }
+        let Some(snapshot) = &self.snapshot else {
+            return;
+        };
+        // Duplicate delivery of the same collection (polling can outpace
+        // the service's 125 ms loop) must not restart the ease window.
+        if self.live_tail.back().map(|item| item.timestamp_ms) == Some(sample.timestamp_ms) {
+            return;
+        }
+        let target = live_to_system(&sample, &snapshot.system);
+        let displayed = self.display_system(&snapshot.system);
+        self.smooth
+            .retarget_live(displayed, target.clone(), Instant::now());
+        self.live_tail.push_back(target);
+        while self.live_tail.len() > LIVE_TAIL_CAPACITY {
+            self.live_tail.pop_front();
+        }
+    }
+
+    /// The service predates the `live` command: note it once, then run
+    /// smooth mode on 2-second snapshots exactly as v1.10.0 did.
+    fn note_live_unsupported(&mut self) {
+        if self.live_unsupported {
+            return;
+        }
+        self.live_unsupported = true;
+        self.smooth.clear_live();
+        self.live_tail.clear();
+        self.status = "This collector predates live telemetry — smooth mode continues on \
+                       2-second snapshots"
+            .into();
+        self.status_is_error = false;
+        self.sync_live_polling();
+    }
+
+    /// Reconcile the worker's live poller with the effective refresh rate.
+    /// Sends ConfigureLive only when the target rate actually changed; at
+    /// 0 fps the live layer and tail are dropped so event-driven rendering
+    /// is byte-identical to a build without the live channel.
+    pub(crate) fn sync_live_polling(&mut self) {
+        let fps = if self.live_unsupported {
+            0
+        } else {
+            self.effective_refresh_fps()
+        };
+        if self.live_fps_sent.unwrap_or(0) != fps {
+            self.live_fps_sent = Some(fps);
+            let _ = self
+                .worker
+                .commands
+                .try_send(WorkerCommand::ConfigureLive { fps });
+        }
+        if fps == 0 {
+            self.smooth.clear_live();
+            self.live_tail.clear();
+        }
     }
 
     /// The CPU share a process row displays this frame.
@@ -2206,6 +2383,31 @@ impl App {
 
     fn process_count(&self) -> usize {
         self.visible_processes().len()
+    }
+}
+
+/// Map a live sample onto the system-metric shape the tween and chart
+/// understand: the live channels land in their fields, everything else
+/// (pool bytes, counts, collector self-metrics) carries over from the
+/// latest snapshot sample. A zero live memory total (memory probe denied)
+/// keeps the snapshot's total so percentage math never divides by zero.
+fn live_to_system(sample: &LiveSample, base: &SystemMetric) -> SystemMetric {
+    SystemMetric {
+        timestamp_ms: sample.timestamp_ms,
+        cpu_percent: sample.cpu_percent,
+        memory_used_bytes: sample.memory_used_bytes,
+        memory_total_bytes: if sample.memory_total_bytes == 0 {
+            base.memory_total_bytes
+        } else {
+            sample.memory_total_bytes
+        },
+        disk_latency_ms: sample.disk_latency_ms,
+        disk_read_bytes_per_sec: sample.disk_read_bytes_per_sec,
+        disk_write_bytes_per_sec: sample.disk_write_bytes_per_sec,
+        network_bytes_per_sec: sample.network_bytes_per_sec,
+        dpc_rate: sample.dpc_rate,
+        interrupt_rate: sample.interrupt_rate,
+        ..base.clone()
     }
 }
 
@@ -3369,6 +3571,273 @@ mod tests {
         let mut focused = app_with_vault_session("A question");
         focused.handle_key(key(KeyCode::Char('e')));
         assert!(matches!(focused.mode, InputMode::Normal));
+    }
+
+    /// An `App` with both worker channels held open by the test: commands
+    /// can be asserted and events can be injected.
+    fn app_with_live_channels() -> (App, Receiver<WorkerCommand>, Sender<WorkerEvent>) {
+        let (commands, command_rx) = bounded(32);
+        let (event_tx, events) = bounded(64);
+        let app = App::with_worker(
+            Worker {
+                commands,
+                events,
+                handle: None,
+            },
+            false,
+        );
+        (app, command_rx, event_tx)
+    }
+
+    fn live_sample(timestamp_ms: i64, cpu: f64) -> LiveSample {
+        LiveSample {
+            available: true,
+            timestamp_ms,
+            cpu_percent: cpu,
+            memory_used_bytes: 8_000_000_000,
+            memory_total_bytes: 16_000_000_000,
+            disk_read_bytes_per_sec: 1_000.0,
+            disk_write_bytes_per_sec: 2_000.0,
+            disk_latency_ms: 1.5,
+            network_bytes_per_sec: 3_000.0,
+            dpc_rate: 100.0,
+            interrupt_rate: 200.0,
+        }
+    }
+
+    #[test]
+    fn live_poll_interval_is_min_of_eight_hz_and_the_refresh_rate() {
+        assert_eq!(live_poll_interval(0), None, "0 fps never sends live");
+        assert_eq!(live_poll_interval(30), Some(Duration::from_millis(125)));
+        assert_eq!(live_poll_interval(60), Some(Duration::from_millis(125)));
+        // A hypothetical tier below 8 Hz would poll at its own rate.
+        assert_eq!(live_poll_interval(4), Some(Duration::from_millis(250)));
+    }
+
+    #[test]
+    fn unsupported_live_errors_are_distinguished_from_transient_ones() {
+        assert!(live_unsupported_error(&anyhow::anyhow!(
+            "invalid JSON request: unknown variant `live` (invalidRequest)"
+        )));
+        assert!(!live_unsupported_error(&anyhow::anyhow!(
+            "PC Pulse collector did not create its named pipe within 5.0s"
+        )));
+    }
+
+    #[test]
+    fn live_events_retarget_the_tween_toward_fresh_system_values() {
+        let (mut app, _commands, events) = app_with_live_channels();
+        app.client_prefs.refresh_fps = 30;
+        let mut snapshot = Snapshot::default();
+        snapshot.system.timestamp_ms = 1_800_000_000_000;
+        snapshot.system.cpu_percent = 20.0;
+        snapshot.system.memory_total_bytes = 16_000_000_000;
+        snapshot.system.paged_pool_bytes = 777;
+        events.send(WorkerEvent::Snapshot(Ok(snapshot))).unwrap();
+        assert!(app.drain_events());
+
+        let before_apply = Instant::now();
+        events
+            .send(WorkerEvent::Live(Ok(live_sample(
+                1_800_000_001_000,
+                80.0,
+            ))))
+            .unwrap();
+        assert!(app.drain_events());
+
+        let target = app.snapshot.as_ref().unwrap().system.clone();
+        // The raw snapshot is untouched — live data never rewrites it.
+        assert_eq!(target.cpu_percent, 20.0);
+        assert_eq!(target.timestamp_ms, 1_800_000_000_000);
+        // Before the live arrival instant the display still shows the
+        // captured previous value; after a full ease window it sits exactly
+        // on the live target — with snapshot-only fields passed through.
+        app.set_render_now(before_apply);
+        assert_eq!(app.display_system(&target).cpu_percent, 20.0);
+        app.set_render_now(Instant::now() + crate::tween::TWEEN);
+        let settled = app.display_system(&target);
+        assert_eq!(settled.cpu_percent, 80.0);
+        assert_eq!(settled.disk_latency_ms, 1.5);
+        assert_eq!(settled.paged_pool_bytes, 777, "pass-through field");
+        // The high-res tail recorded the sample.
+        assert_eq!(app.live_tail.len(), 1);
+        assert_eq!(app.live_tail[0].timestamp_ms, 1_800_000_001_000);
+
+        // A duplicate delivery of the same collection is ignored.
+        events
+            .send(WorkerEvent::Live(Ok(live_sample(
+                1_800_000_001_000,
+                80.0,
+            ))))
+            .unwrap();
+        app.drain_events();
+        assert_eq!(app.live_tail.len(), 1);
+
+        // An unavailable (warm-up) sample is ignored too.
+        let mut cold = live_sample(1_800_000_002_000, 50.0);
+        cold.available = false;
+        events.send(WorkerEvent::Live(Ok(cold))).unwrap();
+        app.drain_events();
+        assert_eq!(app.live_tail.len(), 1);
+    }
+
+    #[test]
+    fn at_zero_fps_live_is_never_requested_and_display_is_unchanged() {
+        let (mut app, commands, events) = app_with_live_channels();
+        // Startup with the event-driven default: adopting prefs sends no
+        // ConfigureLive at all — the worker's poller defaults to off.
+        app.adopt_client_prefs(UiPrefs::default(), None);
+        assert!(
+            !commands
+                .try_iter()
+                .any(|command| matches!(command, WorkerCommand::ConfigureLive { .. })),
+            "0 fps startup must not arm the live poller"
+        );
+        // Even if a stray live event arrives, event-driven display ignores it.
+        let mut snapshot = Snapshot::default();
+        snapshot.system.cpu_percent = 20.0;
+        events.send(WorkerEvent::Snapshot(Ok(snapshot))).unwrap();
+        events
+            .send(WorkerEvent::Live(Ok(live_sample(5, 99.0))))
+            .unwrap();
+        app.drain_events();
+        assert!(app.live_tail.is_empty());
+        let target = app.snapshot.as_ref().unwrap().system.clone();
+        assert_eq!(app.display_system(&target).cpu_percent, 20.0);
+    }
+
+    #[test]
+    fn refresh_changes_and_downgrades_reconfigure_the_live_poller_once() {
+        let (mut app, commands, _events) = app_with_live_channels();
+        app.adopt_client_prefs(
+            UiPrefs {
+                refresh_fps: 30,
+                ..UiPrefs::default()
+            },
+            None,
+        );
+        let sent: Vec<u32> = commands
+            .try_iter()
+            .filter_map(|command| match command {
+                WorkerCommand::ConfigureLive { fps } => Some(fps),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(sent, vec![30], "smooth startup arms the poller once");
+
+        // Cycling 30 -> 60 reconfigures; the redundant same-value sync is
+        // suppressed.
+        app.page = Page::Settings;
+        app.setting_state.select(Some(2));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.client_prefs.refresh_fps, 60);
+        let sent: Vec<u32> = commands
+            .try_iter()
+            .filter_map(|command| match command {
+                WorkerCommand::ConfigureLive { fps } => Some(fps),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(sent, vec![60]);
+
+        // Governor downgrades walk 60 -> 30 -> 0 and stop the poller at 0.
+        let budget = Duration::from_millis(16);
+        let over = Duration::from_millis(40);
+        for _ in 0..3 {
+            app.note_smooth_frame(over, budget);
+        }
+        for _ in 0..3 {
+            app.note_smooth_frame(over, budget);
+        }
+        assert_eq!(app.effective_refresh_fps(), 0);
+        let sent: Vec<u32> = commands
+            .try_iter()
+            .filter_map(|command| match command {
+                WorkerCommand::ConfigureLive { fps } => Some(fps),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(sent, vec![30, 0]);
+    }
+
+    #[test]
+    fn an_old_service_degrades_smooth_mode_to_snapshots_with_one_note() {
+        let (mut app, commands, events) = app_with_live_channels();
+        app.adopt_client_prefs(
+            UiPrefs {
+                refresh_fps: 30,
+                ..UiPrefs::default()
+            },
+            None,
+        );
+        let mut snapshot = Snapshot::default();
+        snapshot.system.cpu_percent = 20.0;
+        events.send(WorkerEvent::Snapshot(Ok(snapshot))).unwrap();
+        events
+            .send(WorkerEvent::Live(Ok(live_sample(5, 99.0))))
+            .unwrap();
+        app.drain_events();
+        assert_eq!(app.live_tail.len(), 1, "live worked until the error");
+
+        // The stub client error an old service produces.
+        events
+            .send(WorkerEvent::Live(Err(
+                "invalid JSON request: unknown variant `live`, expected one of `ping`, \
+                 `getSnapshot` (invalidRequest)"
+                    .into(),
+            )))
+            .unwrap();
+        app.drain_events();
+        assert!(app.live_unsupported);
+        assert!(app.status.contains("2-second snapshots"));
+        assert!(!app.status_is_error, "a note, not an error");
+        assert!(app.live_tail.is_empty(), "stale live data is dropped");
+        // The display falls back to the plain snapshot tween path.
+        let target = app.snapshot.as_ref().unwrap().system.clone();
+        app.set_render_now(Instant::now() + crate::tween::TWEEN);
+        assert_eq!(app.display_system(&target).cpu_percent, 20.0);
+        // The poller was told to stop.
+        assert!(commands.try_iter().any(|command| matches!(
+            command,
+            WorkerCommand::ConfigureLive { fps: 0 }
+        )));
+
+        // Note exactly once: a second error changes nothing user-visible.
+        app.status = "Connected".into();
+        events.send(WorkerEvent::Live(Err("again (invalidRequest)".into()))).unwrap();
+        app.drain_events();
+        assert_eq!(app.status, "Connected");
+        // And later live samples are refused for the session.
+        events
+            .send(WorkerEvent::Live(Ok(live_sample(9, 42.0))))
+            .unwrap();
+        app.drain_events();
+        assert!(app.live_tail.is_empty());
+    }
+
+    #[test]
+    fn the_live_tail_is_bounded_and_chronological() {
+        let (mut app, _commands, events) = app_with_live_channels();
+        app.client_prefs.refresh_fps = 60;
+        events
+            .send(WorkerEvent::Snapshot(Ok(Snapshot::default())))
+            .unwrap();
+        app.drain_events();
+        for step in 0..(LIVE_TAIL_CAPACITY as i64 + 200) {
+            app.apply_live(live_sample(step * 125, 10.0));
+        }
+        assert_eq!(app.live_tail.len(), LIVE_TAIL_CAPACITY);
+        assert!(
+            app.live_tail
+                .iter()
+                .zip(app.live_tail.iter().skip(1))
+                .all(|(left, right)| left.timestamp_ms < right.timestamp_ms),
+            "the tail must stay in arrival order"
+        );
+        // ~180 seconds of 8 Hz data.
+        let span_ms = app.live_tail.back().unwrap().timestamp_ms
+            - app.live_tail.front().unwrap().timestamp_ms;
+        assert_eq!(span_ms, (LIVE_TAIL_CAPACITY as i64 - 1) * 125);
     }
 
     #[test]

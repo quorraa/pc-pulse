@@ -33,11 +33,17 @@ pub fn cubic_out(t: f64) -> f64 {
 /// Eased tween progress for a sample that arrived at `started`, sampled at
 /// `now`. Saturates to `1.0` once [`TWEEN`] has fully elapsed.
 pub fn progress(started: Instant, now: Instant) -> f64 {
+    progress_over(started, now, TWEEN)
+}
+
+/// [`progress`] over an arbitrary ease window — the live channel shortens
+/// its window to track 8 Hz data responsively while staying smooth.
+pub fn progress_over(started: Instant, now: Instant, window: Duration) -> f64 {
     let elapsed = now.saturating_duration_since(started);
-    if elapsed >= TWEEN {
+    if elapsed >= window || window.is_zero() {
         1.0
     } else {
-        cubic_out(elapsed.as_secs_f64() / TWEEN.as_secs_f64())
+        cubic_out(elapsed.as_secs_f64() / window.as_secs_f64())
     }
 }
 
@@ -160,6 +166,14 @@ pub struct SmoothState {
     governor: FrameGovernor,
     /// Session-only refresh ceiling set by the governor; `None` = uncapped.
     session_cap: Option<u32>,
+    /// The live channel's own system-only tween: previous displayed values,
+    /// the newest live target, its arrival instant, and the (shortened)
+    /// ease window. Kept apart from `previous`/`arrived_at` so re-targeting
+    /// at 8 Hz never restarts the per-process 400 ms snapshot tween.
+    live_previous: Option<SystemMetric>,
+    live_target: Option<SystemMetric>,
+    live_arrived_at: Option<Instant>,
+    live_window: Duration,
 }
 
 impl Default for SmoothState {
@@ -170,6 +184,10 @@ impl Default for SmoothState {
             render_now: Instant::now(),
             governor: FrameGovernor::new(),
             session_cap: None,
+            live_previous: None,
+            live_target: None,
+            live_arrived_at: None,
+            live_window: TWEEN,
         }
     }
 }
@@ -198,34 +216,10 @@ impl SmoothState {
             Some(arrived) => progress(arrived, now),
             None => 1.0,
         };
-        let mut system = outgoing.system.clone();
-        if let Some(previous) = &self.previous.system {
-            system.cpu_percent = lerp(previous.cpu_percent, system.cpu_percent, t);
-            system.memory_used_bytes = lerp(
-                previous.memory_used_bytes as f64,
-                system.memory_used_bytes as f64,
-                t,
-            )
-            .round() as u64;
-            system.disk_latency_ms = lerp(previous.disk_latency_ms, system.disk_latency_ms, t);
-            system.disk_read_bytes_per_sec = lerp(
-                previous.disk_read_bytes_per_sec,
-                system.disk_read_bytes_per_sec,
-                t,
-            );
-            system.disk_write_bytes_per_sec = lerp(
-                previous.disk_write_bytes_per_sec,
-                system.disk_write_bytes_per_sec,
-                t,
-            );
-            system.network_bytes_per_sec = lerp(
-                previous.network_bytes_per_sec,
-                system.network_bytes_per_sec,
-                t,
-            );
-            system.dpc_rate = lerp(previous.dpc_rate, system.dpc_rate, t);
-            system.interrupt_rate = lerp(previous.interrupt_rate, system.interrupt_rate, t);
-        }
+        let system = match &self.previous.system {
+            Some(previous) => lerp_system_channels(previous, &outgoing.system, t),
+            None => outgoing.system.clone(),
+        };
         let processes = outgoing
             .processes
             .iter()
@@ -317,6 +311,56 @@ impl SmoothState {
         self.session_cap = None;
         self.governor = FrameGovernor::new();
     }
+
+    // ---- Live channel ----------------------------------------------------
+
+    /// Re-target the system tween toward a fresh live sample: capture what
+    /// the screen shows *right now* as the new starting point (so 8 Hz
+    /// re-targets chain without snapping) and shorten the ease window to
+    /// `min(`[`TWEEN`]`, 1.5 × the spacing between live samples)` — 8 Hz
+    /// data eases over ~190 ms, responsive but still smooth. Only the
+    /// system-level layer moves; the per-process snapshot tween is
+    /// untouched.
+    pub fn retarget_live(&mut self, displayed: SystemMetric, target: SystemMetric, now: Instant) {
+        if let Some(previous_arrival) = self.live_arrived_at {
+            let spacing = now.saturating_duration_since(previous_arrival);
+            self.live_window = TWEEN.min(spacing.mul_f64(1.5));
+        } else {
+            self.live_window = TWEEN;
+        }
+        self.live_previous = Some(displayed);
+        self.live_target = Some(target);
+        self.live_arrived_at = Some(now);
+    }
+
+    /// Drop the live layer (smooth mode turned off, live channel
+    /// unsupported, or disconnect) so display falls back to the snapshot
+    /// tween exactly as before v1.11.
+    pub fn clear_live(&mut self) {
+        self.live_previous = None;
+        self.live_target = None;
+        self.live_arrived_at = None;
+        self.live_window = TWEEN;
+    }
+
+    /// The ease window currently applied to live re-targets.
+    pub fn live_window(&self) -> Duration {
+        self.live_window
+    }
+
+    /// The system sample the live layer displays at the stamped frame
+    /// clock, or `None` when no live target is active.
+    pub fn display_live_system(&self) -> Option<SystemMetric> {
+        let target = self.live_target.as_ref()?;
+        let t = match self.live_arrived_at {
+            Some(arrived) => progress_over(arrived, self.render_now, self.live_window),
+            None => 1.0,
+        };
+        Some(match (&self.live_previous, t < 1.0) {
+            (Some(previous), true) => lerp_system_channels(previous, target, t),
+            _ => target.clone(),
+        })
+    }
 }
 
 /// Interpolate a displayed process channel against the captured sample.
@@ -336,13 +380,21 @@ pub fn display_process_channel(
 /// Interpolate the whole displayed system sample: the tweened channels ease,
 /// every other field passes through from `target` untouched.
 pub fn display_system(smooth: &SmoothState, target: &SystemMetric, t: f64) -> SystemMetric {
-    let mut shown = target.clone();
     if t >= 1.0 {
-        return shown;
+        return target.clone();
     }
     let Some(previous) = smooth.previous_system() else {
-        return shown;
+        return target.clone();
     };
+    lerp_system_channels(previous, target, t)
+}
+
+/// The one authoritative list of tweened system channels: interpolate them
+/// from `previous` toward `target`; every other field (timestamps, pool
+/// bytes, counts, collector self-metrics) passes through from `target`.
+/// Shared by the snapshot tween, its mid-tween capture, and the live layer.
+pub fn lerp_system_channels(previous: &SystemMetric, target: &SystemMetric, t: f64) -> SystemMetric {
+    let mut shown = target.clone();
     shown.cpu_percent = lerp(previous.cpu_percent, target.cpu_percent, t);
     shown.memory_used_bytes = lerp(
         previous.memory_used_bytes as f64,
@@ -469,6 +521,115 @@ mod tests {
         assert_eq!(smooth.session_cap(), Some(0));
         smooth.reset_session();
         assert_eq!(smooth.session_cap(), None);
+    }
+
+    #[test]
+    fn progress_over_scales_to_the_shortened_live_window() {
+        let start = Instant::now();
+        let window = Duration::from_millis(188);
+        assert_eq!(progress_over(start, start, window), 0.0);
+        assert_eq!(progress_over(start, start + window, window), 1.0);
+        assert_eq!(progress_over(start, start + window * 3, window), 1.0);
+        let mid = progress_over(start, start + window / 2, window);
+        assert!(mid > 0.8 && mid < 1.0, "cubic-out midpoint, got {mid}");
+        // A zero window can never divide by zero: it is instantly settled.
+        assert_eq!(progress_over(start, start, Duration::ZERO), 1.0);
+    }
+
+    #[test]
+    fn live_retargets_shorten_the_window_and_ease_from_the_displayed_value() {
+        let mut smooth = SmoothState::default();
+        assert!(smooth.display_live_system().is_none(), "inert until live");
+        let start = Instant::now();
+        let displayed = SystemMetric {
+            cpu_percent: 20.0,
+            ..SystemMetric::default()
+        };
+        let target = SystemMetric {
+            cpu_percent: 80.0,
+            ..SystemMetric::default()
+        };
+        // First live sample: no prior arrival, so the window stays TWEEN.
+        smooth.retarget_live(displayed.clone(), target.clone(), start);
+        assert_eq!(smooth.live_window(), TWEEN);
+        // Mid-window the display sits strictly between the endpoints.
+        smooth.set_render_now(start + TWEEN / 2);
+        let shown = smooth.display_live_system().expect("live layer active");
+        assert!(shown.cpu_percent > 20.0 && shown.cpu_percent < 80.0);
+        // At (and beyond) the window the target is exact — no residue.
+        smooth.set_render_now(start + TWEEN);
+        assert_eq!(smooth.display_live_system().unwrap().cpu_percent, 80.0);
+        // A second sample 125 ms later shortens the window to 1.5 × spacing
+        // (~188 ms) — the 8 Hz ease the spec asks for — and chains from the
+        // currently displayed value, never snapping.
+        let second_arrival = start + Duration::from_millis(125);
+        let next = SystemMetric {
+            cpu_percent: 40.0,
+            ..SystemMetric::default()
+        };
+        smooth.retarget_live(shown, next, second_arrival);
+        assert_eq!(smooth.live_window(), Duration::from_micros(187_500));
+        assert!(smooth.live_window() < TWEEN);
+        smooth.set_render_now(second_arrival + smooth.live_window());
+        assert_eq!(smooth.display_live_system().unwrap().cpu_percent, 40.0);
+        // Slow spacing clamps back to the full TWEEN window.
+        let third_arrival = second_arrival + Duration::from_secs(2);
+        smooth.retarget_live(
+            SystemMetric::default(),
+            SystemMetric::default(),
+            third_arrival,
+        );
+        assert_eq!(smooth.live_window(), TWEEN);
+        // Clearing the layer restores the pre-live path entirely.
+        smooth.clear_live();
+        assert!(smooth.display_live_system().is_none());
+        assert_eq!(smooth.live_window(), TWEEN);
+    }
+
+    #[test]
+    fn live_retargeting_leaves_the_per_process_snapshot_tween_alone() {
+        use pcpulse_service::models::Snapshot;
+        let mut smooth = SmoothState::default();
+        let mut snapshot = Snapshot::default();
+        snapshot.processes.push(pcpulse_service::models::ProcessMetric {
+            timestamp_ms: 0,
+            pid: 42,
+            parent_pid: 1,
+            name: "worker.exe".into(),
+            executable_path: String::new(),
+            cpu_percent: 10.0,
+            working_set_bytes: 1_000,
+            private_bytes: 0,
+            handle_count: 0,
+            thread_count: 0,
+            read_bytes_per_sec: 0.0,
+            write_bytes_per_sec: 0.0,
+            total_read_bytes: 0,
+            total_write_bytes: 0,
+            started_at_ms: 0,
+            session_id: 0,
+            responsive: true,
+            has_visible_window: false,
+            launch_duration_ms: None,
+            is_agent_candidate: false,
+        });
+        let start = Instant::now();
+        smooth.begin(sample_from_snapshot(&snapshot), start);
+        let before = smooth.previous_process(42).copied().unwrap();
+        // Live re-targets must not restart or reseed the process tween.
+        smooth.retarget_live(SystemMetric::default(), SystemMetric::default(), start);
+        smooth.retarget_live(
+            SystemMetric::default(),
+            SystemMetric::default(),
+            start + Duration::from_millis(125),
+        );
+        let after = smooth.previous_process(42).copied().unwrap();
+        assert_eq!(before.cpu_percent, after.cpu_percent);
+        assert_eq!(before.working_set_bytes, after.working_set_bytes);
+        // The snapshot tween clock is likewise untouched: progress at
+        // `start` is still zero, not restarted by the live arrivals.
+        smooth.set_render_now(start);
+        assert_eq!(smooth.t(), 0.0);
     }
 
     #[test]
