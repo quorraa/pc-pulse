@@ -418,15 +418,10 @@ impl MotionSystem {
                 self.manager.add_unique_effect(EffectKey::Focus, effect);
             }
             MotionCue::Connected => {
+                // Link restoration announces itself in the chrome only; the
+                // body's return from the offline panel is its own signal and
+                // must not replay a full-page reveal (field feedback).
                 let effect = fx::parallel(&[
-                    fx::coalesce_from(
-                        Style::default().fg(palette().ok).bg(palette().bg),
-                        (360, Interpolation::ExpoOut),
-                    )
-                    .with_pattern(RadialPattern::new(0.08, 0.0).with_transition_width(6.0))
-                    .with_rng(SimpleRng::new(0xC011_EC7D))
-                    .with_filter(CellFilter::NonEmpty)
-                    .with_area(regions.body),
                     fx::sweep_in(
                         Motion::LeftToRight,
                         10,
@@ -435,11 +430,16 @@ impl MotionSystem {
                         (260, Interpolation::CubicOut),
                     )
                     .with_area(regions.header),
+                    fx::ping_pong(fx::lighten_fg(0.22, (130, Interpolation::SineInOut)))
+                        .with_filter(CellFilter::NonEmpty)
+                        .with_area(regions.footer),
                 ]);
                 self.manager
                     .add_unique_effect(EffectKey::Connection, effect);
             }
             MotionCue::Disconnected => {
+                // Loss of link stays in the chrome too: the offline panel
+                // replacing the body is already unmistakable.
                 let glitch = Glitch::builder()
                     .cell_glitch_ratio(0.035)
                     .action_start_delay_ms(0..90)
@@ -448,18 +448,18 @@ impl MotionSystem {
                     .into_effect()
                     .with_rng(SimpleRng::new(0xD15C_0001))
                     .with_filter(CellFilter::NonEmpty)
-                    .with_area(regions.full);
+                    .with_area(regions.header);
                 let effect = fx::parallel(&[
                     fx::with_duration(FxDuration::from_millis(230), glitch),
                     fx::fade_from_fg(palette().crit, (360, Interpolation::ExpoOut))
                         .with_pattern(DiagonalPattern::top_right_to_bottom_left())
                         .with_filter(CellFilter::NonEmpty)
-                        .with_area(regions.full),
+                        .with_area(regions.header),
                     fx::ping_pong(
                         fx::darken(Some(0.22), Some(0.12), (120, Interpolation::SineInOut))
                             .with_pattern(SweepPattern::right_to_left(18)),
                     )
-                    .with_area(regions.body),
+                    .with_area(regions.footer),
                 ]);
                 self.manager
                     .add_unique_effect(EffectKey::Connection, effect);
@@ -470,17 +470,15 @@ impl MotionSystem {
                     Severity::Warning => palette().warn,
                     Severity::Critical => palette().crit,
                 };
-                let alert_body = fx::sweep_in(
-                    Motion::LeftToRight,
-                    18,
-                    if severity == Severity::Critical { 3 } else { 1 },
-                    palette().bg,
-                    (340, Interpolation::ExpoOut),
+                // Field feedback: a new finding arriving must not re-reveal
+                // the whole body the way a panel switch does — the page is
+                // already on screen. The cue stays in the chrome: header
+                // pulse (plus glitch when critical) and a footer flash.
+                let footer_flash = fx::ping_pong(
+                    fx::fade_to_fg(accent, (140, Interpolation::SineInOut)),
                 )
-                .with_rng(SimpleRng::new(0xA1E4_7001))
-                .with_color_space(ColorSpace::Hsv)
                 .with_filter(CellFilter::NonEmpty)
-                .with_area(regions.body);
+                .with_area(regions.footer);
                 let pulse = if severity == Severity::Critical {
                     // "Defib": two crisp, uniform brightness pulses — charge, shock,
                     // shock — with no pattern so the whole header flashes as one.
@@ -504,7 +502,7 @@ impl MotionSystem {
                     .with_filter(CellFilter::NonEmpty)
                     .with_area(regions.header)
                 };
-                let mut effects = vec![alert_body, pulse];
+                let mut effects = vec![footer_flash, pulse];
                 if severity == Severity::Critical {
                     let glitch = Glitch::builder()
                         .cell_glitch_ratio(0.028)
