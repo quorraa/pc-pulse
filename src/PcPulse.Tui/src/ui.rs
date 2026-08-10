@@ -51,6 +51,9 @@ const FOLIO_HEIGHT: u16 = 2;
 /// Below this width the headline block digits lose more than they show, so
 /// the front page degrades to plain numerals.
 const HEADLINE_MIN_WIDTH: u16 = 100;
+/// Width at which the headline seats the NET / IRQ minor figures beside
+/// the three block-digit columns.
+const MINOR_HEADLINE_MIN_WIDTH: u16 = 128;
 
 /// The rail column width when the avionics rail structure applies to this
 /// terminal size, or `None` when the statusline shape is used instead.
@@ -298,9 +301,10 @@ fn mouse_body_click(
                 return pressure_map_click(app, point, body);
             }
             if broadsheet() {
-                // The front page is a printed sheet: headline digits and the
-                // suspect ledger read, they do not click. Keyboard sorts
-                // (`o` on HUNT, header clicks elsewhere) are unaffected.
+                // The front page is a printed sheet: headline digits, the
+                // market tickers, and the movers board read, they do not
+                // click. Keyboard sorts and header clicks elsewhere are
+                // unaffected.
                 return false;
             }
             let table = overview_suspect_area(body);
@@ -1011,9 +1015,8 @@ fn render_rail_keys(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let width = usize::from(area.width.saturating_sub(1));
     let lines = Page::ALL
         .iter()
-        .enumerate()
-        .map(|(index, page)| {
-            let label = format!(" [{}] {:<width$}", index + 1, route_short(*page));
+        .map(|page| {
+            let label = format!(" [{}] {:<width$}", page_key_label(*page), route_short(*page));
             if *page == app.page {
                 Line::styled(
                     label,
@@ -1082,7 +1085,7 @@ fn render_rail_status(frame: &mut Frame<'_>, app: &App, area: Rect) {
     ]));
     lines.push(Line::from(vec![
         key_badge("?"),
-        Span::styled(" man ", Style::default().fg(palette().muted)),
+        Span::styled(" keys", Style::default().fg(palette().muted)),
         key_badge("q"),
         Span::styled(" exit", Style::default().fg(palette().muted)),
     ]));
@@ -1146,7 +1149,7 @@ fn rail_input_line(app: &App) -> Line<'static> {
                 Page::Timeline => "[ ] r",
                 Page::Analyzer => "↵ ask e n h y",
                 Page::Settings => "↵ edit s",
-                Page::Help => "1–9 Tab",
+                Page::Help => "1–8 Tab",
                 Page::Hardware => "r sample",
             };
             return Line::styled(format!(" {hints}"), Style::default().fg(palette().faint));
@@ -1312,7 +1315,7 @@ fn render_route(frame: &mut Frame<'_>, app: &App, area: Rect) {
         } else {
             route_name(*page)
         };
-        let text = format!(" {:02} {label} ", index + 1);
+        let text = format!(" {} {label} ", route_key_padded(*page));
         spans.push(if *page == app.page {
             Span::styled(
                 text,
@@ -1337,7 +1340,7 @@ fn route_name(page: Page) -> &'static str {
         Page::Timeline => "CHRONICLE",
         Page::Analyzer => "ORACLE",
         Page::Settings => "TUNE",
-        Page::Help => "MANUAL",
+        Page::Help => "KEYS",
         Page::Hardware => "GAUGES",
     }
 }
@@ -1351,8 +1354,30 @@ fn route_short(page: Page) -> &'static str {
         Page::Timeline => "TIME",
         Page::Analyzer => "ASK",
         Page::Settings => "TUNE",
-        Page::Help => "HELP",
+        Page::Help => "KEYS",
         Page::Hardware => "GAUGE",
+    }
+}
+
+/// The printed key label for a page's index/tab entry: its digit for the
+/// first eight pages, or "?" for the KEYS appendix — the one page without
+/// a digit, reached by Tab wrap-around, a click, or the `?` overlay.
+fn page_key_label(page: Page) -> String {
+    if page == Page::Help {
+        "?".into()
+    } else {
+        format!("{}", page_index(page) + 1)
+    }
+}
+
+/// Two-cell key label for the statusline route, matching the zero-padded
+/// "01".."08" grammar; KEYS renders " ?" so every entry keeps the same
+/// width and the click hit-test math never drifts.
+fn route_key_padded(page: Page) -> String {
+    if page == Page::Help {
+        " ?".into()
+    } else {
+        format!("{:02}", page_index(page) + 1)
     }
 }
 
@@ -1364,7 +1389,7 @@ fn route_description(page: Page) -> &'static str {
             "pressure map / likely culprits / live incidents"
         }
         Page::Overview if theme::active().layout == LayoutKind::Broadsheet => {
-            "headline figures / suspect ledger / notices"
+            "headline figures / market strip / movers board"
         }
         Page::Overview => "pressure field / likely culprits / live incidents",
         Page::Processes => "rank / filter / inspect process pressure",
@@ -1394,11 +1419,12 @@ fn page_index(page: Page) -> usize {
 
 const LEDGER_BRAND: &str = "PC PULSE — WORKSTATION LEDGER";
 
-/// One printed page-index entry: "3 LINEAGE" (or "3 TREE" when compact).
-fn masthead_label(index: usize, page: Page, compact: bool) -> String {
+/// One printed page-index entry: "3 LINEAGE" (or "3 TREE" when compact);
+/// the KEYS appendix prints "? KEYS" — it has no digit.
+fn masthead_label(page: Page, compact: bool) -> String {
     format!(
         "{} {}",
-        index + 1,
+        page_key_label(page),
         if compact {
             route_short(page)
         } else {
@@ -1419,8 +1445,7 @@ fn masthead_index_origin(area: Rect) -> (u16, bool) {
     let separator = masthead_separator(compact).chars().count();
     let total = Page::ALL
         .iter()
-        .enumerate()
-        .map(|(index, page)| masthead_label(index, *page, compact).chars().count())
+        .map(|page| masthead_label(*page, compact).chars().count())
         .sum::<usize>()
         + separator * (Page::ALL.len() - 1);
     let x = area.x + (usize::from(area.width).saturating_sub(total) / 2) as u16;
@@ -1434,7 +1459,7 @@ fn masthead_route_at(column: u16, area: Rect) -> Option<Page> {
         if index > 0 {
             x = x.saturating_add(separator);
         }
-        let width = masthead_label(index, page, compact).chars().count() as u16;
+        let width = masthead_label(page, compact).chars().count() as u16;
         if column >= x && column < x.saturating_add(width) {
             return Some(page);
         }
@@ -1533,7 +1558,7 @@ fn render_masthead_index(frame: &mut Frame<'_>, app: &App, area: Rect) {
                 Style::default().fg(palette().faint),
             ));
         }
-        let label = masthead_label(index, page, compact);
+        let label = masthead_label(page, compact);
         spans.push(if page == app.page {
             Span::styled(
                 label,
@@ -1691,10 +1716,12 @@ fn headline_trend(previous: Option<f64>, current: f64, threshold: f64) -> &'stat
     }
 }
 
-/// The Observe front page under the broadsheet layout: headline block-digit
-/// figures across the top like a newspaper headline, then the SUSPECT LEDGER
-/// and NOTICES columns separated by a thin printed rule, with the
-/// CIRCULATION bar docked under the notices.
+/// The Observe front page under the broadsheet layout — the WHAT'S-CHANGING
+/// edition. Headline block-digit figures across the top like a newspaper
+/// headline (plus NET / IRQ minor figures when width allows), then the
+/// MARKET strip of per-resource trend tickers, the MOVERS board (largest
+/// process movement over ~2 minutes) as the centerpiece, and the active
+/// findings compressed to a one-line-per-notice strip at the foot.
 fn render_overview_broadsheet(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let Some(snapshot) = &app.snapshot else {
         render_offline(frame, app, area);
@@ -1706,21 +1733,18 @@ fn render_overview_broadsheet(frame: &mut Frame<'_>, app: &App, area: Rect) {
     } else {
         2
     };
-    let vertical =
-        Layout::vertical([Constraint::Length(headline_height), Constraint::Min(8)]).split(canvas);
-    render_headline_figures(frame, app, vertical[0]);
-    let columns = Layout::horizontal([
-        Constraint::Percentage(56),
-        Constraint::Length(1),
-        Constraint::Min(30),
+    let notices_height = (snapshot.active_alerts.len().min(3) as u16).max(1) + 1;
+    let vertical = Layout::vertical([
+        Constraint::Length(headline_height),
+        Constraint::Length(MARKET_ROWS.len() as u16 + 1),
+        Constraint::Min(6),
+        Constraint::Length(notices_height),
     ])
-    .split(vertical[1]);
-    render_suspect_matrix(frame, app, columns[0]);
-    render_column_rule(frame, columns[1]);
-    let right = Layout::vertical([Constraint::Min(6), Constraint::Length(4)]).split(columns[2]);
-    render_notices(frame, app, right[0]);
-    render_circulation(frame, app, right[1]);
-    let _ = snapshot;
+    .split(canvas);
+    render_headline_figures(frame, app, vertical[0]);
+    render_market(frame, app, vertical[1]);
+    render_movers(frame, app, vertical[2]);
+    render_notices(frame, app, vertical[3]);
 }
 
 /// A thin vertical printed rule between broadsheet columns.
@@ -1805,12 +1829,27 @@ fn render_headline_figures(frame: &mut Frame<'_>, app: &App, area: Rect) {
         );
         return;
     }
-    let columns = Layout::horizontal([
-        Constraint::Percentage(33),
-        Constraint::Percentage(34),
-        Constraint::Percentage(33),
-    ])
-    .split(area);
+    // NET and IRQ ride along as minor headline figures — plain bold
+    // numerals, not block digits — whenever the sheet is wide enough to
+    // seat five columns without crowding the presses.
+    let minor = area.width >= MINOR_HEADLINE_MIN_WIDTH;
+    let columns = if minor {
+        Layout::horizontal([
+            Constraint::Percentage(22),
+            Constraint::Percentage(23),
+            Constraint::Percentage(23),
+            Constraint::Percentage(16),
+            Constraint::Percentage(16),
+        ])
+        .split(area)
+    } else {
+        Layout::horizontal([
+            Constraint::Percentage(33),
+            Constraint::Percentage(34),
+            Constraint::Percentage(33),
+        ])
+        .split(area)
+    };
     for (column, (caption, value, trend, accent)) in columns.iter().zip(figures) {
         let digits = block_digits(&value);
         let mut lines = digits
@@ -1821,6 +1860,48 @@ fn render_headline_figures(frame: &mut Frame<'_>, app: &App, area: Rect) {
             Span::styled(caption, Style::default().fg(palette().muted)),
             Span::styled(format!("  {trend}"), Style::default().fg(accent).bold()),
         ]));
+        frame.render_widget(
+            Paragraph::new(lines)
+                .alignment(Alignment::Center)
+                .style(Style::default().bg(palette().bg)),
+            *column,
+        );
+    }
+    if !minor {
+        return;
+    }
+    let minors: [(&str, String, &'static str, Color); 2] = [
+        (
+            "NET MB/S",
+            format!("{:.1}", shown.network_bytes_per_sec / (1024.0 * 1024.0)),
+            headline_trend(
+                previous.map(|point| point.network_bytes_per_sec),
+                snapshot.system.network_bytes_per_sec,
+                128.0 * 1024.0,
+            ),
+            palette().info,
+        ),
+        (
+            "IRQ /S",
+            format!("{:.0}", shown.interrupt_rate + shown.dpc_rate),
+            headline_trend(
+                previous.map(|point| point.interrupt_rate + point.dpc_rate),
+                snapshot.system.interrupt_rate + snapshot.system.dpc_rate,
+                50.0,
+            ),
+            palette().warn,
+        ),
+    ];
+    for (column, (caption, value, trend, accent)) in columns.iter().skip(3).zip(minors) {
+        let lines = vec![
+            Line::default(),
+            Line::styled(value, Style::default().fg(palette().text).bold()),
+            Line::default(),
+            Line::from(vec![
+                Span::styled(caption, Style::default().fg(palette().muted)),
+                Span::styled(format!("  {trend}"), Style::default().fg(accent).bold()),
+            ]),
+        ];
         frame.render_widget(
             Paragraph::new(lines)
                 .alignment(Alignment::Center)
@@ -1839,14 +1920,296 @@ fn severity_tag(severity: Severity) -> &'static str {
     }
 }
 
-/// The incident tape restyled as classified-ads entries: a printed severity
-/// tag, the owner, the condition, and one indented evidence line each.
+/// One MARKET strip row: the label, its direction semantics, and the
+/// movement floor beneath which the ticker prints "steady".
+struct MarketResource {
+    label: &'static str,
+    /// Direction severity: `true` when a rising value means growing
+    /// pressure (warn channel) and a falling one relief (ok channel).
+    /// Every current row measures load, so rising reads as pressure across
+    /// the board; a relief-metric row (free memory, idle share) would flip
+    /// this bit rather than invent its own coloring.
+    rising_is_pressure: bool,
+    /// Minimum |delta| over the window that counts as movement, in the
+    /// row's native unit.
+    floor: f64,
+}
+
+/// The MARKET delta window: "now vs ≈5 minutes ago".
+const MARKET_WINDOW_MS: i64 = 300_000;
+
+const MARKET_ROWS: [MarketResource; 6] = [
+    MarketResource {
+        label: "CPU",
+        rising_is_pressure: true,
+        floor: 1.0,
+    },
+    MarketResource {
+        label: "MEM",
+        rising_is_pressure: true,
+        floor: 0.5,
+    },
+    MarketResource {
+        label: "DISK LAT",
+        rising_is_pressure: true,
+        floor: 0.3,
+    },
+    MarketResource {
+        label: "DISK IO",
+        rising_is_pressure: true,
+        floor: 512.0 * 1024.0,
+    },
+    MarketResource {
+        label: "NET",
+        rising_is_pressure: true,
+        floor: 256.0 * 1024.0,
+    },
+    MarketResource {
+        label: "IRQ+DPC",
+        rising_is_pressure: true,
+        floor: 400.0,
+    },
+];
+
+/// The metric a MARKET row reads from a system sample, in row order.
+fn market_value(row: usize, point: &SystemMetric) -> f64 {
+    match row {
+        0 => point.cpu_percent,
+        1 => percent(point.memory_used_bytes, point.memory_total_bytes),
+        2 => point.disk_latency_ms,
+        3 => point.disk_read_bytes_per_sec + point.disk_write_bytes_per_sec,
+        4 => point.network_bytes_per_sec,
+        _ => point.interrupt_rate + point.dpc_rate,
+    }
+}
+
+/// A MARKET reading in the row's native grammar.
+fn market_format(row: usize, value: f64) -> String {
+    match row {
+        0 | 1 => format!("{value:.1}%"),
+        2 => format!("{value:.1} ms"),
+        3 | 4 => format::rate(value),
+        _ => format!("{value:.0}/s"),
+    }
+}
+
+/// The movement color for a MARKET delta, or `None` when it is under the
+/// row's floor and reads as "steady" rather than motion.
+fn market_delta_color(resource: &MarketResource, delta: f64) -> Option<Color> {
+    if delta.abs() < resource.floor {
+        return None;
+    }
+    let pressure = (delta > 0.0) == resource.rising_is_pressure;
+    Some(if pressure { palette().warn } else { palette().ok })
+}
+
+/// A one-row block sparkline of a series' most recent points, normalized
+/// over the window it actually shows.
+fn market_spark(values: &[f64], width: usize) -> String {
+    const LEVELS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    let skip = values.len().saturating_sub(width);
+    let window = &values[skip..];
+    let mut low = f64::INFINITY;
+    let mut high = f64::NEG_INFINITY;
+    for value in window {
+        low = low.min(*value);
+        high = high.max(*value);
+    }
+    let span = (high - low).max(f64::MIN_POSITIVE);
+    window
+        .iter()
+        .map(|value| LEVELS[(((value - low) / span * 7.0).round() as usize).min(7)])
+        .collect()
+}
+
+/// The MARKET strip: one ticker row per system resource — an inline block
+/// sparkline over the live window (snapshot history spliced with the
+/// high-res live tail in smooth mode), the current reading, and the
+/// direction-colored movement vs the [`MARKET_WINDOW_MS`] reference.
+fn render_market(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    let Some(snapshot) = &app.snapshot else {
+        return;
+    };
+    let block = field_block(" MARKET — resource motion ", palette().ok);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let points = pressure_field_points(app);
+    let shown = app.display_system(&snapshot.system);
+    // Deltas compare raw samples only, so a mid-tween frame can never flip
+    // a direction — the same rule the headline trend arrows follow.
+    let latest = points.last().copied();
+    let latest_ts = latest.map(|point| point.timestamp_ms).unwrap_or_default();
+    let reference = points
+        .iter()
+        .find(|point| point.timestamp_ms >= latest_ts - MARKET_WINDOW_MS)
+        .copied();
+    let span_minutes = reference
+        .map(|point| (latest_ts - point.timestamp_ms) as f64 / 60_000.0)
+        .unwrap_or(0.0);
+    // Label (9) + reading (13) + the longest delta tail (26) are reserved;
+    // the sparkline takes what remains so no ticker ever clips its delta.
+    let spark_width = usize::from(inner.width)
+        .saturating_sub(9 + 13 + 26)
+        .clamp(6, 48);
+    let mut lines = Vec::new();
+    for (row, resource) in MARKET_ROWS.iter().enumerate() {
+        let series = points
+            .iter()
+            .map(|point| market_value(row, point))
+            .collect::<Vec<_>>();
+        let delta = latest
+            .zip(reference)
+            .map(|(to, from)| market_value(row, to) - market_value(row, from))
+            .unwrap_or(0.0);
+        let mut spans = vec![
+            Span::styled(
+                format!("{:<9}", resource.label),
+                Style::default().fg(palette().muted).bold(),
+            ),
+            Span::styled(
+                market_spark(&series, spark_width),
+                Style::default().fg(palette().alt),
+            ),
+            Span::styled(
+                format!("  {:>11}", market_format(row, market_value(row, &shown))),
+                Style::default().fg(palette().text).bold(),
+            ),
+        ];
+        match market_delta_color(resource, delta) {
+            Some(color) if span_minutes > 0.0 => {
+                let arrow = if delta > 0.0 { "▲" } else { "▼" };
+                let sign = if delta >= 0.0 { "+" } else { "-" };
+                spans.push(Span::styled(
+                    format!(
+                        "  {arrow} {sign}{} vs {span_minutes:.0} m ago",
+                        market_format(row, delta.abs())
+                    ),
+                    Style::default().fg(color).bold(),
+                ));
+            }
+            _ => spans.push(Span::styled(
+                "  · steady",
+                Style::default().fg(palette().faint),
+            )),
+        }
+        lines.push(Line::from(spans));
+    }
+    frame.render_widget(
+        Paragraph::new(lines).style(Style::default().fg(palette().text).bg(palette().surface)),
+        inner,
+    );
+}
+
+/// One MOVERS board row: name, the dominant delta, a direction bar scaled
+/// by floor-normalized magnitude, and the current absolute reading.
+fn mover_line(mover: &crate::app::Mover) -> Line<'static> {
+    let delta = if mover.cpu_dominant {
+        format!("{:+.1}% cpu", mover.cpu_delta)
+    } else {
+        let sign = if mover.memory_delta >= 0.0 { "+" } else { "-" };
+        format!("{sign}{}", format::bytes_f64(mover.memory_delta.abs()))
+    };
+    let bar = "▮".repeat((mover.weight.round() as usize).clamp(1, 4));
+    let current = if mover.cpu_dominant {
+        format!("{:.1}%", mover.cpu_now)
+    } else {
+        format::bytes(mover.working_set_now)
+    };
+    let color = if mover.rising() {
+        palette().warn
+    } else {
+        palette().ok
+    };
+    Line::from(vec![
+        Span::styled(
+            format!("{:<19}", format::truncate(&mover.name, 18)),
+            Style::default().fg(palette().text).bold(),
+        ),
+        Span::styled(format!("{delta:>12}"), Style::default().fg(color).bold()),
+        Span::styled(format!("  {bar:<4}"), Style::default().fg(color)),
+        Span::styled(format!(" {current:>9}"), Style::default().fg(palette().muted)),
+    ])
+}
+
+/// The honest quiet line when a MOVERS column has nothing past the floors.
+fn no_movement_line() -> Line<'static> {
+    Line::styled(
+        "no significant movement",
+        Style::default().fg(palette().faint),
+    )
+}
+
+/// One MOVERS column: printed direction header, then the strongest movers.
+fn render_mover_column(
+    frame: &mut Frame<'_>,
+    title: &str,
+    movers: &[crate::app::Mover],
+    area: Rect,
+) {
+    let mut lines = vec![Line::styled(
+        title.to_string(),
+        Style::default().fg(palette().muted).bold(),
+    )];
+    let capacity = usize::from(area.height.saturating_sub(1)).max(1);
+    if movers.is_empty() {
+        lines.push(no_movement_line());
+    }
+    for mover in movers.iter().take(capacity) {
+        lines.push(mover_line(mover));
+    }
+    frame.render_widget(
+        Paragraph::new(lines).style(Style::default().fg(palette().text).bg(palette().surface)),
+        area,
+    );
+}
+
+/// The MOVERS board, the front page's centerpiece: RISING and EASING as two
+/// ruled columns of the processes with the largest CPU / working-set change
+/// over the ~2 minute client-side trend window. Narrow sheets get a single
+/// short list instead of columns.
+fn render_movers(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    let (rising, easing) = app.process_movers();
+    let block = field_block(" MOVERS — largest movement, ≈2 m window ", palette().alt);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if area.width < HEADLINE_MIN_WIDTH {
+        // Single column: risers first, then easers, one short list.
+        let capacity = usize::from(inner.height).max(1);
+        let mut lines = Vec::new();
+        for mover in rising.iter().chain(easing.iter()).take(capacity) {
+            lines.push(mover_line(mover));
+        }
+        if lines.is_empty() {
+            lines.push(no_movement_line());
+        }
+        frame.render_widget(
+            Paragraph::new(lines).style(Style::default().fg(palette().text).bg(palette().surface)),
+            inner,
+        );
+        return;
+    }
+    let columns = Layout::horizontal([
+        Constraint::Percentage(50),
+        Constraint::Length(1),
+        Constraint::Min(24),
+    ])
+    .split(inner);
+    render_mover_column(frame, "RISING", &rising, columns[0]);
+    render_column_rule(frame, columns[1]);
+    render_mover_column(frame, "EASING", &easing, columns[2]);
+}
+
+/// The NOTICES strip, compressed to one printed line per active finding:
+/// severity tag, owner, condition. The classified-ads evidence line is
+/// gone — the INCIDENTS page still carries the full record.
 fn render_notices(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let Some(snapshot) = &app.snapshot else {
         return;
     };
     let block = field_block(" NOTICES — sustained findings ", palette().warn);
-    let capacity = (usize::from(area.height.saturating_sub(1)) / 2).max(1);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let capacity = usize::from(inner.height).max(1);
     let mut lines = Vec::new();
     for alert in snapshot.active_alerts.iter().take(capacity) {
         let owner = alert.process_name.as_deref().unwrap_or("system / driver");
@@ -1860,19 +2223,10 @@ fn render_notices(frame: &mut Frame<'_>, app: &App, area: Rect) {
                 Style::default().fg(palette().text).bold(),
             ),
             Span::styled(
-                format!(" — {}", format::truncate(&alert.title, 34)),
+                format!(" — {}", format::truncate(&alert.title, 48)),
                 Style::default().fg(severity_color(alert.severity)),
             ),
         ]));
-        let evidence = alert
-            .evidence
-            .first()
-            .map(|item| format!("{} {}", item.label, item.value))
-            .unwrap_or_else(|| "sustained condition confirmed".into());
-        lines.push(Line::styled(
-            format!("   {}", format::truncate(&evidence, 52)),
-            Style::default().fg(palette().muted),
-        ));
     }
     if lines.is_empty() {
         lines.push(Line::from(vec![
@@ -1883,82 +2237,6 @@ fn render_notices(frame: &mut Frame<'_>, app: &App, area: Rect) {
             ),
         ]));
     }
-    frame.render_widget(
-        Paragraph::new(lines)
-            .style(Style::default().fg(palette().text).bg(palette().surface))
-            .block(block),
-        area,
-    );
-}
-
-/// The load ribbon as a thin "circulation" bar: one proportional row of the
-/// busiest suspects' share of busy CPU, with the busy/idle tally beneath.
-fn render_circulation(frame: &mut Frame<'_>, app: &App, area: Rect) {
-    let Some(snapshot) = &app.snapshot else {
-        return;
-    };
-    let busy = app
-        .display_system(&snapshot.system)
-        .cpu_percent
-        .clamp(0.0, 100.0);
-    let block = field_block(" CIRCULATION — share of busy cpu ", palette().info);
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-    let mut lines = Vec::new();
-    if busy < DONUT_QUIESCENT_CPU {
-        lines.push(Line::styled(
-            format!("cpu quiescent {busy:.1}% — nothing to attribute"),
-            Style::default().fg(palette().muted),
-        ));
-    } else {
-        let mut suspects = snapshot
-            .processes
-            .iter()
-            .filter(|process| process.pid > 4)
-            .collect::<Vec<_>>();
-        suspects.sort_by(|left, right| right.cpu_percent.total_cmp(&left.cpu_percent));
-        let cycle = [palette().ok, palette().alt, palette().info, palette().warn];
-        let mut segments = suspects
-            .iter()
-            .take(4)
-            .enumerate()
-            .map(|(index, process)| {
-                (
-                    app.display_process_cpu(process).max(0.0),
-                    cycle[index % cycle.len()],
-                )
-            })
-            .collect::<Vec<_>>();
-        let named = segments.iter().map(|(value, _)| *value).sum::<f64>();
-        segments.push(((busy - named).max(0.0), palette().muted));
-        let total = segments
-            .iter()
-            .map(|(value, _)| *value)
-            .sum::<f64>()
-            .max(f64::MIN_POSITIVE);
-        let width = usize::from(inner.width.max(1));
-        let mut spans = Vec::new();
-        let mut used = 0usize;
-        for (value, color) in &segments {
-            if *value <= 0.0 || used >= width {
-                continue;
-            }
-            let cells = (((value / total) * width as f64).round() as usize).clamp(1, width - used);
-            spans.push(Span::styled("█".repeat(cells), Style::default().fg(*color)));
-            used += cells;
-        }
-        lines.push(Line::from(spans));
-    }
-    lines.push(Line::from(vec![
-        Span::styled(
-            format!("busy {busy:.1}%"),
-            Style::default().fg(palette().ok),
-        ),
-        Span::styled(
-            format!(" · idle {:.1}%", 100.0 - busy),
-            Style::default().fg(palette().faint),
-        ),
-    ]));
     frame.render_widget(
         Paragraph::new(lines).style(Style::default().fg(palette().text).bg(palette().surface)),
         inner,
@@ -2549,11 +2827,7 @@ fn render_suspect_matrix(frame: &mut Frame<'_>, app: &App, area: Rect) {
                 ),
             )
             .block(field_block(
-                if broadsheet() {
-                    " SUSPECT LEDGER — relative pressure / not an alert score "
-                } else {
-                    " ⌖ SUSPECT MATRIX  relative pressure / not an alert score "
-                },
+                " ⌖ SUSPECT MATRIX  relative pressure / not an alert score ",
                 palette().alt,
             )),
         area,
@@ -5189,7 +5463,7 @@ fn render_setting_detail(
 /// wrap does so through [`help_lines`]' hanging indent, so the two-column
 /// grid never sheds orphan full-width words.
 const HELP_GLOBAL: [(&str, &str); 11] = [
-    ("1–9", "jump to a page"),
+    ("1–8", "jump to a page"),
     ("Tab / Shift-Tab", "next / previous page"),
     ("j / k, ↑ / ↓", "move selection"),
     ("PgUp / PgDn", "move ten rows"),
@@ -5241,6 +5515,7 @@ fn render_help(frame: &mut Frame<'_>, area: Rect) {
     }
     global.push(Line::raw(""));
     for hint in [
+        "This KEYS page has no digit: it sits last in the Tab cycle, and ? opens the same reference as an overlay from any page.",
         "Launch with --theme vitals|avionics|ledger to pick a profile.",
         "t / m choices persist per user; CLI flags override one run.",
         "The collector continues when the TUI exits.",
@@ -5403,7 +5678,7 @@ fn page_hints(page: Page) -> &'static str {
             "Enter ask  ·  e edit last  ·  n new  ·  h vault (r rename · d delete)  ·  y copy  ·  [ ] evidence"
         }
         Page::Settings => "Enter edit  ·  s commit  ·  r revert",
-        Page::Help => "1–9 route  ·  Tab cycle",
+        Page::Help => "1–8 route  ·  Tab cycle  ·  ? overlay anywhere",
         Page::Hardware => "temperatures + clocks resample every 5s  ·  r refresh",
     }
 }
@@ -5937,7 +6212,10 @@ mod tests {
         }
         assert!(text.contains("01 OBS"));
         assert!(text.contains("06 ASK"));
-        assert!(text.contains("08 HELP"));
+        // GAUGES holds digit 8; the digit-less "? KEYS" entry trails it and
+        // is the one the strip clips first at this width.
+        assert!(text.contains("08 GAUGE"));
+        assert!(!text.contains("09 KEYS"));
     }
 
     #[test]
@@ -6904,7 +7182,8 @@ mod tests {
         let mut app = sample_app();
         let backend = render(&mut app);
         let text = buffer_text(backend.buffer());
-        // Rail chrome: brand block and the eight stacked bezel page keys.
+        // Rail chrome: brand block and the stacked bezel page keys — eight
+        // digits plus the digit-less "?" KEYS appendix at the bottom.
         assert!(text.contains("PCPULSE ▮ MFD"));
         for key in [
             "[1] OBS",
@@ -6914,10 +7193,12 @@ mod tests {
             "[5] TIME",
             "[6] ASK",
             "[7] TUNE",
-            "[8] HELP",
+            "[8] GAUGE",
+            "[?] KEYS",
         ] {
             assert!(text.contains(key), "missing bezel key {key}");
         }
+        assert!(!text.contains("[9]"), "no bezel key carries a 9");
         // Annunciator lamps: one per finding class plus the SYS catch-all.
         assert!(
             row_text(backend.buffer(), 0)
@@ -7058,10 +7339,14 @@ mod tests {
         let text = buffer_text(backend.buffer());
         assert!(text.contains("PC PULSE — WORKSTATION LEDGER"));
         assert!(text.contains("LINKED / ETW"));
-        // Full page names in the printed index at this width.
+        // Full page names in the printed index at this width; GAUGES holds
+        // digit 8 and the KEYS appendix prints "?" instead of a digit.
         assert!(text.contains("1 OBSERVE"));
         assert!(text.contains("6 ORACLE"));
-        assert!(text.contains("9 GAUGES"));
+        assert!(text.contains("8 GAUGES"));
+        assert!(text.contains("? KEYS"));
+        assert!(!text.contains("9 GAUGES"));
+        assert!(!text.contains("9 KEYS"));
         // The double rule under the masthead and the folio rule beneath.
         assert!(text.contains("═══"));
         assert!(text.contains("───"));
@@ -7135,7 +7420,7 @@ mod tests {
     }
 
     #[test]
-    fn ledger_observe_front_page_prints_headline_ledger_and_notices() {
+    fn ledger_observe_front_page_prints_headline_market_movers_and_notices() {
         let _theme = theme::test_support::activate(theme::ThemeId::Ledger);
         let mut app = gallery_app();
         let backend = render(&mut app);
@@ -7147,31 +7432,135 @@ mod tests {
         assert!(text.contains("CPU LOAD %"));
         assert!(text.contains("MEMORY %"));
         assert!(text.contains("DISK MS"));
-        // The two printed columns and the circulation bar.
-        assert!(text.contains("SUSPECT LEDGER"));
+        // The NET / IRQ minor headline figures at full width.
+        assert!(text.contains("NET MB/S"));
+        assert!(text.contains("IRQ /S"));
+        // The MARKET strip: every resource ticker with sparkline glyphs.
+        assert!(text.contains("MARKET"));
+        for label in ["CPU", "MEM", "DISK LAT", "DISK IO", "NET", "IRQ+DPC"] {
+            assert!(text.contains(label), "missing market row {label}");
+        }
+        assert!(
+            ['▁', '▂', '▃', '▄', '▅', '▆', '▇']
+                .iter()
+                .any(|glyph| text.contains(*glyph)),
+            "market sparklines render"
+        );
+        assert!(
+            text.contains("m ago"),
+            "windowed market deltas carry their reference"
+        );
+        // The MOVERS board: both ruled columns, populated by the fixture's
+        // trend rings, with signed dominant deltas.
+        assert!(text.contains("MOVERS"));
+        assert!(text.contains("RISING"));
+        assert!(text.contains("EASING"));
+        assert!(text.contains("chrome.exe"), "cpu riser on the board");
+        assert!(text.contains("firefox.exe"), "cpu easer on the board");
+        assert!(text.contains("% cpu"), "cpu-dominant delta grammar");
+        assert!(text.contains("+400 MB"), "memory-dominant delta grammar");
+        // NOTICES compress to one printed line per finding, tags intact.
         assert!(text.contains("NOTICES"));
-        assert!(text.contains("CIRCULATION"));
-        // Findings wear printed tags, not colored badges.
         assert!(text.contains("[CRITICAL]"));
         assert!(text.contains("[WARNING]"));
         assert!(text.contains("[NOTICE]"));
-        // The vitals/avionics Observe centerpieces stay off this page.
+        // The old front page compositions stay gone.
+        assert!(!text.contains("SUSPECT LEDGER"));
+        assert!(!text.contains("CIRCULATION"));
         assert!(!text.contains("PRESSURE FIELD"));
         assert!(!text.contains("PRESSURE MAP"));
         assert!(!text.contains("SUSPECT MATRIX"));
     }
 
     #[test]
+    fn ledger_observe_reports_quiet_movers_honestly() {
+        let _theme = theme::test_support::activate(theme::ThemeId::Ledger);
+        // sample_app has no trend history at all: the board must say so
+        // instead of inventing movement.
+        let mut app = sample_app();
+        let backend = render(&mut app);
+        let text = buffer_text(backend.buffer());
+        assert!(text.contains("MOVERS"));
+        assert!(text.contains("no significant movement"));
+    }
+
+    #[test]
     fn ledger_headline_degrades_to_plain_numerals_when_narrow() {
         let _theme = theme::test_support::activate(theme::ThemeId::Ledger);
         let mut app = gallery_app();
-        let backend = render_size(&mut app, 90, 28);
+        let backend = render_size(&mut app, 90, 32);
         let text = buffer_text(backend.buffer());
         assert!(text.contains("CPU 46%"), "plain numerals");
         assert!(text.contains("MEM 50%"));
         assert!(text.contains("DISK 1.8 ms"));
         assert!(!text.contains("█▀█"), "no block digits below the floor");
-        assert!(text.contains("SUSPECT LEDGER"));
+        // MARKET keeps its tickers; MOVERS becomes one short list.
+        assert!(text.contains("MARKET"));
+        assert!(text.contains("MOVERS"));
+        assert!(!text.contains("RISING"), "no ruled columns when narrow");
+        assert!(text.contains("% cpu"), "movers list still populated");
+    }
+
+    #[test]
+    fn market_direction_table_colors_pressure_and_relief_by_resource() {
+        let _theme = theme::test_support::activate(theme::ThemeId::Ledger);
+        // Six rows, one per system resource, in render order.
+        let labels = MARKET_ROWS
+            .iter()
+            .map(|resource| resource.label)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            labels,
+            vec!["CPU", "MEM", "DISK LAT", "DISK IO", "NET", "IRQ+DPC"]
+        );
+        for (row, resource) in MARKET_ROWS.iter().enumerate() {
+            // Every load metric reads rising as pressure…
+            assert!(resource.rising_is_pressure, "{}", resource.label);
+            assert!(resource.floor > 0.0, "{}", resource.label);
+            // …so a rising delta takes warn, a falling one ok, and a delta
+            // under the floor is not movement at all.
+            let big = resource.floor * 4.0;
+            assert_eq!(
+                market_delta_color(resource, big),
+                Some(palette().warn),
+                "{} rising",
+                resource.label
+            );
+            assert_eq!(
+                market_delta_color(resource, -big),
+                Some(palette().ok),
+                "{} falling",
+                resource.label
+            );
+            assert_eq!(
+                market_delta_color(resource, resource.floor * 0.5),
+                None,
+                "{} under floor",
+                resource.label
+            );
+            // The row's extractor reads a real channel of the sample.
+            let sample = sample_app().snapshot.expect("snapshot").system;
+            assert!(market_value(row, &sample).is_finite());
+        }
+        // Row extractors map to the documented channels.
+        let sample = SystemMetric {
+            cpu_percent: 12.0,
+            memory_used_bytes: 50,
+            memory_total_bytes: 100,
+            disk_latency_ms: 3.5,
+            disk_read_bytes_per_sec: 10.0,
+            disk_write_bytes_per_sec: 5.0,
+            network_bytes_per_sec: 7.0,
+            interrupt_rate: 100.0,
+            dpc_rate: 25.0,
+            ..SystemMetric::default()
+        };
+        assert_eq!(market_value(0, &sample), 12.0);
+        assert_eq!(market_value(1, &sample), 50.0);
+        assert_eq!(market_value(2, &sample), 3.5);
+        assert_eq!(market_value(3, &sample), 15.0);
+        assert_eq!(market_value(4, &sample), 7.0);
+        assert_eq!(market_value(5, &sample), 125.0);
     }
 
     #[test]
@@ -7200,6 +7589,52 @@ mod tests {
                 (tabs.x..tabs.right()).any(|x| masthead_route_at(x, tabs) == Some(page)),
                 "index entry {index} unreachable"
             );
+        }
+    }
+
+    #[test]
+    fn clicking_the_question_mark_entry_opens_the_keys_page_in_every_profile() {
+        let area = Rect::new(0, 0, 150, 46);
+        let click = |column: u16, row: u16| MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row,
+            modifiers: ratatui::crossterm::event::KeyModifiers::NONE,
+        };
+        // Vitals: the statusline route strip's "? KEYS" entry.
+        {
+            let _theme = theme::test_support::activate(theme::ThemeId::Vitals);
+            let mut app = sample_app();
+            // The full-width route prints the digit-less entry as "? KEYS".
+            let text = buffer_text(render(&mut app).buffer());
+            assert!(text.contains("? KEYS"));
+            assert!(!text.contains("09 KEYS"));
+            let tabs = regions(area).tabs;
+            let column = (tabs.x..tabs.right())
+                .find(|column| route_at(*column, tabs) == Some(Page::Help))
+                .expect("the ? KEYS route entry must be clickable");
+            assert!(handle_mouse(&mut app, click(column, tabs.y), area));
+            assert_eq!(app.page, Page::Help);
+        }
+        // Avionics: the bottom "[?] KEYS" bezel key row.
+        {
+            let _theme = theme::test_support::activate(theme::ThemeId::Avionics);
+            let mut app = sample_app();
+            let tabs = regions(area).tabs;
+            assert_eq!(rail_key_at(tabs.y + 8, tabs), Some(Page::Help));
+            assert!(handle_mouse(&mut app, click(tabs.x + 2, tabs.y + 8), area));
+            assert_eq!(app.page, Page::Help);
+        }
+        // Ledger: the printed masthead index's "? KEYS" entry.
+        {
+            let _theme = theme::test_support::activate(theme::ThemeId::Ledger);
+            let mut app = sample_app();
+            let tabs = regions(area).tabs;
+            let column = (tabs.x..tabs.right())
+                .find(|column| masthead_route_at(*column, tabs) == Some(Page::Help))
+                .expect("the ? KEYS index entry must be clickable");
+            assert!(handle_mouse(&mut app, click(column, tabs.y), area));
+            assert_eq!(app.page, Page::Help);
         }
     }
 
@@ -7588,6 +8023,38 @@ mod tests {
             resolved,
             acknowledged,
         ];
+        // MOVERS trend rings: ~2 minutes of scripted per-process drift so
+        // the ledger board has RISING and EASING entries. The ramps end
+        // exactly on the snapshot's current values (f = 1 at the final
+        // step), so the board's "current" column matches the process table.
+        let final_processes = app.snapshot.as_ref().expect("snapshot").processes.clone();
+        let start_cpu = |name: &str, current: f64| match name {
+            "chrome.exe" => 2.0,   // riser: +6.9% cpu
+            "firefox.exe" => 13.0, // easer: -6.6% cpu
+            "WmiPrvSE.exe" => 0.4, // second riser: +2.7% cpu
+            _ => current,
+        };
+        let start_ws = |name: &str, current: u64| match name {
+            "node.exe" => 300 * 1024 * 1024,   // riser: +400 MB
+            "Spotify.exe" => 800 * 1024 * 1024, // easer: -320 MB
+            _ => current,
+        };
+        for step in 0..60_i64 {
+            let f = step as f64 / 59.0;
+            let processes = final_processes
+                .iter()
+                .map(|process| {
+                    let mut point = process.clone();
+                    let cpu = start_cpu(&process.name, process.cpu_percent);
+                    point.cpu_percent = cpu + (process.cpu_percent - cpu) * f;
+                    let ws = start_ws(&process.name, process.working_set_bytes) as f64;
+                    point.working_set_bytes =
+                        (ws + (process.working_set_bytes as f64 - ws) * f).round() as u64;
+                    point
+                })
+                .collect::<Vec<_>>();
+            app.record_process_trends(base.timestamp_ms - (59 - step) * 2_000, &processes);
+        }
         // History must stay chronological (oldest first, ending at the
         // snapshot timestamp), matching the push_back invariant `App`
         // maintains for `live_history`.
@@ -7600,6 +8067,13 @@ mod tests {
             point.memory_used_bytes = base.memory_used_bytes
                 + ((phase * 0.5).sin().abs() * 6.0 * 1024.0 * 1024.0 * 1024.0) as u64;
             point.disk_latency_ms = 0.6 + 1.4 * (phase * 0.8).cos().abs();
+            // The ledger MARKET strip charts every resource: give the I/O,
+            // network, and interrupt channels believable drift too.
+            point.disk_read_bytes_per_sec = (7.0 + 6.0 * (phase * 0.7).sin().abs()) * 1024.0 * 1024.0;
+            point.disk_write_bytes_per_sec = (2.0 + 2.0 * (phase * 1.3).sin().abs()) * 1024.0 * 1024.0;
+            point.network_bytes_per_sec = (1.2 + 1.6 * (phase * 0.45).sin().abs()) * 1024.0 * 1024.0;
+            point.interrupt_rate = 15_000.0 + 4_000.0 * (phase * 0.6).sin().abs();
+            point.dpc_rate = 40.0 + 30.0 * (phase * 0.9).cos().abs();
             app.live_history.push_back(point.clone());
             app.persisted_history.system.push(point);
         }
@@ -7741,17 +8215,17 @@ mod tests {
     }
 
     #[test]
-    fn gauges_key_9_reaches_the_page_and_the_rail_lists_it() {
+    fn gauges_key_8_reaches_the_page_and_the_rail_lists_it() {
         let _guard = theme::test_support::activate(theme::ThemeId::Avionics);
         let mut app = sample_app();
         app.handle_key(ratatui::crossterm::event::KeyEvent::new(
-            ratatui::crossterm::event::KeyCode::Char('9'),
+            ratatui::crossterm::event::KeyCode::Char('8'),
             ratatui::crossterm::event::KeyModifiers::NONE,
         ));
         assert_eq!(app.page, Page::Hardware);
         let backend = render(&mut app);
         let text = buffer_text(backend.buffer());
-        assert!(text.contains("[9] GAUGE"), "rail bezel key for the page");
+        assert!(text.contains("[8] GAUGE"), "rail bezel key for the page");
     }
 
     // ---- Smooth refresh (tween layer) ----------------------------------

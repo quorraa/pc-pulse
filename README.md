@@ -36,7 +36,7 @@ If policy denies ETW session creation, the collector continues with PDH and Win3
 
 ## Terminal interface
 
-The TUI ships three presentation profiles: **vitals** (default), a patient-monitor identity; **avionics**, an amber-CRT multi-function display with a bezel-key rail, an annunciator strip that keeps one lamp per finding class lit from every page, and a pressure-map treemap where every major process is a clickable tile sized by working set and heated by its dominant pressure channel; and **ledger**, a night-edition broadsheet that swaps every box border for typographic rules — a full-width masthead with a printed page index, block-digit headline figures for CPU/MEM/DISK on the front page, a SUSPECT LEDGER and classified-ads NOTICES column, and a folio line at the foot. Start with `PcPulse.exe --theme vitals|avionics|ledger` or cycle live with `t`.
+The TUI ships three presentation profiles: **vitals** (default), a patient-monitor identity; **avionics**, an amber-CRT multi-function display with a bezel-key rail, an annunciator strip that keeps one lamp per finding class lit from every page, and a pressure-map treemap where every major process is a clickable tile sized by working set and heated by its dominant pressure channel; and **ledger**, a night-edition broadsheet that swaps every box border for typographic rules — a full-width masthead with a printed page index, block-digit headline figures for CPU/MEM/DISK (plus NET and IRQ minor figures on wide terminals), a MARKET strip of per-resource trend tickers with windowed deltas, a MOVERS board naming the processes with the largest CPU and working-set change over the last ~2 minutes, one-line NOTICES at the foot, and a folio line beneath. Start with `PcPulse.exe --theme vitals|avionics|ledger` or cycle live with `t`.
 
 | Vitals (default) | Avionics |
 |---|---|
@@ -60,14 +60,14 @@ Nine views:
 5. **Timeline** — persisted CPU, memory, and disk-latency charts over configurable windows.
 6. **Oracle** — evidence-aware chat with the dedicated systems analyzer and the live Windows diagnostic feed.
 7. **Settings** — all detector thresholds and notification state, plain-language explanations, plus per-user CLIENT settings (theme, motion effects, refresh rate, Oracle time budget).
-8. **Keys** — the complete keyboard reference.
-9. **Gauges** — thermal-zone and GPU temperature meters with live history sparklines, plus CPU/GPU clocks and GPU utilization; degrades to an honest unavailable state when sensors are denied.
+8. **Gauges** — thermal-zone and GPU temperature meters with live history sparklines, plus CPU/GPU clocks and GPU utilization; degrades to an honest unavailable state when sensors are denied.
+9. **Keys** — the complete keyboard reference. This page has no digit key: it sits last in the `Tab` cycle and its tab entry prints `?`; pressing `?` anywhere opens the same reference as an overlay.
 
 Important keys:
 
 | Key | Action |
 |---|---|
-| `1`–`9`, `Tab`, `Shift-Tab` | Navigate pages |
+| `1`–`8`, `Tab`, `Shift-Tab` | Navigate pages; the Keys page has no digit and sits last in the `Tab` cycle |
 | `j`/`k`, arrows, `PgUp`/`PgDn` | Move selection |
 | `/` | Filter the process table |
 | `o` | Cycle CPU/memory/I/O/handle/thread/age/name sorting |
@@ -92,7 +92,7 @@ Important keys:
 | `m` | Toggle finite TachyonFX motion effects; the choice is saved per user |
 | Refresh rate (Settings CLIENT row) | Off (event-driven, default) / 30 / 60 fps, saved per user; 30/60 draws on a fixed cadence with smooth interpolation of meters between telemetry samples, and drops a tier automatically if frames keep exceeding their budget. With a v1.11+ service, smooth mode streams system telemetry live at up to 8 Hz; per-process data stays on the two-second cadence |
 | `t` | Cycle presentation profiles (vitals / avionics / ledger); the choice is saved per user |
-| `?` | Open the keys overlay on top of any page; `Esc`, `?`, or a click closes it (the Keys page itself stays on `8`) |
+| `?` | Open the keys overlay on top of any page; `Esc`, `?`, or a click closes it (the full Keys page is the `?`-labeled last tab) |
 | `q` / `Ctrl-C` | Exit the TUI; the collector continues |
 | Left-click | Select tabs, process/tree/finding rows, settings, or the Oracle prompt; clicking a Chat Vault row opens that chat and keeps the vault focused for rename/delete |
 | Click any table header | Sort the overview suspects, processes, lineage rows, findings, or settings by that column |

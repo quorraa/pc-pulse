@@ -33,6 +33,18 @@ use std::{
 const LIVE_HISTORY_CAPACITY: usize = 180;
 /// The high-res pressure-field tail: ~180 seconds of 8 Hz live samples.
 const LIVE_TAIL_CAPACITY: usize = 1_440;
+/// MOVERS trend rings: how many pids the client tracks — the union of the
+/// snapshot's top-CPU and top-memory processes, roughly 20 + 20.
+const PROCESS_TREND_PIDS: usize = 40;
+/// MOVERS trend rings: points per pid — ~2 minutes at the 2-second
+/// snapshot cadence.
+const PROCESS_TREND_POINTS: usize = 60;
+/// The MOVERS comparison window: deltas read "now vs ~2 minutes ago".
+pub const MOVERS_WINDOW_MS: i64 = 120_000;
+/// Movement floors: CPU deltas under this many percentage points and
+/// working-set deltas under this many bytes are noise, not movers.
+pub const MOVER_CPU_FLOOR: f64 = 1.5;
+pub const MOVER_MEMORY_FLOOR: f64 = 32.0 * 1024.0 * 1024.0;
 /// The live channel's request ceiling: never faster than 8 Hz, matching the
 /// service's 125 ms collection cadence.
 const LIVE_MAX_HZ: u32 = 8;
@@ -64,6 +76,9 @@ pub enum Page {
 }
 
 impl Page {
+    /// Every page in tab order. The KEYS reference deliberately sits last —
+    /// it is the appendix, reached by Tab wrap-around or its printed "?"
+    /// entry, and it is the only page without a digit key.
     pub const ALL: [Self; 9] = [
         Self::Overview,
         Self::Processes,
@@ -72,8 +87,8 @@ impl Page {
         Self::Timeline,
         Self::Analyzer,
         Self::Settings,
-        Self::Help,
         Self::Hardware,
+        Self::Help,
     ];
 
     pub const fn title(self) -> &'static str {
@@ -193,6 +208,51 @@ pub struct TreeRow {
 pub struct HardwareTrace {
     pub label: String,
     pub points: VecDeque<f64>,
+}
+
+/// One point of a per-process MOVERS trend ring: the client-side record of
+/// what a pid's CPU share and working set looked like at a snapshot.
+#[derive(Debug, Clone, Copy)]
+pub struct ProcessTrendPoint {
+    pub timestamp_ms: i64,
+    pub cpu_percent: f64,
+    pub working_set_bytes: u64,
+}
+
+/// A bounded per-pid ring of [`ProcessTrendPoint`]s, fed on every fresh
+/// snapshot; the ledger MOVERS board reads deltas out of these.
+#[derive(Debug, Clone, Default)]
+pub struct ProcessTrend {
+    pub name: String,
+    pub points: VecDeque<ProcessTrendPoint>,
+}
+
+/// One MOVERS board entry: a process whose CPU or working set moved past
+/// the floors over the recent window.
+#[derive(Debug, Clone)]
+pub struct Mover {
+    pub name: String,
+    /// CPU change over the window in percentage points (signed).
+    pub cpu_delta: f64,
+    /// Working-set change over the window in bytes (signed).
+    pub memory_delta: f64,
+    pub cpu_now: f64,
+    pub working_set_now: u64,
+    /// True when the CPU delta is the dominant signal; false = working set.
+    pub cpu_dominant: bool,
+    /// The dominant signal's floor-normalized magnitude; sorts the board.
+    pub weight: f64,
+}
+
+impl Mover {
+    /// True for the RISING column: the dominant signal grew.
+    pub fn rising(&self) -> bool {
+        if self.cpu_dominant {
+            self.cpu_delta > 0.0
+        } else {
+            self.memory_delta > 0.0
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -831,6 +891,10 @@ pub struct App {
     /// [`Self::hardware_history`]; the service caches hardware between
     /// 5-second probes, so most snapshots repeat the previous sample.
     hardware_history_ms: i64,
+    /// MOVERS trend rings: pid → bounded (timestamp, cpu, working-set)
+    /// history for the union of the snapshot's top CPU/memory processes.
+    /// Purely client-side; fed by [`Self::record_process_trends`].
+    pub(crate) process_trends: std::collections::HashMap<u32, ProcessTrend>,
     pub persisted_history: HistoryResponse,
     pub alerts: Vec<Alert>,
     pub diagnostics: DiagnosticLogResponse,
@@ -946,6 +1010,7 @@ impl App {
             live_fps_sent: None,
             hardware_history: Vec::new(),
             hardware_history_ms: 0,
+            process_trends: std::collections::HashMap::new(),
             persisted_history: HistoryResponse {
                 system: Vec::new(),
                 processes: Vec::new(),
@@ -1047,6 +1112,12 @@ impl App {
                         while self.live_history.len() > LIVE_HISTORY_CAPACITY {
                             self.live_history.pop_front();
                         }
+                        // Same freshness guard feeds the MOVERS trend rings:
+                        // a repeated telemetry sample must not double-record.
+                        self.record_process_trends(
+                            snapshot.system.timestamp_ms,
+                            &snapshot.processes,
+                        );
                     }
                     if snapshot.hardware.sampled_at_ms != self.hardware_history_ms {
                         self.hardware_history_ms = snapshot.hardware.sampled_at_ms;
@@ -1202,7 +1273,9 @@ impl App {
             KeyCode::Tab | KeyCode::Right if self.page != Page::Settings => self.change_page(1),
             KeyCode::BackTab | KeyCode::Left if self.page != Page::Settings => self.change_page(-1),
             KeyCode::Char('?') => self.help_overlay = Some(0),
-            KeyCode::Char(value @ '1'..='9') => {
+            // Digits address the first eight pages only; the KEYS page has
+            // no digit — Tab wraps to it, and '?' opens the quick overlay.
+            KeyCode::Char(value @ '1'..='8') => {
                 self.select_page(Page::ALL[(value as u8 - b'1') as usize]);
             }
             KeyCode::Esc if self.page == Page::Analyzer && self.analyzer_running => {
@@ -1987,6 +2060,127 @@ impl App {
         }
     }
 
+    /// Feed the MOVERS trend rings from one fresh snapshot: record a point
+    /// for every pid in the union of the top-CPU and top-memory processes,
+    /// evict pids that left the process table, and hold the tracked set to
+    /// [`PROCESS_TREND_PIDS`] by dropping the stalest untracked rings.
+    pub(crate) fn record_process_trends(
+        &mut self,
+        timestamp_ms: i64,
+        processes: &[ProcessMetric],
+    ) {
+        let half = PROCESS_TREND_PIDS / 2;
+        let mut by_cpu = processes
+            .iter()
+            .filter(|process| process.pid > 4)
+            .collect::<Vec<_>>();
+        let mut by_memory = by_cpu.clone();
+        by_cpu.sort_by(|left, right| right.cpu_percent.total_cmp(&left.cpu_percent));
+        by_memory.sort_by_key(|process| std::cmp::Reverse(process.working_set_bytes));
+        let tracked = by_cpu
+            .iter()
+            .take(half)
+            .chain(by_memory.iter().take(half))
+            .map(|process| process.pid)
+            .collect::<std::collections::HashSet<u32>>();
+        // A pid gone from the table is stale — its ring would otherwise
+        // report a ghost mover forever.
+        self.process_trends
+            .retain(|pid, _| processes.iter().any(|process| process.pid == *pid));
+        for process in processes {
+            if !tracked.contains(&process.pid) {
+                continue;
+            }
+            let trend = self.process_trends.entry(process.pid).or_default();
+            trend.name = process.name.clone();
+            if trend.points.back().map(|point| point.timestamp_ms) == Some(timestamp_ms) {
+                continue;
+            }
+            trend.points.push_back(ProcessTrendPoint {
+                timestamp_ms,
+                cpu_percent: process.cpu_percent,
+                working_set_bytes: process.working_set_bytes,
+            });
+            while trend.points.len() > PROCESS_TREND_POINTS {
+                trend.points.pop_front();
+            }
+        }
+        // Rings that survive the retain but fell out of the union keep
+        // their history (a process easing off IS the story) — until the map
+        // outgrows the cap, when the stalest of them are shed first.
+        if self.process_trends.len() > PROCESS_TREND_PIDS {
+            let mut untracked = self
+                .process_trends
+                .iter()
+                .filter(|(pid, _)| !tracked.contains(pid))
+                .map(|(pid, trend)| {
+                    (
+                        *pid,
+                        trend.points.back().map(|point| point.timestamp_ms).unwrap_or(0),
+                    )
+                })
+                .collect::<Vec<_>>();
+            untracked.sort_by_key(|(_, last)| *last);
+            for (pid, _) in untracked
+                .iter()
+                .take(self.process_trends.len() - PROCESS_TREND_PIDS)
+            {
+                self.process_trends.remove(pid);
+            }
+        }
+    }
+
+    /// The MOVERS board: processes whose CPU or working set moved past the
+    /// floors over [`MOVERS_WINDOW_MS`], split into (rising, easing) and
+    /// sorted by floor-normalized magnitude. Quiet rings yield no entry.
+    pub fn process_movers(&self) -> (Vec<Mover>, Vec<Mover>) {
+        let mut rising = Vec::new();
+        let mut easing = Vec::new();
+        for trend in self.process_trends.values() {
+            let Some(latest) = trend.points.back() else {
+                continue;
+            };
+            // The reference point: the oldest sample still inside the
+            // window, so a short ring compares over what it actually has.
+            let Some(reference) = trend
+                .points
+                .iter()
+                .find(|point| point.timestamp_ms >= latest.timestamp_ms - MOVERS_WINDOW_MS)
+            else {
+                continue;
+            };
+            if reference.timestamp_ms == latest.timestamp_ms {
+                continue;
+            }
+            let cpu_delta = latest.cpu_percent - reference.cpu_percent;
+            let memory_delta =
+                latest.working_set_bytes as f64 - reference.working_set_bytes as f64;
+            let cpu_weight = cpu_delta.abs() / MOVER_CPU_FLOOR;
+            let memory_weight = memory_delta.abs() / MOVER_MEMORY_FLOOR;
+            let weight = cpu_weight.max(memory_weight);
+            if weight < 1.0 {
+                continue;
+            }
+            let mover = Mover {
+                name: trend.name.clone(),
+                cpu_delta,
+                memory_delta,
+                cpu_now: latest.cpu_percent,
+                working_set_now: latest.working_set_bytes,
+                cpu_dominant: cpu_weight >= memory_weight,
+                weight,
+            };
+            if mover.rising() {
+                rising.push(mover);
+            } else {
+                easing.push(mover);
+            }
+        }
+        rising.sort_by(|left, right| right.weight.total_cmp(&left.weight));
+        easing.sort_by(|left, right| right.weight.total_cmp(&left.weight));
+        (rising, easing)
+    }
+
     fn bound_chat_history(&mut self) {
         while self.chat_messages.len() > 16 {
             self.chat_messages.pop_front();
@@ -2691,18 +2885,154 @@ mod tests {
     }
 
     #[test]
-    fn key_9_routes_to_the_gauges_page_and_tab_cycles_through_it() {
+    fn key_8_routes_to_gauges_and_keys_sits_last_without_a_digit() {
         let mut app = App::new_inert();
+        app.handle_key(KeyEvent::new(KeyCode::Char('8'), KeyModifiers::NONE));
+        assert_eq!(app.page, Page::Hardware);
+        // '9' addresses nothing: the KEYS page has no digit.
         app.handle_key(KeyEvent::new(KeyCode::Char('9'), KeyModifiers::NONE));
         assert_eq!(app.page, Page::Hardware);
-        // Tab wraps from the last page back to Overview.
+        // Tab from GAUGES reaches the KEYS appendix, then wraps to Overview.
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.page, Page::Help);
         app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         assert_eq!(app.page, Page::Overview);
-        // Shift-Tab reaches GAUGES from Overview.
+        // Shift-Tab reaches KEYS from Overview.
         app.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE));
-        assert_eq!(app.page, Page::Hardware);
+        assert_eq!(app.page, Page::Help);
         assert_eq!(Page::ALL.len(), 9);
-        assert_eq!(Page::Hardware.title(), "Gauges");
+        assert_eq!(Page::ALL[7], Page::Hardware);
+        assert_eq!(Page::ALL[8], Page::Help);
+        assert_eq!(Page::Help.title(), "Keys");
+        // '?' still opens the quick overlay rather than routing pages.
+        app.handle_key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE));
+        assert_eq!(app.help_overlay, Some(0));
+        assert_eq!(app.page, Page::Overview);
+    }
+
+    /// A ProcessMetric for the trend-ring tests: only the fields the rings
+    /// read matter.
+    fn trend_process(pid: u32, name: &str, cpu: f64, working_set_mb: u64) -> ProcessMetric {
+        ProcessMetric {
+            timestamp_ms: 0,
+            pid,
+            parent_pid: 1,
+            name: name.into(),
+            executable_path: format!(r"C:\apps\{name}"),
+            cpu_percent: cpu,
+            working_set_bytes: working_set_mb * 1024 * 1024,
+            private_bytes: 0,
+            handle_count: 10,
+            thread_count: 2,
+            read_bytes_per_sec: 0.0,
+            write_bytes_per_sec: 0.0,
+            total_read_bytes: 0,
+            total_write_bytes: 0,
+            started_at_ms: 0,
+            session_id: 1,
+            responsive: true,
+            has_visible_window: false,
+            launch_duration_ms: None,
+            is_agent_candidate: false,
+        }
+    }
+
+    #[test]
+    fn process_trend_rings_stay_bounded_and_evict_departed_pids() {
+        let mut app = App::new_inert();
+        // 60 pids on offer, but only the top-CPU/top-memory union is
+        // tracked: the cap holds at PROCESS_TREND_PIDS.
+        let crowd = (0..60)
+            .map(|index| {
+                trend_process(
+                    100 + index,
+                    &format!("proc-{index}.exe"),
+                    f64::from(index),
+                    64 + u64::from(index),
+                )
+            })
+            .collect::<Vec<_>>();
+        for step in 0..(PROCESS_TREND_POINTS as i64 + 20) {
+            app.record_process_trends(step * 2_000, &crowd);
+        }
+        assert!(app.process_trends.len() <= PROCESS_TREND_PIDS);
+        for trend in app.process_trends.values() {
+            assert!(trend.points.len() <= PROCESS_TREND_POINTS);
+        }
+        // A repeated timestamp must not double-record.
+        let tracked_pid = *app.process_trends.keys().next().expect("tracked pid");
+        let before = app.process_trends[&tracked_pid].points.len();
+        app.record_process_trends((PROCESS_TREND_POINTS as i64 + 19) * 2_000, &crowd);
+        assert_eq!(app.process_trends[&tracked_pid].points.len(), before);
+        // A pid that leaves the process table loses its ring.
+        let survivors = crowd
+            .iter()
+            .filter(|process| process.pid != tracked_pid)
+            .cloned()
+            .collect::<Vec<_>>();
+        app.record_process_trends(1_000_000, &survivors);
+        assert!(!app.process_trends.contains_key(&tracked_pid));
+        // System pids never enter the rings.
+        app.record_process_trends(1_002_000, &[trend_process(4, "System", 90.0, 900)]);
+        assert!(!app.process_trends.contains_key(&4));
+    }
+
+    #[test]
+    fn process_movers_split_by_direction_with_floors_and_delta_math() {
+        let mut app = App::new_inert();
+        let steps = 60_i64;
+        for step in 0..=steps {
+            let t = step as f64 / steps as f64;
+            let processes = vec![
+                // CPU climbs 2% → 16%: a riser, CPU-dominant.
+                trend_process(10, "climber.exe", 2.0 + 14.0 * t, 100),
+                // CPU falls 20% → 5%: an easer.
+                trend_process(20, "cooler.exe", 20.0 - 15.0 * t, 100),
+                // Working set grows 100 MB → 480 MB: a memory riser.
+                trend_process(30, "bloater.exe", 1.0, 100 + (380.0 * t) as u64),
+                // Flat under both floors: never a mover.
+                trend_process(40, "steady.exe", 3.0 + 0.4 * t, 100),
+            ];
+            app.record_process_trends(step * 2_000, &processes);
+        }
+        let (rising, easing) = app.process_movers();
+        let names = |movers: &[Mover]| {
+            movers
+                .iter()
+                .map(|mover| mover.name.clone())
+                .collect::<Vec<_>>()
+        };
+        assert!(names(&rising).contains(&"climber.exe".to_string()));
+        assert!(names(&rising).contains(&"bloater.exe".to_string()));
+        assert_eq!(names(&easing), vec!["cooler.exe".to_string()]);
+        assert!(!names(&rising).contains(&"steady.exe".to_string()));
+        let climber = rising
+            .iter()
+            .find(|mover| mover.name == "climber.exe")
+            .expect("climber");
+        // The window covers the last 2 minutes of the ring, i.e. cpu at
+        // t=window-start vs now; the delta is positive and CPU-dominant.
+        assert!(climber.cpu_dominant);
+        assert!(climber.cpu_delta > MOVER_CPU_FLOOR);
+        assert!((climber.cpu_now - 16.0).abs() < 1e-9);
+        let bloater = rising
+            .iter()
+            .find(|mover| mover.name == "bloater.exe")
+            .expect("bloater");
+        assert!(!bloater.cpu_dominant);
+        assert!(bloater.memory_delta > MOVER_MEMORY_FLOOR);
+        // Rising sorts by normalized magnitude, strongest first.
+        assert!(
+            rising
+                .windows(2)
+                .all(|pair| pair[0].weight >= pair[1].weight)
+        );
+        // A single-point ring yields nothing (no reference to compare).
+        let mut fresh = App::new_inert();
+        fresh.record_process_trends(0, &[trend_process(10, "solo.exe", 50.0, 500)]);
+        let (rising, easing) = fresh.process_movers();
+        assert!(rising.is_empty() && easing.is_empty());
     }
 
     #[test]
