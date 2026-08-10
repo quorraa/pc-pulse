@@ -1788,7 +1788,10 @@ impl App {
         if self.live_tail.back().map(|item| item.timestamp_ms) == Some(sample.timestamp_ms) {
             return;
         }
-        let target = live_to_system(&sample, &snapshot.system);
+        let raw = live_to_system(&sample, &snapshot.system);
+        // Ease toward the EMA, not the raw 125 ms window; the chart tail
+        // carries the same smoothed series so meters and chart agree.
+        let target = smooth_live_target(self.live_tail.back(), &raw);
         let displayed = self.display_system(&snapshot.system);
         self.smooth
             .retarget_live(displayed, target.clone(), Instant::now());
@@ -2391,6 +2394,47 @@ impl App {
 /// (pool bytes, counts, collector self-metrics) carries over from the
 /// latest snapshot sample. A zero live memory total (memory probe denied)
 /// keeps the snapshot's total so percentage math never divides by zero.
+/// A 125 ms PDH window is honest but spiky: instantaneous CPU whipsaws
+/// between near-zero and bursts, and easing toward every twitch makes the
+/// meters thrash ("cpu numbers look very crazy"). Display targets are
+/// therefore an exponential moving average over the live stream — a ~500 ms
+/// time constant for the twitchy channels and ~300 ms for throughput —
+/// which keeps sub-second responsiveness without the seismograph needle.
+const LIVE_EMA_SLOW: f64 = 0.22;
+const LIVE_EMA_FAST: f64 = 0.35;
+
+fn ema(previous: f64, sample: f64, alpha: f64) -> f64 {
+    previous + (sample - previous) * alpha
+}
+
+fn smooth_live_target(previous: Option<&SystemMetric>, raw: &SystemMetric) -> SystemMetric {
+    let Some(prev) = previous else {
+        return raw.clone();
+    };
+    SystemMetric {
+        cpu_percent: ema(prev.cpu_percent, raw.cpu_percent, LIVE_EMA_SLOW),
+        disk_latency_ms: ema(prev.disk_latency_ms, raw.disk_latency_ms, LIVE_EMA_SLOW),
+        dpc_rate: ema(prev.dpc_rate, raw.dpc_rate, LIVE_EMA_SLOW),
+        interrupt_rate: ema(prev.interrupt_rate, raw.interrupt_rate, LIVE_EMA_SLOW),
+        disk_read_bytes_per_sec: ema(
+            prev.disk_read_bytes_per_sec,
+            raw.disk_read_bytes_per_sec,
+            LIVE_EMA_FAST,
+        ),
+        disk_write_bytes_per_sec: ema(
+            prev.disk_write_bytes_per_sec,
+            raw.disk_write_bytes_per_sec,
+            LIVE_EMA_FAST,
+        ),
+        network_bytes_per_sec: ema(
+            prev.network_bytes_per_sec,
+            raw.network_bytes_per_sec,
+            LIVE_EMA_FAST,
+        ),
+        ..raw.clone()
+    }
+}
+
 fn live_to_system(sample: &LiveSample, base: &SystemMetric) -> SystemMetric {
     SystemMetric {
         timestamp_ms: sample.timestamp_ms,
@@ -3603,6 +3647,32 @@ mod tests {
             dpc_rate: 100.0,
             interrupt_rate: 200.0,
         }
+    }
+
+    #[test]
+    fn live_targets_are_ema_smoothed_against_window_jitter() {
+        // First sample seeds raw.
+        let seed = live_to_system(&live_sample(1_000, 40.0), &SystemMetric::default());
+        assert_eq!(smooth_live_target(None, &seed).cpu_percent, 40.0);
+        // A 125 ms window whipsawing 40 -> 95 must move the display target
+        // only a fraction of the way — no seismograph needle.
+        let spike = live_to_system(&live_sample(1_125, 95.0), &SystemMetric::default());
+        let smoothed = smooth_live_target(Some(&seed), &spike);
+        assert!(
+            (smoothed.cpu_percent - (40.0 + 55.0 * LIVE_EMA_SLOW)).abs() < 1e-9,
+            "expected one EMA step, got {}",
+            smoothed.cpu_percent
+        );
+        assert!(smoothed.cpu_percent < 60.0);
+        // Sustained load converges: repeated 95% samples approach 95.
+        let mut rolling = seed;
+        for step in 0..40 {
+            let raw = live_to_system(&live_sample(1_250 + step, 95.0), &SystemMetric::default());
+            rolling = smooth_live_target(Some(&rolling), &raw);
+        }
+        assert!((rolling.cpu_percent - 95.0).abs() < 1.0);
+        // Non-jitter channels pass through raw.
+        assert_eq!(rolling.memory_used_bytes, 8_000_000_000);
     }
 
     #[test]
