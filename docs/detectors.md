@@ -35,10 +35,28 @@ Both captures take a baseline when the finding first fires, then refresh at most
 
 Privacy boundary: forensics records kernel object type names and module base file names only — never command lines, handle names, window text, or memory content.
 
+## Interrupt attribution
+
+While a `dpcInterrupt` finding is active, the collector answers the question the PDH counters cannot: *which driver* is doing the interrupt work. It captures a short Windows kernel trace and attaches three evidence rows to the finding:
+
+- `ISR/DPC attribution :: storport.sys 41% · ndis.sys 27% · nvlddmkm.sys 12%` — every interrupt service routine and DPC routine address in the trace, bucketed at 64 KiB granularity and mapped to the loaded kernel driver whose base address is nearest at-or-below (`EnumDeviceDrivers`); addresses below every driver base are `unattributed`.
+- `Top driver :: storport.sys — Microsoft Storage Port Driver` — the leading driver enriched with its version-resource description (or company name).
+- `Trace window :: 8 s · 214k events` — the actual span and decoded event count, with `(capped)` when the storm guard ended the capture early.
+
+Mechanics and budget:
+
+- **Session isolation.** The capture uses a dedicated short-lived system logger session (`PcPulseIsrDpc`, `EVENT_TRACE_SYSTEM_LOGGER_MODE`, Windows 10 1703+ allows eight concurrently) enabling only the ISR and DPC kernel flags. The collector's long-lived process-lifecycle ETW session is a separate session and is never touched.
+- **Trigger and cooldown.** One capture when the finding fires, then at most one every ten minutes while it stays active. A failed capture also starts the cooldown, so a denied session is not retried on every sample. With no `dpcInterrupt` finding active the engine performs no syscalls at all.
+- **Bounded window.** Eight seconds of wall time, consumed in real time on a below-normal-priority thread, with a 400,000-event storm guard that stops the capture early and says so in the evidence. The session is stopped and the trace handle closed deterministically on every path, including errors (balance counters assert this in the probe harness).
+- **Expected cost.** During a genuine interrupt storm the consumer processes a burst of very small callbacks — a real but brief CPU spike for up to eight seconds, at below-normal priority, at most once per ten minutes; sustained collector CPU stays far under the 0.2% budget. Metric sampling pauses for the capture window and resumes with the next sample. The bucket map is a few hundred entries at most; ETW buffer memory (≤ 768 KiB) is returned when the session stops.
+- **Degraded modes.** If the session cannot start — unelevated collector, pre-1703 Windows, policy, or system-logger exhaustion — the finding carries an honest `capture degraded: …` note instead of attribution, exactly like leak forensics. If events arrive but their layout cannot be decoded, the evidence says so rather than guessing.
+
+Privacy boundary: interrupt attribution records driver base file names and version-resource company/description strings only — never routine addresses, process data, or memory content.
+
 ## Attribution limits
 
 - Disk latency is a system PDH value. PC Pulse names the process with the greatest current read/write rate as the likely workload owner and phrases the explanation accordingly; it does not claim proof of storage-stack ownership.
-- Kernel pool allocations and DPC/interrupt work usually belong to drivers. There is no honest user-process attribution, so these findings are labeled `System / driver` and recommend OEM driver checks or PoolMon.
+- Kernel pool allocations and DPC/interrupt work usually belong to drivers. There is no honest user-process attribution, so these findings are labeled `System / driver`; sustained DPC/interrupt findings additionally gain driver-level ISR/DPC attribution (above), while kernel pool findings recommend OEM driver checks or PoolMon.
 - Unresponsive status comes from `IsHungAppWindow` on visible top-level windows.
 - Launch time uses ETW process start plus first visible top-level window. Processes that predate the current ETW session are excluded.
 - An agent candidate requires a configured name/path fragment, a missing live parent, minimum age, CPU under 1%, and combined I/O under 1 MiB/s for the sustained window.

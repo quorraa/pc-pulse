@@ -337,8 +337,9 @@ impl SettingField {
     pub const fn description(self) -> &'static str {
         match self {
             Self::ClientTheme => {
-                "Which look this terminal uses — vitals (green patient monitor) or avionics \
-                 (amber cockpit display). Enter switches immediately and remembers your choice."
+                "Which look this terminal uses — vitals (green patient monitor), avionics \
+                 (amber cockpit display), or ledger (night-edition broadsheet). Enter switches \
+                 immediately and remembers your choice."
             }
             Self::ClientEffects => {
                 "Whether brief motion effects play on page changes and new findings. Enter \
@@ -2801,6 +2802,15 @@ mod tests {
         assert!(app.take_terminal_clear(), "theme swap needs a repaint");
         assert!(!app.take_terminal_clear(), "the flag drains");
         assert_eq!(store.load().theme, theme::ThemeId::Avionics);
+
+        // The row is a three-position switch: avionics -> ledger -> vitals.
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(theme::active().id, theme::ThemeId::Ledger);
+        assert_eq!(app.setting_value(SettingField::ClientTheme), "ledger");
+        assert_eq!(store.load().theme, theme::ThemeId::Ledger);
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(theme::active().id, theme::ThemeId::Vitals);
+        assert_eq!(store.load().theme, theme::ThemeId::Vitals);
         let _ = std::fs::remove_file(path);
     }
 

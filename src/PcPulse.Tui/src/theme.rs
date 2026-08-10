@@ -1,8 +1,10 @@
 //! Presentation profiles: a theme is a palette plus a structural layout.
 //!
-//! Two profiles ship: **vitals** (the patient-monitor identity, statusline
-//! layout) and **avionics** (an amber-CRT multi-function-display identity,
-//! rail layout). The active profile lives in a process-wide atomic so the
+//! Three profiles ship: **vitals** (the patient-monitor identity, statusline
+//! layout), **avionics** (an amber-CRT multi-function-display identity,
+//! rail layout), and **ledger** (a night-edition broadsheet identity,
+//! typographic broadsheet layout — rules instead of box borders). The active
+//! profile lives in a process-wide atomic so the
 //! ~460 color call sites in `ui.rs`/`effects.rs` stay expression-shaped:
 //! `palette().text`, `palette().ok`, and so on. Both modules read through
 //! the same accessors, which keeps the exact-RGB `CellFilter::FgColor`
@@ -36,6 +38,7 @@ pub struct Palette {
 pub enum ThemeId {
     Vitals = 0,
     Avionics = 1,
+    Ledger = 2,
 }
 
 impl ThemeId {
@@ -44,6 +47,7 @@ impl ThemeId {
         match self {
             Self::Vitals => "vitals",
             Self::Avionics => "avionics",
+            Self::Ledger => "ledger",
         }
     }
 }
@@ -54,6 +58,10 @@ pub enum LayoutKind {
     Statusline,
     /// Left rail + top annunciator strip (avionics MFD structure).
     Rail,
+    /// Full-width masthead + printed page index + folio footer, with no box
+    /// borders anywhere — structure comes from typographic rules (the ledger
+    /// broadsheet structure).
+    Broadsheet,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -111,8 +119,34 @@ static AVIONICS: Theme = Theme {
     },
 };
 
+/// Night-edition broadsheet: deep warm charcoal newsprint, soft warm
+/// off-white ink, dim pencil rules; accents: ledger red (`crit`), steel blue
+/// (`info`), soft green (`ok`), ochre (`warn`), mauve (`alt`); selection is a
+/// dim warm wash.
+static LEDGER: Theme = Theme {
+    id: ThemeId::Ledger,
+    name: "ledger",
+    layout: LayoutKind::Broadsheet,
+    palette: Palette {
+        bg: Color::Rgb(16, 15, 13),
+        surface: Color::Rgb(24, 22, 19),
+        surface_raised: Color::Rgb(33, 30, 26),
+        border: Color::Rgb(58, 53, 45),
+        border_hot: Color::Rgb(88, 80, 66),
+        text: Color::Rgb(226, 220, 206),
+        muted: Color::Rgb(150, 142, 126),
+        faint: Color::Rgb(100, 93, 80),
+        ok: Color::Rgb(110, 200, 140),
+        alt: Color::Rgb(190, 130, 200),
+        info: Color::Rgb(120, 164, 224),
+        warn: Color::Rgb(222, 168, 72),
+        crit: Color::Rgb(232, 84, 90),
+        select_bg: Color::Rgb(56, 48, 36),
+    },
+};
+
 /// Every shipped profile, in cycle order.
-pub static ALL: [&Theme; 2] = [&VITALS, &AVIONICS];
+pub static ALL: [&Theme; 3] = [&VITALS, &AVIONICS, &LEDGER];
 
 static ACTIVE: AtomicU8 = AtomicU8::new(ThemeId::Vitals as u8);
 
@@ -120,6 +154,7 @@ static ACTIVE: AtomicU8 = AtomicU8::new(ThemeId::Vitals as u8);
 pub fn active() -> &'static Theme {
     match ACTIVE.load(Ordering::Relaxed) {
         1 => &AVIONICS,
+        2 => &LEDGER,
         _ => &VITALS,
     }
 }
@@ -135,11 +170,11 @@ pub fn set_active(id: ThemeId) {
 
 /// Advance to the next profile in [`ALL`] order and return it.
 pub fn cycle() -> &'static Theme {
-    let next = match active().id {
-        ThemeId::Vitals => ThemeId::Avionics,
-        ThemeId::Avionics => ThemeId::Vitals,
-    };
-    set_active(next);
+    let position = ALL
+        .iter()
+        .position(|theme| theme.id == active().id)
+        .unwrap_or(0);
+    set_active(ALL[(position + 1) % ALL.len()].id);
     active()
 }
 
@@ -192,6 +227,8 @@ mod tests {
         assert_eq!("vitals".parse::<ThemeId>(), Ok(ThemeId::Vitals));
         assert_eq!("avionics".parse::<ThemeId>(), Ok(ThemeId::Avionics));
         assert_eq!("AVIONICS".parse::<ThemeId>(), Ok(ThemeId::Avionics));
+        assert_eq!("ledger".parse::<ThemeId>(), Ok(ThemeId::Ledger));
+        assert_eq!("LEDGER".parse::<ThemeId>(), Ok(ThemeId::Ledger));
         assert!("nightwatch".parse::<ThemeId>().is_err());
         assert!("".parse::<ThemeId>().is_err());
     }
@@ -202,12 +239,14 @@ mod tests {
         assert_eq!(active().id, ThemeId::Vitals);
         assert_eq!(cycle().id, ThemeId::Avionics);
         assert_eq!(active().layout, LayoutKind::Rail);
+        assert_eq!(cycle().id, ThemeId::Ledger);
+        assert_eq!(active().layout, LayoutKind::Broadsheet);
         assert_eq!(cycle().id, ThemeId::Vitals);
         assert_eq!(active().layout, LayoutKind::Statusline);
     }
 
     #[test]
-    fn both_palettes_keep_five_distinct_accent_channels() {
+    fn every_palette_keeps_five_distinct_accent_channels() {
         for theme in ALL {
             let p = theme.palette;
             let channels = [p.ok, p.alt, p.info, p.warn, p.crit];
@@ -226,7 +265,7 @@ mod tests {
     }
 
     #[test]
-    fn both_palettes_keep_readable_contrast_on_surfaces() {
+    fn every_palette_keeps_readable_contrast_on_surfaces() {
         for theme in ALL {
             let p = theme.palette;
             assert!(

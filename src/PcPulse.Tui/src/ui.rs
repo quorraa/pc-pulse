@@ -44,6 +44,14 @@ const RAIL_BRAND_HEIGHT: u16 = 3;
 const RAIL_STATUS_HEIGHT: u16 = 8;
 const ANNUNCIATOR_HEIGHT: u16 = 3;
 
+/// Broadsheet masthead: brand line, dateline, printed page index, double
+/// rule. Folio: one thin rule plus the printed folio line.
+const MASTHEAD_HEIGHT: u16 = 4;
+const FOLIO_HEIGHT: u16 = 2;
+/// Below this width the headline block digits lose more than they show, so
+/// the front page degrades to plain numerals.
+const HEADLINE_MIN_WIDTH: u16 = 100;
+
 /// The rail column width when the avionics rail structure applies to this
 /// terminal size, or `None` when the statusline shape is used instead.
 fn rail_width(area: Rect) -> Option<u16> {
@@ -53,10 +61,48 @@ fn rail_width(area: Rect) -> Option<u16> {
         .then_some(RAIL_WIDTH)
 }
 
+/// True when the ledger broadsheet structure applies. Unlike the rail it has
+/// no size floor: masthead + folio cost one row less than the statusline
+/// chrome, so it holds at every supported terminal size.
+fn broadsheet() -> bool {
+    theme::active().layout == LayoutKind::Broadsheet
+}
+
 pub fn regions(area: Rect) -> UiRegions {
-    match rail_width(area) {
-        Some(width) => rail_regions(area, width),
-        None => statusline_regions(area),
+    if let Some(width) = rail_width(area) {
+        return rail_regions(area, width);
+    }
+    if broadsheet() {
+        return broadsheet_regions(area);
+    }
+    statusline_regions(area)
+}
+
+/// Ledger broadsheet shape: a full-width masthead on top (brand, dateline,
+/// printed page index, double rule), the page body beneath, and a printed
+/// folio line at the bottom. Region mapping for the effects layer:
+/// `header` = the whole masthead, `tabs` = the masthead's page-index line,
+/// `footer` = the folio block, `body` = the rest.
+fn broadsheet_regions(area: Rect) -> UiRegions {
+    let chunks = Layout::vertical([
+        Constraint::Length(MASTHEAD_HEIGHT),
+        Constraint::Min(12),
+        Constraint::Length(FOLIO_HEIGHT),
+    ])
+    .split(area);
+    let masthead = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .split(chunks[0]);
+    UiRegions {
+        full: area,
+        header: chunks[0],
+        tabs: masthead[2],
+        body: chunks[1],
+        footer: chunks[2],
     }
 }
 
@@ -194,6 +240,8 @@ pub fn handle_mouse(app: &mut App, event: MouseEvent, area: Rect) -> bool {
             if button == MouseButton::Left && point_in(regions.tabs, point) {
                 let page = if rail {
                     rail_key_at(event.row, regions.tabs)
+                } else if broadsheet() {
+                    masthead_route_at(event.column, regions.tabs)
                 } else {
                     route_at(event.column, regions.tabs)
                 };
@@ -248,6 +296,12 @@ fn mouse_body_click(
         Page::Overview if button == MouseButton::Left => {
             if rail {
                 return pressure_map_click(app, point, body);
+            }
+            if broadsheet() {
+                // The front page is a printed sheet: headline digits and the
+                // suspect ledger read, they do not click. Keyboard sorts
+                // (`o` on HUNT, header clicks elsewhere) are unaffected.
+                return false;
             }
             let table = overview_suspect_area(body);
             if point.1 == table.y.saturating_add(1)
@@ -813,15 +867,19 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
         return;
     }
     let rail = rail_width(area).is_some();
+    let broadsheet = !rail && broadsheet();
     let regions = regions(area);
     if rail {
         render_rail(frame, app, regions);
         render_annunciator(frame, app, regions.header);
+    } else if broadsheet {
+        render_masthead(frame, app, regions.header);
     } else {
         render_header(frame, app, regions.header);
     }
     match app.page {
         Page::Overview if rail => render_overview_rail(frame, app, regions.body),
+        Page::Overview if broadsheet => render_overview_broadsheet(frame, app, regions.body),
         Page::Overview => render_overview(frame, app, regions.body),
         Page::Processes => render_processes(frame, app, regions.body),
         Page::Tree => render_tree(frame, app, regions.body),
@@ -832,7 +890,9 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
         Page::Help => render_help(frame, regions.body),
         Page::Hardware => render_hardware(frame, app, regions.body),
     }
-    if !rail {
+    if broadsheet {
+        render_folio(frame, app, regions.footer);
+    } else if !rail {
         render_footer(frame, app, regions.footer);
     }
     render_modal(frame, app);
@@ -1308,6 +1368,9 @@ fn route_description(page: Page) -> &'static str {
         Page::Overview if theme::active().layout == LayoutKind::Rail => {
             "pressure map / likely culprits / live incidents"
         }
+        Page::Overview if theme::active().layout == LayoutKind::Broadsheet => {
+            "headline figures / suspect ledger / notices"
+        }
         Page::Overview => "pressure field / likely culprits / live incidents",
         Page::Processes => "rank / filter / inspect process pressure",
         Page::Tree => "trace ownership through parent-child lineages",
@@ -1325,6 +1388,572 @@ fn page_index(page: Page) -> usize {
         .iter()
         .position(|candidate| *candidate == page)
         .unwrap_or_default()
+}
+
+// ---- Ledger broadsheet chrome ------------------------------------------
+//
+// The ledger profile draws no box borders anywhere: structure comes from
+// typography. A full-width masthead (brand, dateline, printed page index,
+// double rule) replaces the header, section headings are printed rules, and
+// a folio line replaces the footer.
+
+const LEDGER_BRAND: &str = "PC PULSE — WORKSTATION LEDGER";
+
+/// One printed page-index entry: "3 LINEAGE" (or "3 TREE" when compact).
+fn masthead_label(index: usize, page: Page, compact: bool) -> String {
+    format!(
+        "{} {}",
+        index + 1,
+        if compact {
+            route_short(page)
+        } else {
+            route_name(page)
+        }
+    )
+}
+
+fn masthead_separator(compact: bool) -> &'static str {
+    if compact { " " } else { " · " }
+}
+
+/// Where the centered page-index line begins, and whether it uses the
+/// compact labels. Shared by the renderer and the mouse hit-test so the
+/// printed index and its click targets can never drift apart.
+fn masthead_index_origin(area: Rect) -> (u16, bool) {
+    let compact = area.width < 112;
+    let separator = masthead_separator(compact).chars().count();
+    let total = Page::ALL
+        .iter()
+        .enumerate()
+        .map(|(index, page)| masthead_label(index, *page, compact).chars().count())
+        .sum::<usize>()
+        + separator * (Page::ALL.len() - 1);
+    let x = area.x + (usize::from(area.width).saturating_sub(total) / 2) as u16;
+    (x, compact)
+}
+
+fn masthead_route_at(column: u16, area: Rect) -> Option<Page> {
+    let (mut x, compact) = masthead_index_origin(area);
+    let separator = masthead_separator(compact).chars().count() as u16;
+    for (index, page) in Page::ALL.iter().copied().enumerate() {
+        if index > 0 {
+            x = x.saturating_add(separator);
+        }
+        let width = masthead_label(index, page, compact).chars().count() as u16;
+        if column >= x && column < x.saturating_add(width) {
+            return Some(page);
+        }
+        x = x.saturating_add(width);
+    }
+    None
+}
+
+fn render_masthead(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    let rows = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .split(area);
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            LEDGER_BRAND,
+            Style::default().fg(palette().text).bold(),
+        ))
+        .alignment(Alignment::Center)
+        .style(Style::default().bg(palette().bg)),
+        rows[0],
+    );
+    // Dateline: link state, telemetry sample, edition version, page name.
+    let (link, link_color) = if app.connected {
+        let etw = app
+            .snapshot
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.system.etw_active);
+        (
+            if etw { "LINKED / ETW" } else { "LINKED / ETW DEGRADED" },
+            if etw { palette().ok } else { palette().warn },
+        )
+    } else {
+        ("SIGNAL LOST", palette().crit)
+    };
+    let mut dateline = vec![Span::styled(link, Style::default().fg(link_color).bold())];
+    if let Some(snapshot) = &app.snapshot {
+        let memory = percent(
+            snapshot.system.memory_used_bytes,
+            snapshot.system.memory_total_bytes,
+        );
+        dateline.push(Span::styled(
+            format!(
+                " · CPU {:.1}% · MEM {memory:.1}% · {}P/{}T · v{}",
+                snapshot.system.cpu_percent,
+                snapshot.system.process_count,
+                snapshot.system.thread_count,
+                snapshot.service_version
+            ),
+            Style::default().fg(palette().muted),
+        ));
+    } else {
+        dateline.push(Span::styled(
+            " · awaiting first telemetry frame",
+            Style::default().fg(palette().muted),
+        ));
+    }
+    dateline.push(Span::styled(
+        format!(
+            " · PAGE {:02} — {}",
+            page_index(app.page) + 1,
+            route_name(app.page)
+        ),
+        Style::default().fg(palette().alt).bold(),
+    ));
+    frame.render_widget(
+        Paragraph::new(Line::from(dateline))
+            .alignment(Alignment::Center)
+            .style(Style::default().bg(palette().bg)),
+        rows[1],
+    );
+    render_masthead_index(frame, app, rows[2]);
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            "═".repeat(usize::from(rows[3].width)),
+            Style::default().fg(palette().border_hot),
+        )),
+        rows[3],
+    );
+}
+
+/// The printed page index: every page as "N NAME", the active one inverted
+/// like a rubber-stamped entry.
+fn render_masthead_index(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    let compact = area.width < 112;
+    let mut spans = Vec::new();
+    for (index, page) in Page::ALL.iter().copied().enumerate() {
+        if index > 0 {
+            spans.push(Span::styled(
+                masthead_separator(compact),
+                Style::default().fg(palette().faint),
+            ));
+        }
+        let label = masthead_label(index, page, compact);
+        spans.push(if page == app.page {
+            Span::styled(
+                label,
+                Style::default().fg(palette().bg).bg(palette().text).bold(),
+            )
+        } else {
+            Span::styled(label, Style::default().fg(palette().muted))
+        });
+    }
+    frame.render_widget(
+        Paragraph::new(Line::from(spans))
+            .alignment(Alignment::Center)
+            .style(Style::default().bg(palette().bg)),
+        area,
+    );
+}
+
+/// The folio: one thin printed rule, then a single line carrying the page
+/// number, contextual hints (or the live input band), and the status.
+fn render_folio(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    let rows = Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).split(area);
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            "─".repeat(usize::from(rows[0].width)),
+            Style::default().fg(palette().border),
+        )),
+        rows[0],
+    );
+    let mut spans = match &app.mode {
+        InputMode::Normal => vec![
+            Span::styled(
+                format!(
+                    " №{:02}/{:02} {}",
+                    page_index(app.page) + 1,
+                    Page::ALL.len(),
+                    route_name(app.page)
+                ),
+                Style::default().fg(palette().alt).bold(),
+            ),
+            Span::styled(
+                format!("  {}", page_hints(app.page)),
+                Style::default().fg(palette().muted),
+            ),
+            Span::styled(
+                "  ·  t profile · m motion · ? keys · q quit",
+                Style::default().fg(palette().faint),
+            ),
+        ],
+        InputMode::Search(value) => vec![
+            Span::styled(" FILTER» ", Style::default().fg(palette().ok).bold()),
+            Span::styled(value.clone(), Style::default().fg(palette().text).bold()),
+            Span::styled("█", Style::default().fg(palette().ok)),
+        ],
+        InputMode::Chat(value) => vec![
+            Span::styled(" ASK» ", Style::default().fg(palette().alt).bold()),
+            Span::styled(value.clone(), Style::default().fg(palette().text).bold()),
+            Span::styled("█", Style::default().fg(palette().alt)),
+            Span::styled(
+                "  Enter send · Esc cancel",
+                Style::default().fg(palette().muted),
+            ),
+        ],
+        InputMode::ConfirmTerminate { pid, typed, .. } => vec![
+            Span::styled(
+                format!(" TYPE PID {pid} TO CONFIRM» "),
+                Style::default().fg(palette().crit).bold(),
+            ),
+            Span::styled(typed.clone(), Style::default().fg(palette().text).bold()),
+            Span::styled("█", Style::default().fg(palette().crit)),
+        ],
+        InputMode::EditSetting { field, typed } => vec![
+            Span::styled(" EDIT» ", Style::default().fg(palette().warn).bold()),
+            Span::styled(
+                format!("{}  ", field.label().to_ascii_uppercase()),
+                Style::default().fg(palette().alt).bold(),
+            ),
+            Span::styled(typed.clone(), Style::default().fg(palette().text).bold()),
+            Span::styled("█", Style::default().fg(palette().warn)),
+            Span::styled(
+                "  Enter apply · Esc cancel",
+                Style::default().fg(palette().muted),
+            ),
+        ],
+    };
+    if !app.connected {
+        spans.push(Span::styled(
+            format!(
+                "  — OFFLINE: {}",
+                app.last_error.as_deref().unwrap_or("collector unavailable")
+            ),
+            Style::default().fg(palette().crit).bold(),
+        ));
+    } else if !app.status.is_empty() {
+        spans.push(Span::styled(
+            format!("  — {}", app.status),
+            Style::default().fg(if app.status_is_error {
+                palette().crit
+            } else {
+                palette().muted
+            }),
+        ));
+    }
+    frame.render_widget(
+        Paragraph::new(Line::from(spans)).style(Style::default().bg(palette().bg)),
+        rows[1],
+    );
+}
+
+/// 3-row block-digit glyphs (built from █ ▀ ▄ and space only) for the
+/// broadsheet headline figures. Covers 0–9, the decimal point, and the
+/// percent sign; anything else renders as a one-cell gap.
+fn block_glyph(character: char) -> Option<[&'static str; 3]> {
+    Some(match character {
+        '0' => ["█▀█", "█ █", "▀▀▀"],
+        '1' => ["▄█ ", " █ ", "▀▀▀"],
+        '2' => ["▀▀█", "█▀▀", "▀▀▀"],
+        '3' => ["▀▀█", " ▀█", "▀▀▀"],
+        '4' => ["█ █", "▀▀█", "  █"],
+        '5' => ["█▀▀", "▀▀█", "▀▀▀"],
+        '6' => ["█▀▀", "█▀█", "▀▀▀"],
+        '7' => ["▀▀█", "  █", "  █"],
+        '8' => ["█▀█", "█▀█", "▀▀▀"],
+        '9' => ["█▀█", "▀▀█", "▀▀▀"],
+        '.' => [" ", " ", "▄"],
+        '%' => ["▀ █", " █ ", "█ ▄"],
+        _ => return None,
+    })
+}
+
+/// Render `text` as three rows of block-digit glyphs joined by one-cell
+/// gaps. Every returned row has the same display width.
+fn block_digits(text: &str) -> [String; 3] {
+    let mut rows = [String::new(), String::new(), String::new()];
+    for (position, character) in text.chars().enumerate() {
+        let glyph = block_glyph(character);
+        for (row, line) in rows.iter_mut().enumerate() {
+            if position > 0 {
+                line.push(' ');
+            }
+            match glyph {
+                Some(glyph) => line.push_str(glyph[row]),
+                None => line.push(' '),
+            }
+        }
+    }
+    rows
+}
+
+/// Direction glyph for a headline figure: prior sample vs the current one.
+fn headline_trend(previous: Option<f64>, current: f64, threshold: f64) -> &'static str {
+    match previous {
+        Some(previous) if current - previous > threshold => "▲",
+        Some(previous) if previous - current > threshold => "▼",
+        _ => "·",
+    }
+}
+
+/// The Observe front page under the broadsheet layout: headline block-digit
+/// figures across the top like a newspaper headline, then the SUSPECT LEDGER
+/// and NOTICES columns separated by a thin printed rule, with the
+/// CIRCULATION bar docked under the notices.
+fn render_overview_broadsheet(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    let Some(snapshot) = &app.snapshot else {
+        render_offline(frame, app, area);
+        return;
+    };
+    let canvas = area.inner(Margin::new(1, 0));
+    let headline_height = if canvas.width >= HEADLINE_MIN_WIDTH { 5 } else { 2 };
+    let vertical = Layout::vertical([Constraint::Length(headline_height), Constraint::Min(8)])
+        .split(canvas);
+    render_headline_figures(frame, app, vertical[0]);
+    let columns = Layout::horizontal([
+        Constraint::Percentage(56),
+        Constraint::Length(1),
+        Constraint::Min(30),
+    ])
+    .split(vertical[1]);
+    render_suspect_matrix(frame, app, columns[0]);
+    render_column_rule(frame, columns[1]);
+    let right = Layout::vertical([Constraint::Min(6), Constraint::Length(4)]).split(columns[2]);
+    render_notices(frame, app, right[0]);
+    render_circulation(frame, app, right[1]);
+    let _ = snapshot;
+}
+
+/// A thin vertical printed rule between broadsheet columns.
+fn render_column_rule(frame: &mut Frame<'_>, area: Rect) {
+    let lines = (0..area.height)
+        .map(|_| Line::styled("│", Style::default().fg(palette().border)))
+        .collect::<Vec<_>>();
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+/// CPU %, MEM %, and DISK ms as headline block digits, each with a caption
+/// and a trend arrow; below [`HEADLINE_MIN_WIDTH`] columns the figures
+/// degrade to one plain-numeral line.
+fn render_headline_figures(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    let Some(snapshot) = &app.snapshot else {
+        return;
+    };
+    let memory = percent(
+        snapshot.system.memory_used_bytes,
+        snapshot.system.memory_total_bytes,
+    );
+    let previous = app.live_history.iter().rev().nth(1);
+    let figures: [(&str, String, &'static str, Color); 3] = [
+        (
+            "CPU LOAD %",
+            format!("{:.0}", snapshot.system.cpu_percent),
+            headline_trend(
+                previous.map(|point| point.cpu_percent),
+                snapshot.system.cpu_percent,
+                0.5,
+            ),
+            palette().ok,
+        ),
+        (
+            "MEMORY %",
+            format!("{memory:.0}"),
+            headline_trend(
+                previous.map(|point| percent(point.memory_used_bytes, point.memory_total_bytes)),
+                memory,
+                0.5,
+            ),
+            palette().alt,
+        ),
+        (
+            "DISK MS",
+            format!("{:.1}", snapshot.system.disk_latency_ms),
+            headline_trend(
+                previous.map(|point| point.disk_latency_ms),
+                snapshot.system.disk_latency_ms,
+                0.2,
+            ),
+            palette().warn,
+        ),
+    ];
+    if area.width < HEADLINE_MIN_WIDTH {
+        // Plain numerals: the whole headline on one bold line.
+        let mut spans = Vec::new();
+        for (index, (caption, value, trend, accent)) in figures.iter().enumerate() {
+            if index > 0 {
+                spans.push(Span::styled("   ", Style::default()));
+            }
+            let (label, unit) = match *caption {
+                "MEMORY %" => ("MEM", "%"),
+                "DISK MS" => ("DISK", " ms"),
+                _ => ("CPU", "%"),
+            };
+            spans.push(Span::styled(
+                format!("{label} {value}{unit}"),
+                Style::default().fg(palette().text).bold(),
+            ));
+            spans.push(Span::styled(
+                format!(" {trend}"),
+                Style::default().fg(*accent).bold(),
+            ));
+        }
+        frame.render_widget(
+            Paragraph::new(Line::from(spans)).style(Style::default().bg(palette().bg)),
+            area,
+        );
+        return;
+    }
+    let columns = Layout::horizontal([
+        Constraint::Percentage(33),
+        Constraint::Percentage(34),
+        Constraint::Percentage(33),
+    ])
+    .split(area);
+    for (column, (caption, value, trend, accent)) in columns.iter().zip(figures) {
+        let digits = block_digits(&value);
+        let mut lines = digits
+            .iter()
+            .map(|row| Line::styled(row.clone(), Style::default().fg(palette().text).bold()))
+            .collect::<Vec<_>>();
+        lines.push(Line::from(vec![
+            Span::styled(caption, Style::default().fg(palette().muted)),
+            Span::styled(format!("  {trend}"), Style::default().fg(accent).bold()),
+        ]));
+        frame.render_widget(
+            Paragraph::new(lines)
+                .alignment(Alignment::Center)
+                .style(Style::default().bg(palette().bg)),
+            *column,
+        );
+    }
+}
+
+/// Printed severity tag for the NOTICES column — typographic, no badge bg.
+fn severity_tag(severity: Severity) -> &'static str {
+    match severity {
+        Severity::Info => "[NOTICE]",
+        Severity::Warning => "[WARNING]",
+        Severity::Critical => "[CRITICAL]",
+    }
+}
+
+/// The incident tape restyled as classified-ads entries: a printed severity
+/// tag, the owner, the condition, and one indented evidence line each.
+fn render_notices(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    let Some(snapshot) = &app.snapshot else {
+        return;
+    };
+    let block = field_block(" NOTICES — sustained findings ", palette().warn);
+    let capacity = (usize::from(area.height.saturating_sub(1)) / 2).max(1);
+    let mut lines = Vec::new();
+    for alert in snapshot.active_alerts.iter().take(capacity) {
+        let owner = alert.process_name.as_deref().unwrap_or("system / driver");
+        lines.push(Line::from(vec![
+            Span::styled(
+                severity_tag(alert.severity),
+                Style::default().fg(severity_color(alert.severity)).bold(),
+            ),
+            Span::styled(
+                format!(" {}", format::truncate(owner, 22)),
+                Style::default().fg(palette().text).bold(),
+            ),
+            Span::styled(
+                format!(" — {}", format::truncate(&alert.title, 34)),
+                Style::default().fg(severity_color(alert.severity)),
+            ),
+        ]));
+        let evidence = alert
+            .evidence
+            .first()
+            .map(|item| format!("{} {}", item.label, item.value))
+            .unwrap_or_else(|| "sustained condition confirmed".into());
+        lines.push(Line::styled(
+            format!("   {}", format::truncate(&evidence, 52)),
+            Style::default().fg(palette().muted),
+        ));
+    }
+    if lines.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled("NO NOTICES", Style::default().fg(palette().ok).bold()),
+            Span::styled(
+                " — no sustained deviations in the active window",
+                Style::default().fg(palette().muted),
+            ),
+        ]));
+    }
+    frame.render_widget(
+        Paragraph::new(lines)
+            .style(Style::default().fg(palette().text).bg(palette().surface))
+            .block(block),
+        area,
+    );
+}
+
+/// The load ribbon as a thin "circulation" bar: one proportional row of the
+/// busiest suspects' share of busy CPU, with the busy/idle tally beneath.
+fn render_circulation(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    let Some(snapshot) = &app.snapshot else {
+        return;
+    };
+    let busy = snapshot.system.cpu_percent.clamp(0.0, 100.0);
+    let block = field_block(" CIRCULATION — share of busy cpu ", palette().info);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let mut lines = Vec::new();
+    if busy < DONUT_QUIESCENT_CPU {
+        lines.push(Line::styled(
+            format!("cpu quiescent {busy:.1}% — nothing to attribute"),
+            Style::default().fg(palette().muted),
+        ));
+    } else {
+        let mut suspects = snapshot
+            .processes
+            .iter()
+            .filter(|process| process.pid > 4)
+            .collect::<Vec<_>>();
+        suspects.sort_by(|left, right| right.cpu_percent.total_cmp(&left.cpu_percent));
+        let cycle = [palette().ok, palette().alt, palette().info, palette().warn];
+        let mut segments = suspects
+            .iter()
+            .take(4)
+            .enumerate()
+            .map(|(index, process)| (process.cpu_percent.max(0.0), cycle[index % cycle.len()]))
+            .collect::<Vec<_>>();
+        let named = segments.iter().map(|(value, _)| *value).sum::<f64>();
+        segments.push(((busy - named).max(0.0), palette().muted));
+        let total = segments
+            .iter()
+            .map(|(value, _)| *value)
+            .sum::<f64>()
+            .max(f64::MIN_POSITIVE);
+        let width = usize::from(inner.width.max(1));
+        let mut spans = Vec::new();
+        let mut used = 0usize;
+        for (value, color) in &segments {
+            if *value <= 0.0 || used >= width {
+                continue;
+            }
+            let cells = (((value / total) * width as f64).round() as usize).clamp(1, width - used);
+            spans.push(Span::styled(
+                "█".repeat(cells),
+                Style::default().fg(*color),
+            ));
+            used += cells;
+        }
+        lines.push(Line::from(spans));
+    }
+    lines.push(Line::from(vec![
+        Span::styled(
+            format!("busy {busy:.1}%"),
+            Style::default().fg(palette().ok),
+        ),
+        Span::styled(
+            format!(" · idle {:.1}%", 100.0 - busy),
+            Style::default().fg(palette().faint),
+        ),
+    ]));
+    frame.render_widget(
+        Paragraph::new(lines).style(Style::default().fg(palette().text).bg(palette().surface)),
+        inner,
+    );
 }
 
 fn render_overview(frame: &mut Frame<'_>, app: &App, area: Rect) {
@@ -1889,7 +2518,11 @@ fn render_suspect_matrix(frame: &mut Frame<'_>, app: &App, area: Rect) {
                 ),
             )
             .block(field_block(
-                " ⌖ SUSPECT MATRIX  relative pressure / not an alert score ",
+                if broadsheet() {
+                    " SUSPECT LEDGER — relative pressure / not an alert score "
+                } else {
+                    " ⌖ SUSPECT MATRIX  relative pressure / not an alert score "
+                },
                 palette().alt,
             )),
         area,
@@ -2401,6 +3034,15 @@ fn triage_heat(process: &ProcessMetric, app: &App) -> f64 {
 }
 
 fn field_block<'a>(title: &'a str, accent: Color) -> Block<'a> {
+    if broadsheet() {
+        // A printed section rule with a spaced heading — never a box.
+        return Block::default()
+            .borders(Borders::TOP)
+            .border_style(Style::default().fg(palette().border))
+            .style(Style::default().fg(palette().text).bg(palette().surface))
+            .title(title)
+            .title_style(Style::default().fg(accent).bold());
+    }
     Block::default()
         .borders(Borders::TOP | Borders::LEFT)
         .border_type(BorderType::QuadrantOutside)
@@ -4465,7 +5107,7 @@ const HELP_GLOBAL: [(&str, &str); 11] = [
     ("mouse click", "select rows, tabs, prompts"),
     ("mouse wheel", "scroll the active view"),
     ("m", "toggle motion effects"),
-    ("t", "vitals / avionics profile"),
+    ("t", "cycle presentation profile"),
     ("q / Ctrl-C", "quit"),
     ("?", "keys overlay on any page"),
 ];
@@ -4505,7 +5147,7 @@ fn render_help(frame: &mut Frame<'_>, area: Rect) {
     }
     global.push(Line::raw(""));
     for hint in [
-        "Launch with --theme vitals|avionics to pick a profile.",
+        "Launch with --theme vitals|avionics|ledger to pick a profile.",
         "t / m choices persist per user; CLI flags override one run.",
         "The collector continues when the TUI exits.",
     ] {
@@ -4654,8 +5296,10 @@ fn render_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
     );
 }
 
-fn normal_footer(page: Page) -> Line<'static> {
-    let contextual = match page {
+/// Per-page contextual hints, shared by the statusline footer and the
+/// broadsheet folio line.
+fn page_hints(page: Page) -> &'static str {
+    match page {
         Page::Overview => "2 hunt  ·  4 incidents  ·  r sample",
         Page::Processes => "/ query  ·  o rank  ·  g agents  ·  x terminate",
         Page::Tree => "j/k trace  ·  r rebuild  ·  x terminate",
@@ -4667,7 +5311,11 @@ fn normal_footer(page: Page) -> Line<'static> {
         Page::Settings => "Enter edit  ·  s commit  ·  r revert",
         Page::Help => "1–9 route  ·  Tab cycle",
         Page::Hardware => "temperatures + clocks resample every 5s  ·  r refresh",
-    };
+    }
+}
+
+fn normal_footer(page: Page) -> Line<'static> {
+    let contextual = page_hints(page);
     Line::from(vec![
         Span::styled(
             " NORMAL ",
@@ -4777,6 +5425,18 @@ fn panel<'a>(title: &'a str) -> Block<'a> {
 }
 
 fn accent_panel<'a>(title: &'a str, accent: Color) -> Block<'a> {
+    if broadsheet() {
+        // Ruled region instead of a rounded box; the horizontal padding
+        // keeps content columns where the boxed layouts put them, so shared
+        // hit-tests stay aligned.
+        return Block::default()
+            .borders(Borders::TOP)
+            .border_style(Style::default().fg(palette().border))
+            .style(Style::default().fg(palette().text).bg(palette().surface))
+            .title(title)
+            .title_style(Style::default().fg(accent).bold())
+            .padding(Padding::horizontal(1));
+    }
     Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
@@ -6164,6 +6824,173 @@ mod tests {
         assert_eq!(app.page, Page::Analyzer);
     }
 
+    #[test]
+    fn broadsheet_regions_are_masthead_index_body_and_folio() {
+        let _theme = theme::test_support::activate(theme::ThemeId::Ledger);
+        let area = Rect::new(0, 0, 150, 46);
+        let regions = regions(area);
+        assert_eq!(regions.full, area);
+        // Masthead: brand, dateline, page index, double rule.
+        assert_eq!(regions.header, Rect::new(0, 0, 150, 4));
+        // The printed page index is the masthead's third line.
+        assert_eq!(regions.tabs, Rect::new(0, 2, 150, 1));
+        // Folio: one thin rule plus the folio line.
+        assert_eq!(regions.footer, Rect::new(0, 44, 150, 2));
+        assert_eq!(regions.body, Rect::new(0, 4, 150, 40));
+    }
+
+    #[test]
+    fn ledger_masthead_prints_brand_dateline_index_and_rules() {
+        let _theme = theme::test_support::activate(theme::ThemeId::Ledger);
+        let mut app = gallery_app();
+        let backend = render(&mut app);
+        let text = buffer_text(backend.buffer());
+        assert!(text.contains("PC PULSE — WORKSTATION LEDGER"));
+        assert!(text.contains("LINKED / ETW"));
+        // Full page names in the printed index at this width.
+        assert!(text.contains("1 OBSERVE"));
+        assert!(text.contains("6 ORACLE"));
+        assert!(text.contains("9 GAUGES"));
+        // The double rule under the masthead and the folio rule beneath.
+        assert!(text.contains("═══"));
+        assert!(text.contains("───"));
+        // The active index entry is inverted like a rubber stamp.
+        assert!(
+            backend
+                .buffer()
+                .content()
+                .iter()
+                .any(|cell| cell.bg == palette().text)
+        );
+        // The folio carries the page number, hints, and the status.
+        assert!(text.contains("№01/09 OBSERVE"));
+        assert!(text.contains("t profile"));
+        assert!(text.contains("Settings saved"));
+    }
+
+    #[test]
+    fn ledger_never_draws_a_box_border_on_any_page() {
+        let _theme = theme::test_support::activate(theme::ThemeId::Ledger);
+        for page in Page::ALL {
+            let mut app = gallery_app();
+            app.page = page;
+            let text = buffer_text(render(&mut app).buffer());
+            // The panel chrome's corner glyphs: rounded (accent_panel),
+            // quadrant (field_block), double (modal — not open here). Chart
+            // axes may legitimately draw a plain └, so plain corners are
+            // exempt.
+            for corner in ['╭', '╮', '╰', '╯', '▛', '▜', '▙', '▟', '╔', '╗', '╚', '╝'] {
+                assert!(!text.contains(corner), "{page:?} draws box corner {corner}");
+            }
+        }
+    }
+
+    #[test]
+    fn block_digit_font_renders_every_numeral_pattern() {
+        let expected: [(&str, [&str; 3]); 10] = [
+            ("0", ["█▀█", "█ █", "▀▀▀"]),
+            ("1", ["▄█ ", " █ ", "▀▀▀"]),
+            ("2", ["▀▀█", "█▀▀", "▀▀▀"]),
+            ("3", ["▀▀█", " ▀█", "▀▀▀"]),
+            ("4", ["█ █", "▀▀█", "  █"]),
+            ("5", ["█▀▀", "▀▀█", "▀▀▀"]),
+            ("6", ["█▀▀", "█▀█", "▀▀▀"]),
+            ("7", ["▀▀█", "  █", "  █"]),
+            ("8", ["█▀█", "█▀█", "▀▀▀"]),
+            ("9", ["█▀█", "▀▀█", "▀▀▀"]),
+        ];
+        for (text, rows) in expected {
+            assert_eq!(block_digits(text), rows.map(String::from), "digit {text}");
+            // Only the block pieces and space build the glyphs.
+            for row in rows {
+                assert!(row.chars().all(|c| " █▀▄".contains(c)), "digit {text}");
+            }
+        }
+        // Every digit reads as itself: no two glyphs collide.
+        for (left, left_rows) in &expected {
+            for (right, right_rows) in &expected {
+                if left != right {
+                    assert_ne!(left_rows, right_rows, "{left} collides with {right}");
+                }
+            }
+        }
+        // Multi-character figures join with a one-cell gap, equal widths.
+        let joined = block_digits("1.8");
+        for row in &joined {
+            assert_eq!(row.chars().count(), 3 + 1 + 1 + 1 + 3);
+        }
+        assert_eq!(joined[2], "▀▀▀ ▄ ▀▀▀");
+    }
+
+    #[test]
+    fn ledger_observe_front_page_prints_headline_ledger_and_notices() {
+        let _theme = theme::test_support::activate(theme::ThemeId::Ledger);
+        let mut app = gallery_app();
+        let backend = render(&mut app);
+        let text = buffer_text(backend.buffer());
+        // Headline figures: CPU 46 and MEM 50 as block digits with captions.
+        assert!(text.contains("█ █ █▀▀"), "CPU 46 headline row 0");
+        assert!(text.contains("▀▀█ █▀█"), "CPU 46 headline row 1");
+        assert!(text.contains("█▀▀ █▀█"), "MEM 50 headline row 0");
+        assert!(text.contains("CPU LOAD %"));
+        assert!(text.contains("MEMORY %"));
+        assert!(text.contains("DISK MS"));
+        // The two printed columns and the circulation bar.
+        assert!(text.contains("SUSPECT LEDGER"));
+        assert!(text.contains("NOTICES"));
+        assert!(text.contains("CIRCULATION"));
+        // Findings wear printed tags, not colored badges.
+        assert!(text.contains("[CRITICAL]"));
+        assert!(text.contains("[WARNING]"));
+        assert!(text.contains("[NOTICE]"));
+        // The vitals/avionics Observe centerpieces stay off this page.
+        assert!(!text.contains("PRESSURE FIELD"));
+        assert!(!text.contains("PRESSURE MAP"));
+        assert!(!text.contains("SUSPECT MATRIX"));
+    }
+
+    #[test]
+    fn ledger_headline_degrades_to_plain_numerals_when_narrow() {
+        let _theme = theme::test_support::activate(theme::ThemeId::Ledger);
+        let mut app = gallery_app();
+        let backend = render_size(&mut app, 90, 28);
+        let text = buffer_text(backend.buffer());
+        assert!(text.contains("CPU 46%"), "plain numerals");
+        assert!(text.contains("MEM 50%"));
+        assert!(text.contains("DISK 1.8 ms"));
+        assert!(!text.contains("█▀█"), "no block digits below the floor");
+        assert!(text.contains("SUSPECT LEDGER"));
+    }
+
+    #[test]
+    fn clicking_the_masthead_index_switches_pages() {
+        let _theme = theme::test_support::activate(theme::ThemeId::Ledger);
+        let mut app = sample_app();
+        let area = Rect::new(0, 0, 150, 46);
+        let tabs = regions(area).tabs;
+        let oracle_column = (tabs.x..tabs.right())
+            .find(|column| masthead_route_at(*column, tabs) == Some(Page::Analyzer))
+            .expect("Oracle index entry should have a clickable cell");
+        assert!(handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: oracle_column,
+                row: tabs.y,
+                modifiers: ratatui::crossterm::event::KeyModifiers::NONE,
+            },
+            area,
+        ));
+        assert_eq!(app.page, Page::Analyzer);
+        // Every page owns a reachable entry on the printed index.
+        for (index, page) in Page::ALL.iter().copied().enumerate() {
+            assert!(
+                (tabs.x..tabs.right()).any(|x| masthead_route_at(x, tabs) == Some(page)),
+                "index entry {index} unreachable"
+            );
+        }
+    }
+
     /// A snapshot with several distinct processes so the pressure map has a
     /// landscape to tile; kept out of `sample_app` so the vitals fixtures
     /// stay byte-identical.
@@ -6729,7 +7556,11 @@ mod tests {
              h2{margin:28px 0 4px;color:#fc6}h3{margin:16px 0 2px;color:#9ad}\
              h4{margin:10px 0 2px;color:#8a8}</style>",
         );
-        for theme_id in [theme::ThemeId::Vitals, theme::ThemeId::Avionics] {
+        for theme_id in [
+            theme::ThemeId::Vitals,
+            theme::ThemeId::Avionics,
+            theme::ThemeId::Ledger,
+        ] {
             let _guard = theme::test_support::activate(theme_id);
             html.push_str(&format!("<h2 id=\"{theme_id:?}\">{theme_id:?}</h2>"));
             for (width, height) in sizes {
@@ -7066,7 +7897,11 @@ mod tests {
         let Ok(directory) = std::env::var("PCPULSE_DEMO_DIR") else {
             return;
         };
-        for theme_id in [theme::ThemeId::Vitals, theme::ThemeId::Avionics] {
+        for theme_id in [
+            theme::ThemeId::Vitals,
+            theme::ThemeId::Avionics,
+            theme::ThemeId::Ledger,
+        ] {
             let _guard = theme::test_support::activate(theme_id);
             let mut app = demo_app();
             let mut terminal = Terminal::new(TestBackend::new(120, 36)).expect("demo terminal");

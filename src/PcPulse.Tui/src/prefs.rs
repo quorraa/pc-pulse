@@ -69,7 +69,8 @@ impl UiPrefs {
     }
 }
 
-/// Theme identifiers travel as their CLI names (`"vitals"` / `"avionics"`).
+/// Theme identifiers travel as their CLI names (`"vitals"` / `"avionics"` /
+/// `"ledger"`).
 /// An unknown name — perhaps written by a newer release — degrades to the
 /// default profile instead of poisoning the whole document.
 mod theme_name {
@@ -167,6 +168,21 @@ mod tests {
         let raw = fs::read_to_string(&path).unwrap();
         assert!(raw.contains("\"avionics\""));
         assert!(raw.contains("analyzerTimeoutSecs"));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn ledger_theme_name_persists_round_trip() {
+        let (store, path) = scratch_store("ledger");
+        store
+            .save(&UiPrefs {
+                theme: ThemeId::Ledger,
+                ..UiPrefs::default()
+            })
+            .unwrap();
+        assert_eq!(store.load().theme, ThemeId::Ledger);
+        let raw = fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("\"ledger\""));
         let _ = fs::remove_file(path);
     }
 

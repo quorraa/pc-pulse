@@ -99,7 +99,7 @@ fn entry() -> Result<()> {
         Some("settings") => print_json(PipeClient.settings()?),
         Some("ping") => print_json(PipeClient.ping()?),
         _ => bail!(
-            "usage: PcPulse.exe [snapshot | alerts | logs [hours] | agent-context [hours] | analyze [hours] | plan | plans | import-plan <file> | validate-plan <file> | plan-schema | agent-prompt | settings | ping | --theme <vitals|avionics> | --no-effects | --version]"
+            "usage: PcPulse.exe [snapshot | alerts | logs [hours] | agent-context [hours] | analyze [hours] | plan | plans | import-plan <file> | validate-plan <file> | plan-schema | agent-prompt | settings | ping | --theme <vitals|avionics|ledger> | --no-effects | --version]"
         ),
     }
 }
@@ -147,7 +147,7 @@ fn parse_tui_flags(arguments: &[String]) -> Result<TuiOptions> {
     Ok(options)
 }
 
-const THEME_USAGE: &str = " (usage: PcPulse.exe [--theme vitals|avionics] [--no-effects])";
+const THEME_USAGE: &str = " (usage: PcPulse.exe [--theme vitals|avionics|ledger] [--no-effects])";
 
 fn parse_theme(name: &str) -> Result<theme::ThemeId> {
     name.parse::<theme::ThemeId>()

@@ -24,7 +24,7 @@ Release binaries are currently unsigned; Windows may show an unknown-publisher w
 ## What it monitors
 
 - System and per-process CPU, working set, private bytes, handles, threads, and read/write I/O.
-- Physical-disk transfer latency, DPC rate, interrupt rate, paged pool, and nonpaged pool.
+- Physical-disk transfer latency, DPC rate, interrupt rate, paged pool, and nonpaged pool — with driver-level ISR/DPC attribution when sustained.
 - Hung top-level windows, ETW process starts, time to first visible window, parent/child trees, and detached idle agent processes.
 - Hardware temperatures and clocks — ACPI thermal zones, effective CPU frequency, and NVIDIA GPU temperature/clocks/utilization — best-effort by hardware and driver support, sampled every five seconds.
 - Its own collector against absolute budgets (25 MB working set, 0.2% CPU, 600 handles) plus mature working-set growth.
@@ -36,16 +36,16 @@ If policy denies ETW session creation, the collector continues with PDH and Win3
 
 ## Terminal interface
 
-The TUI ships two presentation profiles: **vitals** (default), a patient-monitor identity, and **avionics**, an amber-CRT multi-function display with a bezel-key rail, an annunciator strip that keeps one lamp per finding class lit from every page, and a pressure-map treemap where every major process is a clickable tile sized by working set and heated by its dominant pressure channel. Start with `PcPulse.exe --theme vitals|avionics` or cycle live with `t`.
+The TUI ships three presentation profiles: **vitals** (default), a patient-monitor identity; **avionics**, an amber-CRT multi-function display with a bezel-key rail, an annunciator strip that keeps one lamp per finding class lit from every page, and a pressure-map treemap where every major process is a clickable tile sized by working set and heated by its dominant pressure channel; and **ledger**, a night-edition broadsheet that swaps every box border for typographic rules — a full-width masthead with a printed page index, block-digit headline figures for CPU/MEM/DISK on the front page, a SUSPECT LEDGER and classified-ads NOTICES column, and a folio line at the foot. Start with `PcPulse.exe --theme vitals|avionics|ledger` or cycle live with `t`.
 
 | Vitals (default) | Avionics |
 |---|---|
 | ![Observe — pressure field, suspect ranking, load ribbon](docs/media/vitals-observe.png) | ![Observe — the pressure-map treemap under the annunciator strip](docs/media/avionics-observe.png) |
 | ![Process hunt — sortable spectrum and process lens](docs/media/vitals-hunt.png) | ![Findings — annunciator lamps and the finding archive](docs/media/avionics-incidents.png) |
 
-| Vitals tour | Avionics tour |
-|---|---|
-| ![Vitals profile tour](docs/media/demo-vitals.gif) | ![Avionics profile tour](docs/media/demo-avionics.gif) |
+| Vitals tour | Avionics tour | Ledger tour |
+|---|---|---|
+| ![Vitals profile tour](docs/media/demo-vitals.gif) | ![Avionics profile tour](docs/media/demo-avionics.gif) | ![Ledger profile tour](docs/media/demo-ledger.gif) |
 
 ![Oracle — the embedded systems-analyzer chat](docs/media/vitals-oracle.png)
 
@@ -90,7 +90,7 @@ Important keys:
 | `s` | Save settings |
 | `r` | Refresh the current view |
 | `m` | Toggle finite TachyonFX motion effects; the choice is saved per user |
-| `t` | Cycle presentation profiles (vitals / avionics); the choice is saved per user |
+| `t` | Cycle presentation profiles (vitals / avionics / ledger); the choice is saved per user |
 | `?` | Open the keys overlay on top of any page; `Esc`, `?`, or a click closes it (the Keys page itself stays on `8`) |
 | `q` / `Ctrl-C` | Exit the TUI; the collector continues |
 | Left-click | Select tabs, process/tree/finding rows, settings, or the Oracle prompt; clicking a Chat Vault row opens that chat and keeps the vault focused for rename/delete |

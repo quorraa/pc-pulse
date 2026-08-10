@@ -33,7 +33,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 FONT_DIR = Path(r"C:\Windows\Fonts")
 FONT_SIZE = 15
-THEMES = ("vitals", "avionics")
+THEMES = ("vitals", "avionics", "ledger")
 SIZE_BUDGET = 8 * 1024 * 1024
 
 

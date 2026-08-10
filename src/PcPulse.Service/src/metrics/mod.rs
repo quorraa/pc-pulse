@@ -1,5 +1,6 @@
 pub mod forensics;
 mod hardware;
+pub mod interrupts;
 mod pdh;
 mod win32;
 

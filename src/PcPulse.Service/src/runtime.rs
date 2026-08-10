@@ -7,6 +7,7 @@ use crate::{
     metrics::{
         MetricCollector,
         forensics::{ForensicsEngine, WindowsForensicsSource},
+        interrupts::{InterruptEngine, WindowsInterruptSource},
     },
     models::{
         DiagnosticLogResponse, DiagnosticLogStatus, PipeRequest, PipeResponse, ProcessMetric,
@@ -330,6 +331,10 @@ fn sampling_loop(state: &Arc<AppState>, stop: crossbeam_channel::Receiver<()>) -
     // Leak forensics is a strict no-op (zero syscalls) until a handle- or
     // thread-growth finding is active; then it captures at most once a minute.
     let mut forensics = ForensicsEngine::new(WindowsForensicsSource::default());
+    // ISR/DPC attribution is likewise a strict no-op until a dpcInterrupt
+    // finding is active; then it runs one bounded kernel trace when the
+    // finding fires and re-captures at most every ten minutes.
+    let mut interrupts = InterruptEngine::new(WindowsInterruptSource::default());
     let mut event_logs = EventLogCollector::default();
     let mut next_system_write = Instant::now();
     let mut next_process_write = Instant::now();
@@ -365,6 +370,9 @@ fn sampling_loop(state: &Arc<AppState>, stop: crossbeam_channel::Receiver<()>) -
         forensics.observe(&evaluation.active, timestamp_ms);
         forensics.decorate(&mut evaluation.active);
         forensics.decorate(&mut evaluation.changed);
+        interrupts.observe(&evaluation.active, timestamp_ms);
+        interrupts.decorate(&mut evaluation.active);
+        interrupts.decorate(&mut evaluation.changed);
         state.storage.upsert_alerts(&evaluation.changed)?;
         {
             let mut snapshot = state
