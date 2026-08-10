@@ -1489,12 +1489,26 @@ impl App {
             return;
         };
         let question = compose_investigation_question(&alert);
+        let title = investigation_title(&alert);
         self.select_page(Page::Analyzer);
         self.begin_new_chat();
         // Carry the full finding so the analyzer's evidence bundle contains
         // it even when it has aged out of the fresh-context window; the
         // citation contract only accepts references backed by the bundle.
         self.submit_chat_message(question, vec![format!("alert:{}", alert.id)], Some(alert));
+        // The derived vault title would be the raw question ("Investigate
+        // finding crashDump:ee75aad2…") — pin a human one instead.
+        if let Some(session) = self
+            .chat_sessions
+            .iter_mut()
+            .find(|session| session.conversation_id == self.conversation_id)
+        {
+            session.title = crate::chat_history::truncate_title(&title, 52);
+            session.title_pinned = true;
+            if let Err(error) = self.persist_sessions() {
+                self.set_error(error);
+            }
+        }
     }
 
     /// A left click on a finding row: always select it; a second click on the
@@ -2633,6 +2647,39 @@ fn smooth_live_target(previous: Option<&SystemMetric>, raw: &SystemMetric) -> Sy
     }
 }
 
+/// A human Chat Vault title for an investigation: owner first, then a short
+/// condition label, then the sharpest detail we hold (faulting module for
+/// crashes) — never the raw finding id.
+pub(crate) fn investigation_title(alert: &Alert) -> String {
+    let owner = alert.process_name.as_deref().unwrap_or("system");
+    let label = match alert.kind.as_str() {
+        "crashDump" => "crash",
+        "sustainedCpu" => "sustained CPU",
+        "memoryGrowth" => "memory growth",
+        "handleGrowth" => "handle leak",
+        "threadGrowth" => "thread growth",
+        "sustainedIo" => "heavy I/O",
+        "diskLatency" => "disk latency",
+        "unresponsive" => "hang",
+        "slowLaunch" => "slow launch",
+        "abandonedAgent" => "abandoned agent",
+        "kernelPoolGrowth" => "kernel pool growth",
+        "dpcInterrupt" => "interrupts",
+        "collectorBudget" | "collectorGrowth" => "collector budget",
+        _ => alert.title.as_str(),
+    };
+    let detail = alert
+        .evidence
+        .iter()
+        .find(|row| row.label == "Faulting module" || row.label == "Top driver")
+        .map(|row| {
+            let value = row.value.split(" — ").next().unwrap_or(&row.value);
+            format!(" ({value})")
+        })
+        .unwrap_or_default();
+    format!("{owner} — {label}{detail}")
+}
+
 fn live_to_system(sample: &LiveSample, base: &SystemMetric) -> SystemMetric {
     SystemMetric {
         timestamp_ms: sample.timestamp_ms,
@@ -3340,6 +3387,43 @@ mod tests {
             run.2.as_ref().map(|alert| alert.id.as_str()),
             Some("finding-77")
         );
+    }
+
+    #[test]
+    fn investigations_pin_a_human_vault_title() {
+        let mut alert = investigation_alert();
+        alert.kind = "crashDump".into();
+        alert.process_name = Some("XboxPcApp.exe".into());
+        alert.evidence.push(pcpulse_service::models::Evidence {
+            label: "Faulting module".into(),
+            value: "hermes.dll".into(),
+        });
+        assert_eq!(
+            investigation_title(&alert),
+            "XboxPcApp.exe — crash (hermes.dll)"
+        );
+        alert.kind = "dpcInterrupt".into();
+        alert.process_name = None;
+        alert.evidence.push(pcpulse_service::models::Evidence {
+            label: "Top driver".into(),
+            value: "nvlddmkm.sys — NVIDIA Windows Kernel Mode Driver".into(),
+        });
+        assert!(investigation_title(&alert).starts_with("system — interrupts (hermes.dll)"));
+
+        // End to end: the vault session carries the pinned human title, not
+        // the raw question.
+        let (mut app, _commands) = app_with_captive_worker();
+        app.page = Page::Alerts;
+        app.alerts = vec![investigation_alert()];
+        app.register_finding_click(0);
+        app.register_finding_click(0);
+        let session = app
+            .chat_sessions
+            .iter()
+            .find(|session| session.conversation_id == app.conversation_id)
+            .expect("investigation session persisted");
+        assert!(session.title_pinned);
+        assert_eq!(session.title, "chrome.exe — memory growth");
     }
 
     #[test]
