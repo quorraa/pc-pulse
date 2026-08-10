@@ -76,6 +76,26 @@ Mechanics and budget:
 
 Privacy boundary: interrupt attribution records driver base file names and version-resource company/description strings only — never routine addresses, process data, or memory content.
 
+## Crash dumps
+
+On a slow cadence — first scan shortly after the collector starts, then every five minutes — the collector enumerates the standard Windows crash-dump locations: `%SystemRoot%\Minidump\*.dmp`, `%SystemRoot%\MEMORY.DMP`, and each user profile's `AppData\Local\CrashDumps\*.dmp` (WER). Profiles the collector cannot enter degrade silently. Each visible dump raises one `crashDump` finding; the finding resolves when the dump file disappears. Finding identity is derived from the dump's path and timestamp, so a collector restart re-attaches to the same persisted row instead of duplicating it.
+
+Native triage is bounded and local:
+
+- **Kernel dumps** (`PAGEDU64`, and 32-bit `PAGEDUMP`) have their bugcheck code and four parameters read from the documented header offsets, with ~35 well-known codes named (`Bugcheck :: 0x133 DPC_WATCHDOG_VIOLATION`, `Parameters :: 0x1 0x1e00 0x0 0x0`). A kernel dump younger than 48 hours makes its finding critical; everything else is a warning.
+- **User-mode minidumps** (`MDMP`) have their exception stream and module list hand-parsed to name the exception code and the module containing the faulting address (`Exception :: 0xc0000005 ACCESS_VIOLATION`, `Faulting module :: hermes.dll`). Hang dumps without an exception stream keep honest empty fields. The Mozilla `minidump` crate was evaluated and rejected for this: it pulls ~20 transitive crates into a collector that budgets itself at 25 MB, while the three structures triage needs are a page of offset arithmetic.
+- Every finding carries the dump's redacted path, size, and age (`Dump :: %USERPROFILE%\AppData\Local\CrashDumps\… · 43.2 MB · 2 d ago`) and a rolling `Crash count :: N dumps in 30 days` row.
+
+Budget: between scans the engine is a single timestamp comparison. A scan is directory metadata plus one bounded header/stream read per **new** dump — triage is cached by `(path, modified)`, and a dump already triaged costs nothing to rescan. A header that cannot be read surfaces as a `Triage :: degraded: …` note, never a dropped finding.
+
+Privacy boundary: findings carry metadata and codes only — bugcheck numbers, exception codes, module base file names, sizes, and ages. No dump memory content is read beyond the parsed headers and streams, nothing is uploaded, and user-profile path segments are replaced with `%USERPROFILE%` by the same redaction the event-log collector uses.
+
+### Deep analysis (WinDbg tier)
+
+When the Debugging Tools for Windows are installed, the terminal client can run WinDbg's full `!analyze -v` against a specific dump on explicit demand. This tier lives client-side (`crashdump.rs`), never in the service. It locates `cdb.exe` by probing `PCPULSE_CDB_PATH`, the Windows SDK Debugging Tools under both Program Files roots, the winget/Store WinDbg app-execution alias (`cdbX64.exe` under `%LOCALAPPDATA%\Microsoft\WindowsApps`), and finally PATH; runs `cdb -z <dump> -c "!analyze -v; q"` under a timeout (`PCPULSE_CDB_TIMEOUT_SECS`, default 120 s, clamped 30–1800); preserves the full output to a rotated `%LOCALAPPDATA%\PcPulse\crash-analysis-<n>.log`; and parses the headline fields (`FAILURE_BUCKET_ID`, `IMAGE_NAME`, `MODULE_NAME`, `PROCESS_NAME`, `SYMBOL_NAME`, `BUGCHECK_STR`) into bounded evidence rows that also feed the analyzer's evidence bundle.
+
+**Network note:** this is the only diagnostic path in PC Pulse that touches the network, and only when the user explicitly requests a deep analysis — `cdb` is pointed at the Microsoft public symbol server (`msdl.microsoft.com`) with a local cache under `%LOCALAPPDATA%\PcPulse\symbols`. The service-side scanner performs no network access ever. Missing symbols degrade to whatever cdb can still attribute; nothing is fabricated.
+
 ## Attribution limits
 
 - Disk latency is a system PDH value. PC Pulse names the process with the greatest current read/write rate as the likely workload owner and phrases the explanation accordingly; it does not claim proof of storage-stack ownership.

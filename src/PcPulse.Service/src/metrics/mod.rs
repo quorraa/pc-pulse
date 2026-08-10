@@ -1,3 +1,4 @@
+pub mod dumps;
 pub mod forensics;
 mod hardware;
 pub mod interrupts;

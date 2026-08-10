@@ -4,6 +4,7 @@ pub mod analyzer;
 pub mod app;
 pub mod chat_history;
 pub mod client;
+pub mod crashdump;
 pub mod effects;
 pub mod format;
 pub mod notifier;

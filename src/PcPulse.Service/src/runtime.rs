@@ -6,6 +6,7 @@ use crate::{
     eventlog::EventLogCollector,
     metrics::{
         MetricCollector,
+        dumps::{DumpEngine, WindowsDumpSource},
         forensics::{ForensicsEngine, WindowsForensicsSource},
         interrupts::{InterruptEngine, WindowsInterruptSource},
         live::LiveEngine,
@@ -343,6 +344,10 @@ fn sampling_loop(state: &Arc<AppState>, stop: crossbeam_channel::Receiver<()>) -
     // re-captures on a two-minute cadence until it holds three successful
     // traces, and backs off to every ten minutes.
     let mut interrupts = InterruptEngine::new(WindowsInterruptSource::default());
+    // Crash-dump discovery scans the standard dump locations shortly after
+    // start and then every five minutes; between scans it is a single
+    // timestamp comparison, and triage headers are read once per new dump.
+    let mut dumps = DumpEngine::new(WindowsDumpSource);
     let mut event_logs = EventLogCollector::default();
     let mut next_system_write = Instant::now();
     let mut next_process_write = Instant::now();
@@ -391,6 +396,14 @@ fn sampling_loop(state: &Arc<AppState>, stop: crossbeam_channel::Receiver<()>) -
         interrupts.observe(&evaluation.active, timestamp_ms);
         interrupts.decorate(&mut evaluation.active);
         interrupts.decorate(&mut evaluation.changed);
+        // Crash-dump findings are produced by their own engine (the dump
+        // scan has its own five-minute cadence) and merge into the same
+        // alert stream the detectors feed.
+        evaluation.changed.extend(dumps.observe(timestamp_ms));
+        evaluation.active.extend(dumps.active_alerts());
+        evaluation
+            .active
+            .sort_by_key(|alert| std::cmp::Reverse(alert.first_seen_ms));
         state.storage.upsert_alerts(&evaluation.changed)?;
         {
             let mut snapshot = state

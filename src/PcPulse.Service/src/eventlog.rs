@@ -357,7 +357,9 @@ fn redact_field(name: &str, raw: &str) -> String {
     truncate(&sanitize(&inline_redacted), MAX_FIELD_CHARS)
 }
 
-fn redact_user_profile(value: &str) -> String {
+/// Replaces every `<drive>:\Users\<name>` prefix with `%USERPROFILE%`.
+/// Shared with the crash-dump scanner, which surfaces per-user WER paths.
+pub(crate) fn redact_user_profile(value: &str) -> String {
     let mut result = value.to_string();
     loop {
         let lower = result.to_ascii_lowercase();

@@ -1734,9 +1734,16 @@ fn render_overview_broadsheet(frame: &mut Frame<'_>, app: &App, area: Rect) {
         2
     };
     let notices_height = (snapshot.active_alerts.len().min(3) as u16).max(1) + 1;
+    // Tall sheets give every MARKET ticker a two-row braille band (8 dot
+    // levels); short ones keep single-row tickers so MOVERS stays roomy.
+    let market_height = if canvas.height >= 30 {
+        MARKET_ROWS.len() as u16 * 2 + 1
+    } else {
+        MARKET_ROWS.len() as u16 + 1
+    };
     let vertical = Layout::vertical([
         Constraint::Length(headline_height),
-        Constraint::Length(MARKET_ROWS.len() as u16 + 1),
+        Constraint::Length(market_height),
         Constraint::Min(6),
         Constraint::Length(notices_height),
     ])
@@ -2003,29 +2010,80 @@ fn market_delta_color(resource: &MarketResource, delta: f64) -> Option<Color> {
     Some(if pressure { palette().warn } else { palette().ok })
 }
 
-/// A one-row block sparkline of a series' most recent points, normalized
-/// over the window it actually shows.
-fn market_spark(values: &[f64], width: usize) -> String {
-    const LEVELS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
-    let skip = values.len().saturating_sub(width);
-    let window = &values[skip..];
+/// Dot bits of one braille cell, by (dot row 0..4 top→bottom, column 0..2).
+const BRAILLE_DOTS: [[u8; 2]; 4] = [[0x01, 0x08], [0x02, 0x10], [0x04, 0x20], [0x40, 0x80]];
+
+/// A dotted braille line trace — the broadsheet's printed micro-chart, not
+/// a bar chart. `values` is resampled across `width × 2` dot columns and
+/// normalized over its own window; `rows` text rows give `rows × 4`
+/// vertical dot levels (one dot per column). A flat series prints a mid-
+/// height dotted rule rather than hugging the floor.
+fn braille_spark(values: &[f64], width: usize, rows: usize) -> Vec<String> {
+    let blank = || " ".repeat(width);
+    if values.is_empty() || width == 0 || rows == 0 {
+        return (0..rows.max(1)).map(|_| blank()).collect();
+    }
     let mut low = f64::INFINITY;
     let mut high = f64::NEG_INFINITY;
-    for value in window {
+    for value in values {
         low = low.min(*value);
         high = high.max(*value);
     }
+    let levels = rows * 4;
+    let flat = (high - low) <= f64::EPSILON * high.abs().max(1.0);
     let span = (high - low).max(f64::MIN_POSITIVE);
-    window
-        .iter()
-        .map(|value| LEVELS[(((value - low) / span * 7.0).round() as usize).min(7)])
+    let mut grid = vec![vec![0u8; width]; rows];
+    let columns = width * 2;
+    for column in 0..columns {
+        let index = if columns == 1 {
+            0
+        } else {
+            column * (values.len() - 1) / (columns - 1)
+        };
+        let level = if flat {
+            levels / 2
+        } else {
+            ((((values[index] - low) / span) * (levels - 1) as f64).round() as usize)
+                .min(levels - 1)
+        };
+        let row = rows - 1 - level / 4;
+        grid[row][column / 2] |= BRAILLE_DOTS[3 - (level % 4)][column % 2];
+    }
+    grid.into_iter()
+        .map(|cells| {
+            cells
+                .into_iter()
+                .map(|bits| char::from_u32(0x2800 + u32::from(bits)).unwrap_or(' '))
+                .collect()
+        })
         .collect()
 }
 
-/// The MARKET strip: one ticker row per system resource — an inline block
-/// sparkline over the live window (snapshot history spliced with the
-/// high-res live tail in smooth mode), the current reading, and the
-/// direction-colored movement vs the [`MARKET_WINDOW_MS`] reference.
+/// The signal channel a MARKET ticker's trace prints in, so adjacent rows
+/// read as separate instruments: CPU ok, MEM alt, the disk pair warn,
+/// NET info, IRQ+DPC crit.
+fn market_accent(row: usize) -> Color {
+    match row {
+        0 => palette().ok,
+        1 => palette().alt,
+        2 | 3 => palette().warn,
+        4 => palette().info,
+        _ => palette().crit,
+    }
+}
+
+/// Column budget shared by every MARKET ticker: label, eased reading, and
+/// the longest delta tail; the braille trace stretches across everything
+/// that remains so the strip fills the full sheet width.
+const MARKET_RESERVED: usize = 9 + 13 + 26;
+
+/// The MARKET strip: one ticker per system resource — a dotted braille
+/// trace over the live window (snapshot history spliced with the high-res
+/// live tail in smooth mode) stretching the full remaining width, the
+/// current reading, and the direction-colored movement vs the
+/// [`MARKET_WINDOW_MS`] reference. Each trace normalizes independently and
+/// prints in its own accent. Given the height, every ticker becomes a
+/// two-row band (8 dot levels); otherwise one row (4 levels).
 fn render_market(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let Some(snapshot) = &app.snapshot else {
         return;
@@ -2033,6 +2091,11 @@ fn render_market(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let block = field_block(" MARKET — resource motion ", palette().ok);
     let inner = block.inner(area);
     frame.render_widget(block, area);
+    let band_rows = if usize::from(inner.height) >= MARKET_ROWS.len() * 2 {
+        2
+    } else {
+        1
+    };
     let points = pressure_field_points(app);
     let shown = app.display_system(&snapshot.system);
     // Deltas compare raw samples only, so a mid-tween frame can never flip
@@ -2046,29 +2109,38 @@ fn render_market(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let span_minutes = reference
         .map(|point| (latest_ts - point.timestamp_ms) as f64 / 60_000.0)
         .unwrap_or(0.0);
-    // Label (9) + reading (13) + the longest delta tail (26) are reserved;
-    // the sparkline takes what remains so no ticker ever clips its delta.
     let spark_width = usize::from(inner.width)
-        .saturating_sub(9 + 13 + 26)
-        .clamp(6, 48);
+        .saturating_sub(MARKET_RESERVED)
+        .max(6);
     let mut lines = Vec::new();
     for (row, resource) in MARKET_ROWS.iter().enumerate() {
         let series = points
             .iter()
             .map(|point| market_value(row, point))
             .collect::<Vec<_>>();
+        let trace = braille_spark(&series, spark_width, band_rows);
+        let accent = market_accent(row);
         let delta = latest
             .zip(reference)
             .map(|(to, from)| market_value(row, to) - market_value(row, from))
             .unwrap_or(0.0);
+        // A two-row band floats its upper dots above the caption row; the
+        // label, reading, and delta sit on the baseline row beside the
+        // trace's lower half.
+        if band_rows == 2 {
+            lines.push(Line::from(vec![
+                Span::raw(" ".repeat(9)),
+                Span::styled(trace[0].clone(), Style::default().fg(accent)),
+            ]));
+        }
         let mut spans = vec![
             Span::styled(
                 format!("{:<9}", resource.label),
                 Style::default().fg(palette().muted).bold(),
             ),
             Span::styled(
-                market_spark(&series, spark_width),
-                Style::default().fg(palette().alt),
+                trace[band_rows - 1].clone(),
+                Style::default().fg(accent),
             ),
             Span::styled(
                 format!("  {:>11}", market_format(row, market_value(row, &shown))),
@@ -2100,9 +2172,40 @@ fn render_market(frame: &mut Frame<'_>, app: &App, area: Rect) {
     );
 }
 
-/// One MOVERS board row: name, the dominant delta, a direction bar scaled
-/// by floor-normalized magnitude, and the current absolute reading.
-fn mover_line(mover: &crate::app::Mover) -> Line<'static> {
+/// Column budget shared by every MOVERS / WATCHLIST row: name, delta,
+/// direction bar, current reading; the braille trace takes the rest.
+const MOVER_RESERVED: usize = 19 + 12 + 6 + 10;
+
+/// The braille trace width for a mover-format row inside `width` cells.
+fn mover_spark_width(width: u16) -> usize {
+    usize::from(width).saturating_sub(MOVER_RESERVED).clamp(4, 60)
+}
+
+/// The dominant signal's series out of a pid's trend ring: CPU percent for
+/// CPU-dominant movers, working-set bytes for memory-dominant ones.
+fn trend_series(app: &App, pid: u32, cpu: bool) -> Vec<f64> {
+    app.process_trends
+        .get(&pid)
+        .map(|trend| {
+            trend
+                .points
+                .iter()
+                .map(|point| {
+                    if cpu {
+                        point.cpu_percent
+                    } else {
+                        point.working_set_bytes as f64
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// One MOVERS board row: name, a dotted 2-minute trace of the dominant
+/// signal from the pid's trend ring, the signed delta, a direction bar
+/// scaled by floor-normalized magnitude, and the current absolute reading.
+fn mover_line(app: &App, mover: &crate::app::Mover, spark_width: usize) -> Line<'static> {
     let delta = if mover.cpu_dominant {
         format!("{:+.1}% cpu", mover.cpu_delta)
     } else {
@@ -2120,15 +2223,69 @@ fn mover_line(mover: &crate::app::Mover) -> Line<'static> {
     } else {
         palette().ok
     };
+    let series = trend_series(app, mover.pid, mover.cpu_dominant);
+    let trace = braille_spark(&series, spark_width, 1).remove(0);
     Line::from(vec![
         Span::styled(
             format!("{:<19}", format::truncate(&mover.name, 18)),
             Style::default().fg(palette().text).bold(),
         ),
+        Span::styled(trace, Style::default().fg(color)),
         Span::styled(format!("{delta:>12}"), Style::default().fg(color).bold()),
         Span::styled(format!("  {bar:<4}"), Style::default().fg(color)),
         Span::styled(format!(" {current:>9}"), Style::default().fg(palette().muted)),
     ])
+}
+
+/// One WATCHLIST row: a tracked-but-steady process in the same grammar as
+/// a mover row — name, faint dotted CPU trace, an honest "· steady" where
+/// the delta would print, and the current CPU share.
+fn watch_line(app: &App, pid: u32, name: &str, spark_width: usize) -> Line<'static> {
+    let series = trend_series(app, pid, true);
+    let current = series.last().copied().unwrap_or_default();
+    let trace = braille_spark(&series, spark_width, 1).remove(0);
+    Line::from(vec![
+        Span::styled(
+            format!("{:<19}", format::truncate(name, 18)),
+            Style::default().fg(palette().muted),
+        ),
+        Span::styled(trace, Style::default().fg(palette().faint)),
+        Span::styled(
+            format!("{:>12}", "· steady"),
+            Style::default().fg(palette().faint),
+        ),
+        Span::raw(" ".repeat(6)),
+        Span::styled(
+            format!(" {:>9}", format!("{current:.1}%")),
+            Style::default().fg(palette().muted),
+        ),
+    ])
+}
+
+/// The tracked pids that did not make the MOVERS board, strongest CPU
+/// first: the WATCHLIST backfill so a tall sheet stays fully populated.
+fn watchlist(app: &App, exclude: &std::collections::HashSet<u32>) -> Vec<(u32, String)> {
+    let mut entries = app
+        .process_trends
+        .iter()
+        .filter(|(pid, _)| !exclude.contains(pid))
+        .map(|(pid, trend)| {
+            (
+                *pid,
+                trend.name.clone(),
+                trend
+                    .points
+                    .back()
+                    .map(|point| point.cpu_percent)
+                    .unwrap_or_default(),
+            )
+        })
+        .collect::<Vec<_>>();
+    entries.sort_by(|left, right| right.2.total_cmp(&left.2).then_with(|| left.1.cmp(&right.1)));
+    entries
+        .into_iter()
+        .map(|(pid, name, _)| (pid, name))
+        .collect()
 }
 
 /// The honest quiet line when a MOVERS column has nothing past the floors.
@@ -2142,6 +2299,7 @@ fn no_movement_line() -> Line<'static> {
 /// One MOVERS column: printed direction header, then the strongest movers.
 fn render_mover_column(
     frame: &mut Frame<'_>,
+    app: &App,
     title: &str,
     movers: &[crate::app::Mover],
     area: Rect,
@@ -2154,8 +2312,37 @@ fn render_mover_column(
     if movers.is_empty() {
         lines.push(no_movement_line());
     }
+    let spark_width = mover_spark_width(area.width);
     for mover in movers.iter().take(capacity) {
-        lines.push(mover_line(mover));
+        lines.push(mover_line(app, mover, spark_width));
+    }
+    frame.render_widget(
+        Paragraph::new(lines).style(Style::default().fg(palette().text).bg(palette().surface)),
+        area,
+    );
+}
+
+/// The WATCHLIST subsection under the mover columns: a printed faint
+/// header, then the remaining tracked processes in full-width mover-format
+/// rows, so the board fills its height with real information instead of
+/// blank paper.
+fn render_watchlist(
+    frame: &mut Frame<'_>,
+    app: &App,
+    exclude: &std::collections::HashSet<u32>,
+    area: Rect,
+) {
+    let entries = watchlist(app, exclude);
+    if entries.is_empty() || area.height < 2 {
+        return;
+    }
+    let mut lines = vec![Line::styled(
+        "WATCHLIST — tracked, no significant movement",
+        Style::default().fg(palette().faint).bold(),
+    )];
+    let spark_width = mover_spark_width(area.width);
+    for (pid, name) in entries.iter().take(usize::from(area.height - 1)) {
+        lines.push(watch_line(app, *pid, name, spark_width));
     }
     frame.render_widget(
         Paragraph::new(lines).style(Style::default().fg(palette().text).bg(palette().surface)),
@@ -2165,22 +2352,39 @@ fn render_mover_column(
 
 /// The MOVERS board, the front page's centerpiece: RISING and EASING as two
 /// ruled columns of the processes with the largest CPU / working-set change
-/// over the ~2 minute client-side trend window. Narrow sheets get a single
-/// short list instead of columns.
+/// over the ~2 minute client-side trend window, then a WATCHLIST of the
+/// remaining tracked processes filling whatever height is left. Narrow
+/// sheets get a single merged list instead of columns.
 fn render_movers(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let (rising, easing) = app.process_movers();
     let block = field_block(" MOVERS — largest movement, ≈2 m window ", palette().alt);
     let inner = block.inner(area);
     frame.render_widget(block, area);
+    let shown = rising
+        .iter()
+        .chain(easing.iter())
+        .map(|mover| mover.pid)
+        .collect::<std::collections::HashSet<u32>>();
     if area.width < HEADLINE_MIN_WIDTH {
-        // Single column: risers first, then easers, one short list.
+        // Single column: risers first, then easers, then the watchlist.
         let capacity = usize::from(inner.height).max(1);
+        let spark_width = mover_spark_width(inner.width);
         let mut lines = Vec::new();
         for mover in rising.iter().chain(easing.iter()).take(capacity) {
-            lines.push(mover_line(mover));
+            lines.push(mover_line(app, mover, spark_width));
         }
         if lines.is_empty() {
             lines.push(no_movement_line());
+        }
+        let remaining = capacity.saturating_sub(lines.len());
+        if remaining >= 2 {
+            lines.push(Line::styled(
+                "WATCHLIST — tracked, no significant movement",
+                Style::default().fg(palette().faint).bold(),
+            ));
+            for (pid, name) in watchlist(app, &shown).iter().take(remaining - 1) {
+                lines.push(watch_line(app, *pid, name, spark_width));
+            }
         }
         frame.render_widget(
             Paragraph::new(lines).style(Style::default().fg(palette().text).bg(palette().surface)),
@@ -2188,15 +2392,36 @@ fn render_movers(frame: &mut Frame<'_>, app: &App, area: Rect) {
         );
         return;
     }
+    // The ruled columns take exactly the rows the movers need; the
+    // watchlist fills the rest, and NOTICES stays pinned below the board.
+    let needed = (rising.len().max(easing.len()).max(1) as u16).saturating_add(1);
+    let columns_height = needed.min(inner.height);
+    let column_area = Rect {
+        height: columns_height,
+        ..inner
+    };
     let columns = Layout::horizontal([
         Constraint::Percentage(50),
         Constraint::Length(1),
         Constraint::Min(24),
     ])
-    .split(inner);
-    render_mover_column(frame, "RISING", &rising, columns[0]);
+    .split(column_area);
+    render_mover_column(frame, app, "RISING", &rising, columns[0]);
     render_column_rule(frame, columns[1]);
-    render_mover_column(frame, "EASING", &easing, columns[2]);
+    render_mover_column(frame, app, "EASING", &easing, columns[2]);
+    let remaining = inner.height.saturating_sub(columns_height);
+    if remaining >= 3 {
+        render_watchlist(
+            frame,
+            app,
+            &shown,
+            Rect {
+                y: inner.y + columns_height,
+                height: remaining,
+                ..inner
+            },
+        );
+    }
 }
 
 /// The NOTICES strip, compressed to one printed line per active finding:
@@ -7435,20 +7660,45 @@ mod tests {
         // The NET / IRQ minor headline figures at full width.
         assert!(text.contains("NET MB/S"));
         assert!(text.contains("IRQ /S"));
-        // The MARKET strip: every resource ticker with sparkline glyphs.
+        // The MARKET strip: every resource ticker traced as a dotted
+        // braille line — the printed micro-chart, never solid bar glyphs.
         assert!(text.contains("MARKET"));
         for label in ["CPU", "MEM", "DISK LAT", "DISK IO", "NET", "IRQ+DPC"] {
             assert!(text.contains(label), "missing market row {label}");
         }
         assert!(
-            ['▁', '▂', '▃', '▄', '▅', '▆', '▇']
+            text.chars()
+                .any(|glyph| ('\u{2801}'..='\u{28FF}').contains(&glyph)),
+            "market braille traces render"
+        );
+        // ▄ stays out of this list: the block-digit decimal point uses it.
+        assert!(
+            !['▁', '▂', '▃', '▅', '▆', '▇']
                 .iter()
                 .any(|glyph| text.contains(*glyph)),
-            "market sparklines render"
+            "no solid bar-glyph sparklines on the front page"
         );
         assert!(
             text.contains("m ago"),
             "windowed market deltas carry their reference"
+        );
+        // Each ticker's trace prints in its own accent so rows read apart.
+        assert!(
+            backend
+                .buffer()
+                .content()
+                .iter()
+                .filter(|cell| {
+                    cell.symbol()
+                        .chars()
+                        .next()
+                        .is_some_and(|glyph| ('\u{2801}'..='\u{28FF}').contains(&glyph))
+                })
+                .map(|cell| cell.fg)
+                .collect::<std::collections::HashSet<_>>()
+                .len()
+                >= 4,
+            "braille traces span several signal channels"
         );
         // The MOVERS board: both ruled columns, populated by the fixture's
         // trend rings, with signed dominant deltas.
@@ -7459,6 +7709,11 @@ mod tests {
         assert!(text.contains("firefox.exe"), "cpu easer on the board");
         assert!(text.contains("% cpu"), "cpu-dominant delta grammar");
         assert!(text.contains("+400 MB"), "memory-dominant delta grammar");
+        // The WATCHLIST backfill keeps the tall sheet fully populated with
+        // the steady remainder of the tracked set.
+        assert!(text.contains("WATCHLIST"));
+        assert!(text.contains("· steady"));
+        assert!(text.contains("Discord.exe"), "steady process on the watchlist");
         // NOTICES compress to one printed line per finding, tags intact.
         assert!(text.contains("NOTICES"));
         assert!(text.contains("[CRITICAL]"));
@@ -7494,11 +7749,48 @@ mod tests {
         assert!(text.contains("MEM 50%"));
         assert!(text.contains("DISK 1.8 ms"));
         assert!(!text.contains("█▀█"), "no block digits below the floor");
-        // MARKET keeps its tickers; MOVERS becomes one short list.
+        // MARKET keeps its tickers; MOVERS becomes one merged list with
+        // the WATCHLIST backfill still filling the remaining rows.
         assert!(text.contains("MARKET"));
         assert!(text.contains("MOVERS"));
         assert!(!text.contains("RISING"), "no ruled columns when narrow");
         assert!(text.contains("% cpu"), "movers list still populated");
+        assert!(text.contains("WATCHLIST"), "backfill survives the degrade");
+    }
+
+    #[test]
+    fn braille_spark_plots_a_dotted_trace_and_centers_flat_series() {
+        // A rising ramp over a 2-row band: dots climb from the bottom-left
+        // to the top-right, every cell drawn from the braille block only.
+        let ramp = (0..32).map(f64::from).collect::<Vec<_>>();
+        let band = braille_spark(&ramp, 8, 2);
+        assert_eq!(band.len(), 2);
+        for row in &band {
+            assert_eq!(row.chars().count(), 8);
+            assert!(
+                row.chars()
+                    .all(|glyph| glyph == ' ' || ('\u{2800}'..='\u{28FF}').contains(&glyph)),
+                "traces are braille cells only: {row}"
+            );
+        }
+        // The ramp's low half lives in the bottom row, the high half above.
+        assert!(band[1].starts_with(|glyph: char| glyph != '\u{2800}' && glyph != ' '));
+        assert!(band[0].ends_with(|glyph: char| glyph != '\u{2800}' && glyph != ' '));
+        assert_eq!(band[0].chars().next(), Some('\u{2800}'), "top-left empty");
+        assert_eq!(band[1].chars().last(), Some('\u{2800}'), "bottom-right empty");
+        // Exactly one dotted line: each dot column carries a single dot.
+        let dots = band
+            .iter()
+            .flat_map(|row| row.chars())
+            .map(|glyph| (glyph as u32).saturating_sub(0x2800).count_ones())
+            .sum::<u32>();
+        assert_eq!(dots, 16, "one dot per horizontal dot column");
+        // A flat series prints a mid-height dotted rule, not a floor hug.
+        let flat = braille_spark(&[5.0; 20], 6, 1);
+        assert_eq!(flat.len(), 1);
+        assert!(flat[0].chars().all(|glyph| glyph == '\u{2812}'), "{}", flat[0]);
+        // Empty input renders blank rows rather than panicking.
+        assert_eq!(braille_spark(&[], 4, 2), vec!["    ", "    "]);
     }
 
     #[test]
@@ -7927,7 +8219,7 @@ mod tests {
         let mut app = sample_app();
         let base = app.snapshot.as_ref().expect("snapshot").system.clone();
         let template = app.snapshot.as_ref().expect("snapshot").processes[0].clone();
-        let roster: [(&str, f64, u64, bool); 14] = [
+        let roster: [(&str, f64, u64, bool); 22] = [
             ("firefox.exe", 6.4, 1_400, false),
             ("chrome.exe", 8.9, 1_900, false),
             ("claude.exe", 2.2, 640, true),
@@ -7942,6 +8234,17 @@ mod tests {
             ("RustDesk.exe", 0.1, 90, false),
             ("Discord.exe", 1.2, 520, false),
             ("HWiNFO64.EXE", 0.5, 120, false),
+            // Steady background residents: they never clear the mover
+            // floors, so the ledger WATCHLIST has enough tracked-but-quiet
+            // processes to fill a tall sheet.
+            ("Teams.exe", 1.9, 830, false),
+            ("slack.exe", 1.4, 450, false),
+            ("steam.exe", 1.1, 610, false),
+            ("OneDrive.exe", 0.8, 290, false),
+            ("audiodg.exe", 0.6, 95, false),
+            ("SearchHost.exe", 0.3, 260, false),
+            ("RuntimeBroker.exe", 0.2, 130, false),
+            ("ctfmon.exe", 0.1, 45, false),
         ];
         {
             let snapshot = app.snapshot.as_mut().expect("snapshot");
@@ -8509,13 +8812,25 @@ mod tests {
             return;
         };
         let sizes: [(u16, u16); 4] = [(80, 24), (100, 30), (120, 36), (170, 48)];
-        let mut html = String::from(
-            "<!doctype html><meta charset=\"utf-8\"><style>\
-             body{background:#111;color:#eee;font-family:monospace}\
-             pre{font-family:'Cascadia Mono','Consolas',monospace;font-size:11px;\
-             line-height:1.08;display:inline-block;border:1px solid #333;padding:2px;margin:2px 0}\
-             h2{margin:28px 0 4px;color:#fc6}h3{margin:16px 0 2px;color:#9ad}\
-             h4{margin:10px 0 2px;color:#8a8}</style>",
+        // Self-identifying banner so a stale gallery can never masquerade
+        // as fresh output. SystemTime is fine here: this is the ignored dev
+        // harness, never a normal test run.
+        let banner = format!(
+            "PC Pulse render gallery — v{} — generated {}",
+            env!("CARGO_PKG_VERSION"),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_secs())
+                .unwrap_or_default()
+        );
+        let mut html = format!(
+            "<!doctype html><meta charset=\"utf-8\"><title>{banner}</title><style>\
+             body{{background:#111;color:#eee;font-family:monospace}}\
+             pre{{font-family:'Cascadia Mono','Consolas',monospace;font-size:11px;\
+             line-height:1.08;display:inline-block;border:1px solid #333;padding:2px;margin:2px 0}}\
+             h1{{margin:8px 0;color:#7fd;border-bottom:2px solid #7fd;padding-bottom:6px}}\
+             h2{{margin:28px 0 4px;color:#fc6}}h3{{margin:16px 0 2px;color:#9ad}}\
+             h4{{margin:10px 0 2px;color:#8a8}}</style><h1>{banner} (unix seconds)</h1>",
         );
         for theme_id in [
             theme::ThemeId::Vitals,
@@ -8894,8 +9209,17 @@ mod tests {
                 "{theme_id:?}: tour is too thin ({} frames)",
                 frames.len()
             );
-            let payload = serde_json::to_string(&serde_json::Value::Array(frames))
-                .expect("serialize demo frames");
+            // Version + timestamp ride in the payload so Make-Demo.py can
+            // announce exactly which build produced the frames it renders.
+            let payload = serde_json::to_string(&serde_json::json!({
+                "version": env!("CARGO_PKG_VERSION"),
+                "generatedAt": std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|elapsed| elapsed.as_secs())
+                    .unwrap_or_default(),
+                "frames": frames,
+            }))
+            .expect("serialize demo frames");
             std::fs::write(
                 std::path::Path::new(&directory).join(format!("frames-{}.json", theme_id.name())),
                 payload,

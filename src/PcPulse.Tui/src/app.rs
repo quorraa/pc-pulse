@@ -231,6 +231,9 @@ pub struct ProcessTrend {
 /// the floors over the recent window.
 #[derive(Debug, Clone)]
 pub struct Mover {
+    /// The pid whose [`ProcessTrend`] ring produced this entry; the board
+    /// reads the ring again to draw the row's trace.
+    pub pid: u32,
     pub name: String,
     /// CPU change over the window in percentage points (signed).
     pub cpu_delta: f64,
@@ -2136,7 +2139,7 @@ impl App {
     pub fn process_movers(&self) -> (Vec<Mover>, Vec<Mover>) {
         let mut rising = Vec::new();
         let mut easing = Vec::new();
-        for trend in self.process_trends.values() {
+        for (pid, trend) in &self.process_trends {
             let Some(latest) = trend.points.back() else {
                 continue;
             };
@@ -2162,6 +2165,7 @@ impl App {
                 continue;
             }
             let mover = Mover {
+                pid: *pid,
                 name: trend.name.clone(),
                 cpu_delta,
                 memory_delta,

@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 """Rasterize PC Pulse demo frame dumps into the README GIF tours.
 
-Input:  frames-vitals.json / frames-avionics.json, produced by the ignored
-        `dev_record_demo` test in src/PcPulse.Tui/src/ui.rs:
+Input:  frames-<theme>.json, produced by the ignored `dev_record_demo`
+        test in src/PcPulse.Tui/src/ui.rs:
 
             PCPULSE_DEMO_DIR=<dir> cargo test -p pcpulse-tui --lib \
                 dev_record_demo -- --ignored
 
-        Each file is an array of frames `{ms, rows}`; each row is a list of
-        run-length-encoded `[text, "#fg", "#bg", bold]` runs covering the
-        full 120x36 cell grid.
+        Each file is `{version, generatedAt, frames}`; `frames` is an array
+        of `{ms, rows}` where each row is a list of run-length-encoded
+        `[text, "#fg", "#bg", bold]` runs covering the full 120x36 cell
+        grid. The version/timestamp are printed so a stale dump can never
+        masquerade as fresh.
 
 Output: docs/media/demo-vitals.gif and docs/media/demo-avionics.gif —
         infinite-loop GIFs with per-frame durations from the JSON and a
@@ -137,7 +139,12 @@ def build_master_palette(rendered: list[Image.Image]) -> Image.Image:
 
 
 def make_gif(frames_path: Path, out_path: Path, inspect_dir: Path | None) -> None:
-    frames = json.loads(frames_path.read_text(encoding="utf-8"))
+    payload = json.loads(frames_path.read_text(encoding="utf-8"))
+    frames = payload["frames"]
+    print(
+        f"{frames_path.name}: PC Pulse v{payload['version']}, "
+        f"frames generated at unix {payload['generatedAt']}"
+    )
     regular, bold, font_name = load_fonts()
     cell_w = round(regular.getlength("M"))
     ascent, descent = regular.getmetrics()

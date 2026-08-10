@@ -30,6 +30,7 @@ Release binaries are currently unsigned; Windows may show an unknown-publisher w
 - Its own collector against absolute budgets (25 MB working set, 0.2% CPU, 600 handles) plus mature working-set growth.
 - When a handle or thread leak is flagged, captures which handle types and which modules' threads grew — for any process, system metadata only.
 - Redacted warning/error/critical Application and System events, classified and fingerprinted (hardware, storage, graphics, crashes, hangs, resource exhaustion, power, services, networking, agent runtimes).
+- Discovers kernel and application crash dumps, triages the bugcheck natively, and — with the Debugging Tools installed — runs WinDbg's full analysis on demand.
 - Active and resolved finding history with responsible process where attribution is defensible, supporting evidence, explanation, and safe next actions.
 
 If policy denies ETW session creation, the collector continues with PDH and Win32, marks ETW degraded, and retries every minute. See [detector details](docs/detectors.md) for every finding's ownership, evidence, and thresholds, and the [named-pipe protocol](docs/protocol.md) for the IPC contract.
