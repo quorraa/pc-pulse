@@ -956,22 +956,25 @@ fn paint_background(buffer: &mut Buffer, pixels: &[u8], grid: (u16, u16), dim_pc
 /// video instead of punching solid rectangles through it.
 ///
 /// The layering survives because each cell is dimmed toward the color it was
-/// already wearing: gutters toward `bg`, panels toward `surface`. Panels stay
-/// exactly as much lighter than the gutters as they are today, and both carry
-/// the clip. Any other background — selection bars, severity chips, raised
-/// surfaces, statusline accents — is a semantic choice and stays untouched.
+/// already wearing: gutters toward `bg`, panels toward `surface`, raised
+/// panels toward `surface_raised`. Each chrome layer stays exactly as much
+/// lighter than the one below it as it is today, and all three carry the
+/// clip. Any other background — selection bars, severity chips, statusline
+/// accents — is a semantic choice and stays untouched.
 ///
 /// A glyph covers the full cell, so the background it sits on is the mean of
 /// the cell's two video pixels rather than just the lower one.
 fn restore_background_bg(buffer: &mut Buffer, pixels: &[u8], grid: (u16, u16), dim_pct: u8) {
     let flat = palette().bg;
     let surface = palette().surface;
+    let raised = palette().surface_raised;
     for_each_video_cell(buffer.area, pixels, grid, |x, y, top, bottom| {
         let cell = &mut buffer[(x, y)];
         let target = match cell.bg {
             Color::Reset => flat,
             bg if bg == flat => flat,
             bg if bg == surface => surface,
+            bg if bg == raised => raised,
             _ => return,
         };
         let mean = (
@@ -9597,9 +9600,10 @@ mod tests {
                 // the foreground, bottom half behind it.
                 two_pixel_cells += 1;
             }
-            // The flat backdrop and the panel fills both carry the video; a
-            // semantic fill (selection bar, severity chip) never does.
-            if b.bg != Color::Reset && b.bg != palette().bg && b.bg != palette().surface {
+            // Every chrome layer carries the video; a semantic fill
+            // (selection bar, severity chip, statusline accent) never does.
+            let chrome = [palette().bg, palette().surface, palette().surface_raised];
+            if b.bg != Color::Reset && !chrome.contains(&b.bg) {
                 assert_eq!(a.bg, b.bg, "a semantic fill was overpainted");
             } else if a.bg != b.bg {
                 video_backed_cells += 1;
@@ -9641,7 +9645,7 @@ mod tests {
     fn dim_lerps_the_video_toward_the_cell_s_own_theme_color() {
         let _theme = theme::test_support::activate(theme::ThemeId::Vitals);
         let flat = palette().bg;
-        let (Color::Rgb(br, _, _), Color::Rgb(sr, _, _)) = (flat, palette().surface) else {
+        let Color::Rgb(br, _, _) = flat else {
             panic!("every shipped palette is true color");
         };
         assert_eq!(
@@ -9649,16 +9653,21 @@ mod tests {
             Color::Rgb(200, 100, 40)
         );
         assert_eq!(dim_toward((200, 100, 40), flat, 100), flat);
-        let Color::Rgb(hr, _, _) = dim_toward((205, 100, 40), flat, 50) else {
-            panic!("dimming stays true color");
+        // Each chrome layer dims toward its own fill, which is what keeps the
+        // three of them stacked once they are all carrying the same clip.
+        let red_at_half = |target: Color| {
+            let Color::Rgb(red, _, _) = dim_toward((205, 100, 40), target, 50) else {
+                panic!("dimming stays true color");
+            };
+            red
         };
-        assert_eq!(hr, ((205.0 + f32::from(br)) / 2.0).round() as u8);
-        // Panels dim toward their own fill, which is what keeps them lighter
-        // than the gutters once both are carrying the same clip.
-        let Color::Rgb(pr, _, _) = dim_toward((205, 100, 40), palette().surface, 50) else {
-            panic!("dimming stays true color");
-        };
-        assert_eq!(pr, ((205.0 + f32::from(sr)) / 2.0).round() as u8);
-        assert!(pr > hr, "a panel must stay lighter than the backdrop");
+        let backdrop = red_at_half(flat);
+        let surface = red_at_half(palette().surface);
+        let raised = red_at_half(palette().surface_raised);
+        assert_eq!(backdrop, ((205.0 + f32::from(br)) / 2.0).round() as u8);
+        assert!(
+            backdrop < surface && surface < raised,
+            "the chrome layers must stay stacked: {backdrop} < {surface} < {raised}"
+        );
     }
 }
