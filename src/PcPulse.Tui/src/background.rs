@@ -9,6 +9,12 @@
 //! `elapsed_secs * capture_fps`, never a running counter that could drift
 //! from real time.
 //!
+//! Exactly one decoded frame is held at a time, and it is memoized on its
+//! index: `current_pixels` is called once per *draw*, which is 60 times a
+//! second in smooth mode, while the clip may only tick at 10-30fps. Without
+//! the memo the same frame was inflated from disk over and over — at the
+//! 416x232 capture grid that is a 290 KB decode each time.
+//!
 //! Playback fps is a *tick rate*, not the source of the displayed frame: it
 //! only decides how often `advance_if_due` bothers checking whether the
 //! wall-clock-derived index has moved on. That separation is what lets
@@ -44,6 +50,15 @@ pub struct Background {
     /// The last successfully decoded frame's RGB pixels, reused across
     /// calls so a transient decode error can fall back to it.
     pixels: Vec<u8>,
+    /// Which frame `pixels` holds, or `None` when nothing has decoded
+    /// cleanly yet. `current_pixels` is called once per *draw* — 60 times a
+    /// second in smooth mode — while the clip itself ticks at its own fps,
+    /// so without this the same frame was inflated from disk dozens of
+    /// times over. Decoding now happens only when the index has moved on.
+    cached_index: Option<u32>,
+    /// Counts real decodes, for the test that proves the cache is hit.
+    #[cfg(test)]
+    decodes: u32,
     failed: Option<String>,
 }
 
@@ -73,8 +88,18 @@ impl Background {
             downshifted: false,
             current_index: 0,
             pixels,
+            cached_index: Some(0),
+            #[cfg(test)]
+            decodes: 1,
             failed: None,
         })
+    }
+
+    /// How many frames have actually been inflated from disk, so a test can
+    /// prove a repeated `current_pixels` call served the cache.
+    #[cfg(test)]
+    pub fn decodes_for_test(&self) -> u32 {
+        self.decodes
     }
 
     /// Returns the internal start instant for deterministic tests.
@@ -154,11 +179,26 @@ impl Background {
     /// RGB pixels of the frame due at the last `advance_if_due` call. Never
     /// panics: a read/inflate error leaves the previously decoded frame in
     /// place and records the failure in `failed()`.
+    ///
+    /// The decode is memoized on the frame index. A caller drawing at 60fps
+    /// over a 30fps clip therefore inflates each frame once and reads the
+    /// cache for the second draw, instead of paying the same decode twice.
+    /// A failed decode deliberately does *not* update the cache key, so the
+    /// next call retries and `failed()` keeps reporting the live truth
+    /// rather than latching on one bad read.
     pub fn current_pixels(&mut self) -> &[u8] {
+        if self.cached_index == Some(self.current_index) {
+            return &self.pixels;
+        }
+        #[cfg(test)]
+        {
+            self.decodes += 1;
+        }
         match self.reader.frame(self.current_index) {
             Ok(frame) => {
                 self.pixels.clear();
                 self.pixels.extend_from_slice(frame);
+                self.cached_index = Some(self.current_index);
                 self.failed = None;
             }
             Err(err) => {
@@ -253,6 +293,76 @@ mod tests {
         assert!(d1 - t0 >= Duration::from_millis(99) && d1 - t0 <= Duration::from_millis(101));
         bg.advance_if_due(t0 + Duration::from_millis(100));
         assert_eq!(bg.current_pixels()[0], expected_marker(3)); // wall time drives index: frame 3, not 1
+    }
+
+    #[test]
+    fn a_second_call_at_the_same_index_serves_the_cache_instead_of_decoding() {
+        // `current_pixels` is called once per draw — 60 times a second in
+        // smooth mode — while the clip ticks at its own, lower rate. Every
+        // call used to re-inflate the same frame from disk.
+        let mut bg = Background::load(&test_clip(10, 10.0)).unwrap();
+        let t0 = bg.started_for_test();
+        assert!(bg.advance_if_due(t0 + Duration::from_millis(250)));
+
+        let first = bg.current_pixels().to_vec();
+        let after_first = bg.decodes_for_test();
+        let second = bg.current_pixels().to_vec();
+
+        assert_eq!(
+            bg.decodes_for_test(),
+            after_first,
+            "the frame index had not moved, so nothing should have decoded"
+        );
+        assert_eq!(first, second, "the cached frame must be the same frame");
+
+        // ...and the cache must not outlive the index it was keyed on.
+        assert!(bg.advance_if_due(t0 + Duration::from_millis(350)));
+        assert_eq!(bg.current_pixels()[0], expected_marker(3));
+        assert_eq!(
+            bg.decodes_for_test(),
+            after_first + 1,
+            "an advanced index must decode again"
+        );
+    }
+
+    #[test]
+    fn a_failed_decode_keeps_the_last_frame_and_is_retried_every_call() {
+        use std::io::Write;
+        let path = test_clip(8, 8.0);
+        let mut bg = Background::load(&path).unwrap();
+        let last_good = bg.current_pixels().to_vec();
+        assert!(bg.failed().is_none());
+
+        // Zero the clip on disk underneath the open reader, so the next
+        // real decode fails. Memoizing must not swallow that.
+        let len = std::fs::metadata(&path).unwrap().len() as usize;
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .write_all(&vec![0u8; len])
+            .unwrap();
+
+        let t0 = bg.started_for_test();
+        assert!(bg.advance_if_due(t0 + Duration::from_millis(250))); // frame 2
+        assert_eq!(
+            bg.current_pixels(),
+            &last_good[..],
+            "a failed decode must leave the previous frame on screen"
+        );
+        assert!(bg.failed().is_some(), "the failure must be reported");
+
+        let after_failure = bg.decodes_for_test();
+        let _ = bg.current_pixels();
+        assert!(
+            bg.failed().is_some(),
+            "the cache must not paper over a still-failing frame"
+        );
+        assert_eq!(
+            bg.decodes_for_test(),
+            after_failure + 1,
+            "a frame that failed to decode must be retried, not cached"
+        );
     }
 
     #[test]

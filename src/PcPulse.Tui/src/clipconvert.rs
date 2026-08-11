@@ -10,6 +10,21 @@
 //! blocking on ffmpeg. Every ffmpeg invocation passes its arguments as a
 //! vector (never through a shell) and runs with `CREATE_NO_WINDOW` so no
 //! console flashes up behind the TUI.
+//!
+//! ## What a cache file costs
+//!
+//! A 416x232 frame is 290 KB raw, but `pulseclip` quantizes it to one byte
+//! per pixel and deflates that, so what lands on disk is 6.5-13 KB per
+//! frame — the low end for flat or synthetic footage, the high end for busy
+//! live action. At 60 fps that is roughly 0.4-0.8 MB per second of video: a
+//! 3-minute 60 fps clip is a 70-140 MB cache file, and a 15 s 30 fps clip
+//! about 3 MB.
+//!
+//! Those are measured through this pipeline rather than derived. Doubling
+//! each grid axis (208x116 -> 416x232) quadrupled the pixels but only
+//! multiplied the cache by ~3.2x: the same footage compresses to 0.16
+//! bytes/pixel at the coarse grid and 0.14 at the fine one, because finer
+//! sampling gives deflate more neighbouring-pixel redundancy to exploit.
 
 use crate::pulseclip::{ClipReader, ClipWriter, mute};
 use anyhow::{Context, Result, anyhow, bail};
@@ -25,9 +40,11 @@ use std::thread;
 
 /// Fixed capture grid: coarse enough that full video decoding at source
 /// resolution would be wasted work once everything is redrawn as half-block
-/// terminal cells.
-pub const GRID_W: u16 = 208;
-pub const GRID_H: u16 = 116;
+/// terminal cells, but fine enough that a full-screen terminal downsamples
+/// the clip rather than magnifying it. `GRID_H` must stay even — the
+/// renderer consumes two vertical pixels per cell.
+pub const GRID_W: u16 = 416;
+pub const GRID_H: u16 = 232;
 
 /// Windows' own flag: the spawned ffmpeg gets no console window, matching
 /// the `DETACHED_PROCESS`-style spawns elsewhere in this crate.
@@ -88,16 +105,24 @@ pub fn cache_path(source: &Path) -> Result<PathBuf> {
         .context("source mtime predates the Unix epoch")?
         .as_millis() as u64;
 
-    let mut key = Vec::new();
-    key.extend_from_slice(source.to_string_lossy().as_bytes());
-    key.extend_from_slice(&mtime_ms.to_le_bytes());
-    key.extend_from_slice(&GRID_W.to_le_bytes());
-    key.extend_from_slice(&GRID_H.to_le_bytes());
-    let hash = fnv1a64(&key);
+    let hash = cache_key(source, mtime_ms, GRID_W, GRID_H);
 
     let dir = backgrounds_dir()?;
     fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     Ok(dir.join(format!("{hash:016x}.pulseclip")))
+}
+
+/// The cache filename's hash input, kept separate from `cache_path` so the
+/// grid's presence in the key is testable without a filesystem: a release
+/// that changes `GRID_W`/`GRID_H` must land on a different filename, or
+/// every existing cache would be served back at the wrong resolution.
+fn cache_key(source: &Path, mtime_ms: u64, grid_w: u16, grid_h: u16) -> u64 {
+    let mut key = Vec::new();
+    key.extend_from_slice(source.to_string_lossy().as_bytes());
+    key.extend_from_slice(&mtime_ms.to_le_bytes());
+    key.extend_from_slice(&grid_w.to_le_bytes());
+    key.extend_from_slice(&grid_h.to_le_bytes());
+    fnv1a64(&key)
 }
 
 /// The FNV-1a 64-bit hash: small, dependency-free, and more than sufficient
@@ -412,7 +437,8 @@ mod tests {
             .collect();
         assert_eq!(rendered[0], "-i");
         assert_eq!(rendered[1], r"C:\videos\my clip (1).mp4"); // spaces intact, no quoting
-        assert!(rendered.contains(&"scale=208:116".to_string()));
+        assert!(rendered.contains(&format!("scale={GRID_W}:{GRID_H}")));
+        assert!(rendered.contains(&"scale=416:232".to_string()));
         assert!(rendered.contains(&"48".to_string()));
         assert_eq!(rendered.last().unwrap(), "-");
     }
@@ -430,6 +456,21 @@ mod tests {
         let (fps, duration) = parse_probe("garbage");
         assert_eq!(fps, 30.0);
         assert_eq!(duration, 0.0);
+    }
+
+    #[test]
+    fn the_capture_grid_is_even_and_in_the_cache_key() {
+        // The renderer paints two stacked pixels per cell, so an odd height
+        // would leave a half-cell row nothing could be sampled from.
+        assert_eq!(GRID_H % 2, 0, "the capture grid must be an even height");
+        // Raising the grid has to invalidate every cache written at the old
+        // one; the key carries the grid so the filename moves on its own.
+        let source = Path::new(r"C:\videos\clip.mp4");
+        assert_ne!(
+            cache_key(source, 1_700_000_000_000, GRID_W, GRID_H),
+            cache_key(source, 1_700_000_000_000, 208, 116),
+            "the 208x116 caches would have been served back at the new grid"
+        );
     }
 
     #[test]

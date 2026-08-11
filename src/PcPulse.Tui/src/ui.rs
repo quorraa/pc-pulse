@@ -903,21 +903,18 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     render_modal(frame, app);
     render_help_overlay(frame, app, regions.body);
     // Last, once the page has drawn: the video can only tell chrome from
-    // content by reading what the page left in the buffer. One decode per
-    // draw, copied out of the player because `current_pixels` re-reads the
-    // clip on every call — sampling it per cell would be ruinous.
-    if let Some((pixels, grid)) = app
+    // content by reading what the page left in the buffer. `current_pixels`
+    // memoizes on the frame index, so this borrows the player's own buffer
+    // rather than copying a quarter-megabyte frame out of it per draw.
+    let dim = app.client_prefs.background_dim;
+    if let Some(background) = app
         .background
         .as_mut()
         .filter(|_| app.client_prefs.background_enabled)
-        .map(|background| (background.current_pixels().to_vec(), background.grid()))
     {
-        restore_background_bg(
-            frame.buffer_mut(),
-            &pixels,
-            grid,
-            app.client_prefs.background_dim,
-        );
+        let grid = background.grid();
+        let pixels = background.current_pixels();
+        restore_background_bg(frame.buffer_mut(), pixels, grid, dim);
     }
 }
 
@@ -1025,10 +1022,26 @@ fn mean_pixel(top: (u8, u8, u8), bottom: (u8, u8, u8)) -> (u8, u8, u8) {
     )
 }
 
-/// Walks every cell of `area`, handing the visitor the nearest-neighbor
-/// video colors for that cell's top and bottom halves. Keeping the sampling
-/// math and its bounds guards here leaves the painter to decide only what to
-/// do with the two colors.
+/// Walks every cell of `area`, handing the visitor the video colors for that
+/// cell's top and bottom halves. Keeping the sampling math and its bounds
+/// guards here leaves the painter to decide only what to do with the two
+/// colors.
+///
+/// Sampling is a box filter, not a nearest-neighbor pick: each half-cell
+/// averages *every* source pixel inside the region it covers. The capture
+/// grid is deliberately finer than any terminal (416x232 against, say,
+/// 200x100 half-rows), so one half-cell usually covers several source pixels
+/// and picking one of them threw the rest away — thin bright detail either
+/// dominated a cell or vanished from it depending on where the rounding
+/// landed. Averaging keeps that detail as tone.
+///
+/// Where a half-cell covers less than one source pixel — a small clip, or a
+/// terminal taller than the grid — the region collapses to nothing, and the
+/// span is widened back to the single covering pixel. That is exactly the
+/// old nearest-neighbor behavior, which is the right answer when upscaling.
+///
+/// The arithmetic is integer throughout and allocation-free: three `u32`
+/// accumulators per half-cell, reset per half-cell rather than collected.
 fn for_each_video_cell(
     area: Rect,
     pixels: &[u8],
@@ -1044,22 +1057,43 @@ fn for_each_video_cell(
     if pixels.len() < (grid_w * grid_h * 3) as usize {
         return;
     }
-    let sample = |px: u32, py: u32| {
-        let base = ((py.min(grid_h - 1) * grid_w + px.min(grid_w - 1)) * 3) as usize;
-        (pixels[base], pixels[base + 1], pixels[base + 2])
+    /// The half-open source range cell `index` of `cells` covers along an
+    /// axis `extent` pixels long, never empty: when the cell is narrower
+    /// than one pixel the range widens to the single pixel it sits on.
+    fn span(index: u32, cells: u32, extent: u32) -> (u32, u32) {
+        let start = index * extent / cells;
+        let end = ((index + 1) * extent / cells).max(start + 1).min(extent);
+        (start, end)
+    }
+    let average = |(x0, x1): (u32, u32), (y0, y1): (u32, u32)| {
+        let (mut r, mut g, mut b) = (0_u32, 0_u32, 0_u32);
+        for py in y0..y1 {
+            let row = (py * grid_w) as usize * 3;
+            for px in x0..x1 {
+                let base = row + px as usize * 3;
+                r += u32::from(pixels[base]);
+                g += u32::from(pixels[base + 1]);
+                b += u32::from(pixels[base + 2]);
+            }
+        }
+        // Always at least one pixel, so the divisor can never be zero.
+        let count = (x1 - x0) * (y1 - y0);
+        let mean = |sum: u32| ((sum + count / 2) / count) as u8;
+        (mean(r), mean(g), mean(b))
     };
     // Rows are counted in half-cells: each cell shows two stacked pixels.
     let half_rows = u32::from(area.height) * 2;
+    let cols = u32::from(area.width);
     for cy in 0..area.height {
-        let top = u32::from(cy) * 2 * grid_h / half_rows;
-        let bottom = (u32::from(cy) * 2 + 1) * grid_h / half_rows;
+        let top = span(u32::from(cy) * 2, half_rows, grid_h);
+        let bottom = span(u32::from(cy) * 2 + 1, half_rows, grid_h);
         for cx in 0..area.width {
-            let px = u32::from(cx) * grid_w / u32::from(area.width);
+            let column = span(u32::from(cx), cols, grid_w);
             visit(
                 area.x + cx,
                 area.y + cy,
-                sample(px, top),
-                sample(px, bottom),
+                average(column, top),
+                average(column, bottom),
             );
         }
     }
@@ -9734,6 +9768,37 @@ mod tests {
         // Semantic fill: nothing at all, not even a leftover glyph.
         assert_eq!(buffer[(2, 0)].symbol(), " ");
         assert_eq!(buffer[(2, 0)].bg, palette().select_bg);
+    }
+
+    #[test]
+    fn downsampling_averages_the_covered_pixels_instead_of_skipping_them() {
+        let _theme = theme::test_support::activate(theme::ThemeId::Vitals);
+        // A 2x2 clip of vertical black/white stripes painted into a single
+        // cell: both stripes fall inside the same half-cell, so picking one
+        // source pixel would show a stripe and lose the other one entirely.
+        // This is the whole reason the capture grid can be raised past the
+        // terminal's width without the extra detail turning into noise.
+        let mut pixels = Vec::new();
+        for _ in 0..2 {
+            pixels.extend_from_slice(&[0_u8; 3]); // black column
+            pixels.extend_from_slice(&[255_u8; 3]); // white column
+        }
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 1, 1));
+
+        restore_background_bg(&mut buffer, &pixels, (2, 2), 0);
+
+        let gray = Color::Rgb(128, 128, 128);
+        assert_eq!(buffer[(0, 0)].symbol(), VIDEO_GLYPH);
+        assert_eq!(
+            buffer[(0, 0)].fg,
+            gray,
+            "the top half took one stripe instead of averaging both"
+        );
+        assert_eq!(
+            buffer[(0, 0)].bg,
+            gray,
+            "the bottom half took one stripe instead of averaging both"
+        );
     }
 
     #[test]
