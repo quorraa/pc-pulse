@@ -56,6 +56,11 @@ const LIVE_MAX_HZ: u32 = 8;
 /// Two left clicks on the same finding row within this window count as a
 /// double-click and open an investigation.
 const DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(400);
+/// The status line a running background conversion owns, and the prefix the
+/// worker's per-percent updates extend. Shared so that "is a conversion
+/// already speaking?" is a check against the real string rather than a
+/// second copy of it that could drift.
+const CONVERTING_STATUS: &str = "Converting background…";
 static CHAT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 fn new_conversation_id() -> String {
@@ -502,7 +507,10 @@ impl SettingField {
                  with ffmpeg (winget install ffmpeg); afterwards it costs almost nothing."
             }
             Self::ClientBackgroundQuality => {
-                "How much detail the background video keeps: low, medium, high (the default),                  or ultra. Sharper looks better and costs more disk for the converted clip and                  more CPU while it plays. Enter cycles; each quality is converted once, so                  changing this converts the video again at the new size."
+                "How much detail the background video keeps: low, medium, high (the default), \
+                 or ultra. Sharper looks better and costs more disk for the converted clip and \
+                 more CPU while it plays. Enter cycles; only the quality in use is kept on disk, \
+                 so switching converts the video again — including switching back."
             }
             Self::ClientBackgroundEnabled => {
                 "Whether the converted background video is drawn. Enter toggles; off keeps the \
@@ -1565,7 +1573,7 @@ impl App {
             changed = true;
             match event {
                 ConvertEvent::Progress(percent) => {
-                    self.status = format!("Converting background… {percent}%");
+                    self.status = format!("{CONVERTING_STATUS} {percent}%");
                     self.status_is_error = false;
                 }
                 ConvertEvent::Failed(message) => {
@@ -1602,11 +1610,21 @@ impl App {
         // A different cap is a different cache file, so it is a genuinely
         // new conversion and gets its own worker.
         if self.converting.as_ref() == Some(&(source.clone(), cap)) {
+            // Nothing starts, but the caller may be standing behind a
+            // status line that only a *starting* conversion would ever have
+            // cleared — the file dialog's "Choosing a video…" outlives this
+            // no-op otherwise, and sits there until something unrelated
+            // speaks. Say what is actually happening, without stepping on a
+            // percentage the running worker has already reported.
+            if !self.status.starts_with(CONVERTING_STATUS) {
+                self.status = CONVERTING_STATUS.into();
+                self.status_is_error = false;
+            }
             return;
         }
         self.converting = Some((source.clone(), cap));
         self.convert_rx = Some(clipconvert::spawn_convert(PathBuf::from(source), cap));
-        self.status = "Converting background…".into();
+        self.status = CONVERTING_STATUS.into();
         self.status_is_error = false;
     }
 
@@ -5266,6 +5284,40 @@ mod tests {
         wait_for_background(&mut app);
         assert!(app.background.is_some(), "status was {}", app.status);
         let _ = std::fs::remove_file(prefs_path);
+    }
+
+    #[test]
+    fn choosing_the_file_already_converting_does_not_strand_the_dialog_status() {
+        // The commit is a no-op — that same source is already converting at
+        // that same cap — but "Choosing a video…" was put up by the dialog
+        // and only a *starting* conversion would ever have replaced it. It
+        // used to sit there until something unrelated spoke.
+        let source = scratch_source("picker-already-converting");
+        let mut app = App::new_inert();
+        app.client_prefs.background_video = source.to_string_lossy().into_owned();
+        app.start_background_conversion();
+        let running = app.convert_rx.clone().expect("a conversion is in flight");
+
+        focus_video_row(&mut app);
+        let dialog = arm_picker(&mut app);
+        assert_eq!(app.status, "Choosing a video…");
+        dialog
+            .send(PickEvent::Picked(source.to_path_buf()))
+            .unwrap();
+        app.drain_events();
+
+        assert_eq!(app.status, "Converting background…");
+        assert!(!app.status_is_error);
+        assert!(
+            app.convert_rx.as_ref().unwrap().same_channel(&running),
+            "the running conversion was replaced"
+        );
+
+        // A percentage the worker has already reported is not stepped on by
+        // a later no-op commit.
+        app.status = "Converting background… 47%".into();
+        app.start_background_conversion();
+        assert_eq!(app.status, "Converting background… 47%");
     }
 
     #[test]
