@@ -936,17 +936,23 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
 /// color, its bottom half the background, so one cell carries two pixels.
 const VIDEO_GLYPH: &str = "▀";
 
-/// Pre-pass: fills the whole buffer with the current video frame, two
-/// vertically stacked pixels per cell. Runs before any page chrome, which
-/// then paints over whatever it means to be opaque.
+/// Pre-pass: seeds every cell's *background* with the current video frame, so
+/// anything drawn afterwards that sets no background of its own is already
+/// sitting on the video rather than on the flat backdrop.
+///
+/// Deliberately touches nothing but the background. The symbol and the
+/// foreground belong to whatever the UI is about to draw: `Block::render`
+/// calls `Buffer::set_style`, which rewrites fg and bg across the block's
+/// whole rect but leaves symbols alone, so a glyph painted here would survive
+/// inside every panel wearing `palette().text` — a bright slab over two
+/// thirds of the frame. The half-block trick therefore belongs in the
+/// post-pass, where a cell that is *still blank* is proof that nothing was
+/// drawn over it.
 fn paint_background(buffer: &mut Buffer, pixels: &[u8], grid: (u16, u16), dim_pct: u8) {
     let area = buffer.area;
     let flat = palette().bg;
     for_each_video_cell(area, pixels, grid, |x, y, top, bottom| {
-        let cell = &mut buffer[(x, y)];
-        cell.set_symbol(VIDEO_GLYPH);
-        cell.set_fg(dim_toward(top, flat, dim_pct));
-        cell.set_bg(dim_toward(bottom, flat, dim_pct));
+        buffer[(x, y)].set_bg(dim_toward(mean_pixel(top, bottom), flat, dim_pct));
     });
 }
 
@@ -962,27 +968,43 @@ fn paint_background(buffer: &mut Buffer, pixels: &[u8], grid: (u16, u16), dim_pc
 /// clip. Any other background — selection bars, severity chips, statusline
 /// accents — is a semantic choice and stays untouched.
 ///
-/// A glyph covers the full cell, so the background it sits on is the mean of
-/// the cell's two video pixels rather than just the lower one.
+/// Two kinds of cell come out of a draw, and they are resolved differently:
+///
+/// * **Still blank** — nothing was drawn here, so the cell can carry two
+///   pixels: `▀` with the top pixel in the foreground and the bottom pixel
+///   behind it, at full vertical resolution.
+/// * **Carrying a glyph** — the symbol and its color are the UI's, and are
+///   left alone; only the background changes, to the *mean* of the cell's two
+///   pixels, because one background has to stand in for both halves.
+///
+/// The blank/drawn split is decided on `symbol() == " "` after the page has
+/// drawn, which is the only sound test available: the UI draws `▀` itself
+/// (the broadsheet headline's block digits are built from `▀ ▄ █`), so "the
+/// cell holds the video glyph" would misread those as background.
 fn restore_background_bg(buffer: &mut Buffer, pixels: &[u8], grid: (u16, u16), dim_pct: u8) {
     let flat = palette().bg;
     let surface = palette().surface;
     let raised = palette().surface_raised;
     for_each_video_cell(buffer.area, pixels, grid, |x, y, top, bottom| {
+        let mean = mean_pixel(top, bottom);
+        // A cell nothing has drawn on still wears the pre-pass's seed, which
+        // is recomputed here rather than color-matched against the palette.
+        let seeded = dim_toward(mean, flat, dim_pct);
         let cell = &mut buffer[(x, y)];
         let target = match cell.bg {
             Color::Reset => flat,
-            bg if bg == flat => flat,
+            bg if bg == flat || bg == seeded => flat,
             bg if bg == surface => surface,
             bg if bg == raised => raised,
             _ => return,
         };
-        let mean = (
-            mean_channel(top.0, bottom.0),
-            mean_channel(top.1, bottom.1),
-            mean_channel(top.2, bottom.2),
-        );
-        cell.set_bg(dim_toward(mean, target, dim_pct));
+        if cell.symbol() == " " {
+            cell.set_symbol(VIDEO_GLYPH);
+            cell.set_fg(dim_toward(top, target, dim_pct));
+            cell.set_bg(dim_toward(bottom, target, dim_pct));
+        } else {
+            cell.set_bg(dim_toward(mean, target, dim_pct));
+        }
     });
 }
 
@@ -1003,8 +1025,15 @@ fn dim_toward(rgb: (u8, u8, u8), target: Color, dim_pct: u8) -> Color {
     Color::Rgb(lerp(rgb.0, tr), lerp(rgb.1, tg), lerp(rgb.2, tb))
 }
 
-fn mean_channel(top: u8, bottom: u8) -> u8 {
-    ((u16::from(top) + u16::from(bottom)) / 2) as u8
+/// The single color that stands in for a cell's two video pixels once a glyph
+/// covers the whole cell.
+fn mean_pixel(top: (u8, u8, u8), bottom: (u8, u8, u8)) -> (u8, u8, u8) {
+    let mean = |a: u8, b: u8| ((u16::from(a) + u16::from(b)) / 2) as u8;
+    (
+        mean(top.0, bottom.0),
+        mean(top.1, bottom.1),
+        mean(top.2, bottom.2),
+    )
 }
 
 /// Walks every cell of `area`, handing the visitor the nearest-neighbor
@@ -9552,19 +9581,52 @@ mod tests {
         }
     }
 
-    /// A two-frame clip on a 4x2 grid: small enough that the sampler has to
-    /// stretch every pixel across many cells, and with differing frames so
-    /// the player has something to loop over.
+    /// A two-frame clip whose rows alternate light and dark.
+    ///
+    /// The grid is two pixels tall per terminal row of the fixtures these
+    /// tests render (46 rows), so every cell's top and bottom pixel land on
+    /// *different* clip rows — with a flat frame the two halves would be
+    /// identical and every assertion about vertical resolution would pass
+    /// vacuously. The two frames swap the stripes so the player has something
+    /// to loop over.
     fn background_clip(name: &str) -> std::path::PathBuf {
+        const GRID_W: u16 = 4;
+        const GRID_H: u16 = 92;
         let dir = std::env::temp_dir().join(name);
         std::fs::create_dir_all(&dir).expect("clip directory");
-        let path = dir.join("two-frame.pulseclip");
+        let path = dir.join("striped.pulseclip");
         let mut writer =
-            crate::pulseclip::ClipWriter::create(&path, 4, 2, 2.0).expect("clip writer");
-        writer.push_frame(&[200u8; 4 * 2 * 3]).expect("frame 0");
-        writer.push_frame(&[40u8; 4 * 2 * 3]).expect("frame 1");
+            crate::pulseclip::ClipWriter::create(&path, GRID_W, GRID_H, 2.0).expect("clip writer");
+        let striped = |even: u8, odd: u8| {
+            (0..u32::from(GRID_H))
+                .flat_map(|row| {
+                    let value = if row % 2 == 0 { even } else { odd };
+                    std::iter::repeat_n(value, usize::from(GRID_W) * 3)
+                })
+                .collect::<Vec<u8>>()
+        };
+        writer.push_frame(&striped(200, 40)).expect("frame 0");
+        writer.push_frame(&striped(40, 200)).expect("frame 1");
         writer.finish().expect("finish clip");
         path
+    }
+
+    /// Every color the chrome paints with. A cell the UI left blank must come
+    /// out of the video passes wearing a *video* foreground; if it wears one
+    /// of these, the half-block glyph has been left behind over theme paint —
+    /// the bright slab this test exists to catch.
+    fn chrome_colors() -> [Color; 8] {
+        let p = palette();
+        [
+            p.bg,
+            p.surface,
+            p.surface_raised,
+            p.border,
+            p.border_hot,
+            p.text,
+            p.muted,
+            p.faint,
+        ]
     }
 
     fn app_with_background(clip: &std::path::Path) -> App {
@@ -9582,8 +9644,13 @@ mod tests {
         let with_bg = render(&mut app_with_background(&clip));
         let without = render(&mut sample_app());
 
+        let chrome = chrome_colors();
+        let layers = [palette().bg, palette().surface, palette().surface_raised];
         let mut video_backed_cells = 0;
         let mut two_pixel_cells = 0;
+        // Per chrome layer, so deleting any one of the post-pass's arms fails
+        // here instead of hiding behind the other two.
+        let mut per_layer = [0_usize; 3];
         for (a, b) in with_bg
             .buffer()
             .content()
@@ -9595,18 +9662,31 @@ mod tests {
             if b.symbol() != " " {
                 assert_eq!(a.symbol(), b.symbol(), "the video moved a glyph");
                 assert_eq!(a.fg, b.fg, "the video recolored drawn text");
-            } else if a.symbol() == VIDEO_GLYPH && a.fg != b.fg {
-                // A blank cell keeps both of its video pixels: top half in
-                // the foreground, bottom half behind it.
+            } else if a.symbol() == VIDEO_GLYPH {
+                // A cell the UI left blank now carries two pixels: the top in
+                // the foreground, the bottom behind it. Both must come from
+                // the clip — a chrome foreground here means the glyph was
+                // painted before the page drew and then re-colored by it.
+                assert!(
+                    !chrome.contains(&a.fg),
+                    "a blank cell kept the video glyph with chrome paint ({:?}) — \
+                     that is the bright-slab bug",
+                    a.fg
+                );
+                assert_ne!(a.fg, a.bg, "the two halves must stay independent");
                 two_pixel_cells += 1;
+            } else {
+                assert_eq!(a.symbol(), b.symbol(), "a blank cell grew a glyph");
             }
             // Every chrome layer carries the video; a semantic fill
             // (selection bar, severity chip, statusline accent) never does.
-            let chrome = [palette().bg, palette().surface, palette().surface_raised];
-            if b.bg != Color::Reset && !chrome.contains(&b.bg) {
+            if b.bg != Color::Reset && !layers.contains(&b.bg) {
                 assert_eq!(a.bg, b.bg, "a semantic fill was overpainted");
             } else if a.bg != b.bg {
                 video_backed_cells += 1;
+                if let Some(layer) = layers.iter().position(|color| *color == b.bg) {
+                    per_layer[layer] += 1;
+                }
             }
         }
         let total = with_bg.buffer().content().len();
@@ -9615,7 +9695,126 @@ mod tests {
             "the video reached only {video_backed_cells} of {total} cells — chrome \
              is meant to sit on it, not punch through it"
         );
-        assert!(two_pixel_cells > 0, "no blank cell kept its top pixel");
+        assert!(
+            two_pixel_cells * 2 > total,
+            "only {two_pixel_cells} of {total} cells carry both video pixels"
+        );
+        assert!(
+            per_layer.iter().all(|count| *count > 0),
+            "every chrome layer must carry the video, got {per_layer:?} for \
+             [bg, surface, surface_raised]"
+        );
+    }
+
+    /// A one-cell-tall strip whose cells all sample the same clip column, so
+    /// each cell's top pixel is the first grid row and its bottom pixel the
+    /// second — the sampler's behavior pinned down to exact colors.
+    fn video_strip(cells: u16) -> (Buffer, Vec<u8>, (u16, u16)) {
+        let mut pixels = vec![200u8; 3];
+        pixels.extend_from_slice(&[40u8; 3]);
+        (
+            Buffer::empty(Rect::new(0, 0, cells, 1)),
+            pixels,
+            (1_u16, 2_u16),
+        )
+    }
+
+    #[test]
+    fn post_pass_splits_blank_cells_and_leaves_drawn_glyphs_their_paint() {
+        let _theme = theme::test_support::activate(theme::ThemeId::Vitals);
+        let (mut buffer, pixels, grid) = video_strip(3);
+        // A blank cell, a drawn glyph on the flat backdrop, and a selection
+        // bar's blank cell — one of each kind the post-pass has to tell apart.
+        buffer[(1, 0)].set_symbol("X");
+        buffer[(1, 0)].set_fg(palette().text);
+        buffer[(1, 0)].set_bg(palette().bg);
+        buffer[(2, 0)].set_bg(palette().select_bg);
+
+        restore_background_bg(&mut buffer, &pixels, grid, 0);
+
+        // Blank: two pixels, full vertical resolution, no averaging.
+        assert_eq!(buffer[(0, 0)].symbol(), VIDEO_GLYPH);
+        assert_eq!(buffer[(0, 0)].fg, Color::Rgb(200, 200, 200));
+        assert_eq!(buffer[(0, 0)].bg, Color::Rgb(40, 40, 40));
+        // Drawn: the UI keeps the glyph and its color; only the background
+        // moves, to the mean of the two pixels.
+        assert_eq!(buffer[(1, 0)].symbol(), "X");
+        assert_eq!(buffer[(1, 0)].fg, palette().text);
+        assert_eq!(buffer[(1, 0)].bg, Color::Rgb(120, 120, 120));
+        // Semantic fill: nothing at all, not even a leftover glyph.
+        assert_eq!(buffer[(2, 0)].symbol(), " ");
+        assert_eq!(buffer[(2, 0)].bg, palette().select_bg);
+    }
+
+    #[test]
+    fn post_pass_dims_each_chrome_layer_toward_its_own_fill() {
+        let _theme = theme::test_support::activate(theme::ThemeId::Vitals);
+        let (mut buffer, pixels, grid) = video_strip(3);
+        buffer[(1, 0)].set_bg(palette().surface);
+        buffer[(2, 0)].set_bg(palette().surface_raised);
+
+        restore_background_bg(&mut buffer, &pixels, grid, 50);
+
+        for (cell, target) in [
+            ((0, 0), palette().bg),
+            ((1, 0), palette().surface),
+            ((2, 0), palette().surface_raised),
+        ] {
+            assert_eq!(buffer[cell].fg, dim_toward((200, 200, 200), target, 50));
+            assert_eq!(buffer[cell].bg, dim_toward((40, 40, 40), target, 50));
+        }
+    }
+
+    #[test]
+    fn pre_pass_seeds_only_the_background() {
+        let _theme = theme::test_support::activate(theme::ThemeId::Vitals);
+        let (mut buffer, pixels, grid) = video_strip(1);
+        buffer[(0, 0)].set_symbol("X");
+        buffer[(0, 0)].set_fg(palette().ok);
+
+        paint_background(&mut buffer, &pixels, grid, 0);
+
+        // Symbols and foregrounds belong to the UI: painting a glyph here is
+        // what produced the bright slab under every panel.
+        assert_eq!(buffer[(0, 0)].symbol(), "X");
+        assert_eq!(buffer[(0, 0)].fg, palette().ok);
+        assert_eq!(buffer[(0, 0)].bg, Color::Rgb(120, 120, 120));
+    }
+
+    #[test]
+    fn motion_cues_leave_the_video_layer_exactly_as_drawn() {
+        // The video makes every cell non-empty, so tachyonfx's
+        // `CellFilter::NonEmpty` cues now sweep the background as well as the
+        // text. That is accepted (see `restore_background_bg`); what must not
+        // happen is a cue leaving the video layer altered once it settles.
+        let _theme = theme::test_support::activate(theme::ThemeId::Vitals);
+        let clip = background_clip("ui-bg-motion");
+        let mut app = app_with_background(&clip);
+        let mut motion = crate::effects::MotionSystem::new(&app, true);
+        let mut terminal = Terminal::new(TestBackend::new(150, 46)).expect("terminal");
+        for _ in 0..80 {
+            if !motion.is_animating() {
+                break;
+            }
+            terminal
+                .draw(|frame| {
+                    draw(frame, &mut app);
+                    motion.render(frame, std::time::Duration::from_millis(100));
+                })
+                .expect("draw");
+            let _ = motion.take_cleanup_frame();
+        }
+        assert!(!motion.is_animating(), "the startup cue must settle");
+        terminal
+            .draw(|frame| {
+                draw(frame, &mut app);
+                motion.render(frame, std::time::Duration::from_millis(100));
+            })
+            .expect("draw");
+
+        let settled = terminal.backend().buffer().clone();
+        let plain = render(&mut app_with_background(&clip));
+        assert_eq!(&settled, plain.buffer(), "a cue altered the settled frame");
     }
 
     #[test]
