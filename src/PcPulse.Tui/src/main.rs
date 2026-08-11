@@ -189,6 +189,19 @@ fn print_text(value: &str) -> Result<()> {
     }
 }
 
+/// Opt the interactive UI back into color regardless of the inherited
+/// environment. The tray helper launches this process via ShellExecuteW, so
+/// the TUI inherits whatever environment the tray itself was started from —
+/// including a NO_COLOR left behind by a script or automation shell (field
+/// incident: a tray started from a test shell produced a monochrome TUI
+/// until it was manually restarted). Crossterm honors NO_COLOR by stripping
+/// every ANSI color sequence; the themes are the product, so the full-screen
+/// run always forces color output. The JSON/CLI subcommands never emit color
+/// and are unaffected.
+fn force_tui_colors() {
+    ratatui::crossterm::style::force_color_output(true);
+}
+
 fn run_tui(options: TuiOptions) -> Result<()> {
     // First thing, before any thread exists: load the per-user preferences
     // and feed the analyzer's existing env-var budget. An explicit
@@ -217,6 +230,7 @@ fn run_tui(options: TuiOptions) -> Result<()> {
     // failure degrades to the existing offline panel, and the pipe-retry
     // loop meets a freshly started service as it comes up.
     let healed = bootstrap::ensure_companions();
+    force_tui_colors();
     let mut terminal = ratatui::try_init()?;
     if let Err(error) = execute!(std::io::stdout(), EnableMouseCapture) {
         let _ = ratatui::try_restore();
@@ -376,4 +390,30 @@ fn run_loop(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod color_tests {
+    use ratatui::crossterm::style::{Color, Colored};
+
+    /// Reproduces the tray-launch incident end to end: NO_COLOR in the
+    /// inherited environment makes crossterm strip color sequences, and
+    /// force_tui_colors must win over it.
+    #[test]
+    fn interactive_run_forces_color_despite_inherited_no_color() {
+        // SAFETY: this test target has a single test, so nothing else reads
+        // the environment concurrently.
+        unsafe { std::env::set_var("NO_COLOR", "1") };
+        let stripped = format!("{}", Colored::ForegroundColor(Color::Green));
+        assert!(
+            stripped.is_empty(),
+            "expected NO_COLOR to strip the sequence, got {stripped:?}"
+        );
+        super::force_tui_colors();
+        let restored = format!("{}", Colored::ForegroundColor(Color::Green));
+        assert!(
+            !restored.is_empty(),
+            "force_tui_colors must override an inherited NO_COLOR"
+        );
+    }
 }

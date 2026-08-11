@@ -2,7 +2,7 @@
 param(
     [ValidateSet('x64')]
     [string]$Architecture = 'x64',
-    [string]$Version = '1.16.2',
+    [string]$Version = '1.16.3',
     [string]$CertificateThumbprint,
     [string]$TimestampUrl = 'http://timestamp.digicert.com',
     [switch]$SkipTests
