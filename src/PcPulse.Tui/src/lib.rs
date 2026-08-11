@@ -5,6 +5,7 @@ pub mod app;
 pub mod bootstrap;
 pub mod chat_history;
 pub mod client;
+pub mod clipconvert;
 pub mod crashdump;
 pub mod effects;
 pub mod format;
