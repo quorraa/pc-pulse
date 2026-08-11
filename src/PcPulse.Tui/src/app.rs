@@ -2449,25 +2449,38 @@ impl App {
     }
 
     /// Record one smooth frame's cost against its budget. On the third
-    /// consecutive overrun the session drops a tier (60 → 30 → off) and the
-    /// footer says so; returns `true` so the loop can repaint the message.
+    /// consecutive overrun something has to give, and the cheapest thing to
+    /// give up goes first: a *shown* video background halves its playback
+    /// rate, and only once it is at its 2 fps floor — or absent, or hidden,
+    /// in which case it costs nothing to draw and slowing it would relieve
+    /// nothing — does the session drop a refresh tier (60 → 30 → off).
+    /// Either way the footer says so and `true` comes back so the loop can
+    /// repaint the message.
     pub fn note_smooth_frame(&mut self, cost: Duration, budget: Duration) -> bool {
         let current = self.effective_refresh_fps();
         if current == 0 {
             return false;
         }
-        match self.smooth.note_frame(cost, budget, current) {
-            Some(next) => {
-                self.sync_live_polling();
-                self.status = format!(
-                    "Refresh reduced to {} — frame budget exceeded",
-                    refresh_label(next)
-                );
-                self.status_is_error = false;
-                true
-            }
-            None => false,
+        if !self.smooth.note_frame(cost, budget) {
+            return false;
         }
+        if self.client_prefs.background_enabled
+            && let Some(background) = self.background.as_mut()
+            && background.downshift()
+        {
+            let fps = background.effective_fps();
+            self.status = format!("background rate lowered to {fps} fps (frame budget)");
+            self.status_is_error = false;
+            return true;
+        }
+        let next = self.smooth.drop_tier(current);
+        self.sync_live_polling();
+        self.status = format!(
+            "Refresh reduced to {} — frame budget exceeded",
+            refresh_label(next)
+        );
+        self.status_is_error = false;
+        true
     }
 
     /// Eased tween progress for the current frame; exactly `1.0` whenever
@@ -5116,6 +5129,87 @@ mod tests {
         assert!(app.status_is_error, "status was {}", app.status);
         assert!(app.background.is_none());
         assert!(app.convert_rx.is_none(), "the receiver is dropped");
+    }
+
+    /// An app whose cached clip is loaded and whose refresh preference is
+    /// the top tier, so the frame governor has somewhere to fall.
+    fn app_with_background_and_smooth(tag: &str) -> (App, std::path::PathBuf) {
+        let source = scratch_background(tag, 60.0);
+        let mut app = App::new_inert();
+        app.adopt_client_prefs(
+            UiPrefs {
+                background_video: source.to_string_lossy().into_owned(),
+                refresh_fps: 60,
+                ..UiPrefs::default()
+            },
+            None,
+        );
+        assert!(app.background.is_some(), "status was {}", app.status);
+        (app, source)
+    }
+
+    #[test]
+    fn budget_overruns_downshift_the_background_before_the_ui_tier() {
+        let (mut app, source) = app_with_background_and_smooth("guardrail");
+        assert_eq!(app.effective_refresh_fps(), 60);
+        assert_eq!(app.background.as_ref().unwrap().effective_fps(), 60);
+
+        let over = Duration::from_millis(50);
+        let budget = Duration::from_millis(16);
+        // Three consecutive overruns is exactly one governor trip; the
+        // counter rearms itself on firing.
+        for _ in 0..3 {
+            app.note_smooth_frame(over, budget);
+        }
+        assert_eq!(
+            app.effective_refresh_fps(),
+            60,
+            "UI tier must survive the first trip"
+        );
+        assert_eq!(app.background.as_ref().unwrap().effective_fps(), 30);
+        assert_eq!(
+            app.status,
+            "background rate lowered to 30 fps (frame budget)"
+        );
+        assert!(!app.status_is_error);
+
+        // Drive the background to its floor; the UI tier is untouched the
+        // whole way down.
+        while app.background.as_ref().unwrap().effective_fps() > 2 {
+            for _ in 0..3 {
+                app.note_smooth_frame(over, budget);
+            }
+            assert_eq!(app.effective_refresh_fps(), 60);
+        }
+
+        // At the floor the background has nothing left to give, so the next
+        // trip drops the UI tier with the existing message.
+        for _ in 0..3 {
+            app.note_smooth_frame(over, budget);
+        }
+        assert_eq!(app.effective_refresh_fps(), 30);
+        assert_eq!(app.background.as_ref().unwrap().effective_fps(), 2);
+        assert_eq!(
+            app.status,
+            "Refresh reduced to 30 fps — frame budget exceeded"
+        );
+        let _ = std::fs::remove_file(source);
+    }
+
+    #[test]
+    fn a_hidden_background_does_not_absorb_the_budget_trip() {
+        let (mut app, source) = app_with_background_and_smooth("guardrail-hidden");
+        app.client_prefs.background_enabled = false;
+        let over = Duration::from_millis(50);
+        let budget = Duration::from_millis(16);
+        for _ in 0..3 {
+            app.note_smooth_frame(over, budget);
+        }
+        // Nothing is drawing the clip, so slowing it would relieve nothing:
+        // the trip has to reach the UI tier.
+        assert_eq!(app.background.as_ref().unwrap().effective_fps(), 60);
+        assert_eq!(app.effective_refresh_fps(), 30);
+        let _ = std::fs::remove_file(source);
     }
 
     #[test]

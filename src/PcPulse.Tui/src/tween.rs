@@ -285,20 +285,21 @@ impl SmoothState {
         self.previous.gauges.get(key).copied()
     }
 
-    /// Record one smooth frame's cost. Returns `Some(next_tier)` when the
-    /// governor demands a downgrade; the cap sticks for the session.
-    pub fn note_frame(
-        &mut self,
-        cost: Duration,
-        budget: Duration,
-        current_fps: u32,
-    ) -> Option<u32> {
-        if self.governor.note_frame(cost, budget) {
-            let next = next_tier(current_fps);
-            self.session_cap = Some(next);
-            return Some(next);
-        }
-        None
+    /// Record one smooth frame's cost. Returns `true` when the governor
+    /// demands relief — but imposes none itself, because the refresh tier
+    /// is not the only thing the caller can give up (the video background
+    /// slows down first). Call [`drop_tier`](Self::drop_tier) for the
+    /// refresh-tier response.
+    pub fn note_frame(&mut self, cost: Duration, budget: Duration) -> bool {
+        self.governor.note_frame(cost, budget)
+    }
+
+    /// Step the session down one refresh tier and return the new one. The
+    /// cap sticks until an explicit preference change lifts it.
+    pub fn drop_tier(&mut self, current_fps: u32) -> u32 {
+        let next = next_tier(current_fps);
+        self.session_cap = Some(next);
+        next
     }
 
     pub fn session_cap(&self) -> Option<u32> {
@@ -510,14 +511,21 @@ mod tests {
         let over = Duration::from_millis(40);
         let mut smooth = SmoothState::default();
         for _ in 0..2 {
-            assert_eq!(smooth.note_frame(over, budget, 60), None);
+            assert!(!smooth.note_frame(over, budget));
         }
-        assert_eq!(smooth.note_frame(over, budget, 60), Some(30));
+        assert!(smooth.note_frame(over, budget));
+        assert_eq!(
+            smooth.session_cap(),
+            None,
+            "the trip caps nothing by itself"
+        );
+        assert_eq!(smooth.drop_tier(60), 30);
         assert_eq!(smooth.session_cap(), Some(30));
         for _ in 0..2 {
-            assert_eq!(smooth.note_frame(over, budget, 30), None);
+            assert!(!smooth.note_frame(over, budget));
         }
-        assert_eq!(smooth.note_frame(over, budget, 30), Some(0));
+        assert!(smooth.note_frame(over, budget));
+        assert_eq!(smooth.drop_tier(30), 0);
         assert_eq!(smooth.session_cap(), Some(0));
         smooth.reset_session();
         assert_eq!(smooth.session_cap(), None);
