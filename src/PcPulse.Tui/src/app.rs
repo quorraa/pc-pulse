@@ -1129,6 +1129,14 @@ pub struct App {
     /// `None` — the default, and what every headless test uses — means the
     /// renderer's background passes are skipped entirely.
     pub background: Option<crate::background::Background>,
+    /// The renderer's memo of the video frame resampled onto the current
+    /// terminal geometry. It lives here rather than inside `Background`
+    /// because it is keyed on the *terminal*, not the clip: the player knows
+    /// nothing of `Rect`s, and a cache the player owned would have to be
+    /// invalidated by every resize from the outside anyway. Keyed on the
+    /// player's generation, so replacing `background` above retires it with
+    /// no bookkeeping here.
+    pub background_resample: crate::ui::VideoResample,
     /// The live one-time ffmpeg conversion, while one is running. `drain_events`
     /// polls it and drops it the moment the worker reports `Done` or `Failed`,
     /// so `is_some()` is exactly "a conversion is in flight".
@@ -1250,6 +1258,7 @@ impl App {
             help_overlay: None,
             client_prefs: UiPrefs::default(),
             background: None,
+            background_resample: crate::ui::VideoResample::default(),
             convert_rx: None,
             converting: None,
             prefs_store: None,

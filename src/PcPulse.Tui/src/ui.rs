@@ -905,16 +905,25 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     // Last, once the page has drawn: the video can only tell chrome from
     // content by reading what the page left in the buffer. `current_pixels`
     // memoizes on the frame index, so this borrows the player's own buffer
-    // rather than copying a quarter-megabyte frame out of it per draw.
+    // rather than copying a megabyte frame out of it per draw; the resample
+    // cache is a disjoint field borrow of `app` alongside it.
     let dim = app.client_prefs.background_dim;
-    if let Some(background) = app
-        .background
-        .as_mut()
-        .filter(|_| app.client_prefs.background_enabled)
-    {
+    let enabled = app.client_prefs.background_enabled;
+    if let Some(background) = app.background.as_mut().filter(|_| enabled) {
         let grid = background.grid();
+        let id = VideoFrameId {
+            generation: background.generation(),
+            index: background.current_index(),
+        };
         let pixels = background.current_pixels();
-        restore_background_bg(frame.buffer_mut(), pixels, grid, dim);
+        restore_background_bg(
+            frame.buffer_mut(),
+            &mut app.background_resample,
+            id,
+            pixels,
+            grid,
+            dim,
+        );
     }
 }
 
@@ -971,27 +980,116 @@ const VIDEO_GLYPH: &str = "▀";
 /// 3. nothing accumulates — every frame redraws from scratch and the effect
 ///    manager forces a cleanup base render when the last effect ends. That
 ///    part is pinned by `motion_cues_leave_the_video_layer_exactly_as_drawn`.
-fn restore_background_bg(buffer: &mut Buffer, pixels: &[u8], grid: (u16, u16), dim_pct: u8) {
+fn restore_background_bg(
+    buffer: &mut Buffer,
+    resample: &mut VideoResample,
+    frame: VideoFrameId,
+    pixels: &[u8],
+    grid: (u16, u16),
+    dim_pct: u8,
+) {
+    let area = buffer.area;
+    let cells = resample.cells(frame, area, pixels, grid);
+    // Empty is the sampler's "this frame is unusable" answer, and any other
+    // mismatch would mean painting cells with another geometry's colors.
+    if cells.len() != usize::from(area.width) * usize::from(area.height) {
+        return;
+    }
     let flat = palette().bg;
     let surface = palette().surface;
     let raised = palette().surface_raised;
-    for_each_video_cell(buffer.area, pixels, grid, |x, y, top, bottom| {
-        let cell = &mut buffer[(x, y)];
-        let target = match cell.bg {
-            Color::Reset => flat,
-            bg if bg == flat => flat,
-            bg if bg == surface => surface,
-            bg if bg == raised => raised,
-            _ => return,
-        };
-        if cell.symbol() == " " {
-            cell.set_symbol(VIDEO_GLYPH);
-            cell.set_fg(dim_toward(top, target, dim_pct));
-            cell.set_bg(dim_toward(bottom, target, dim_pct));
-        } else {
-            cell.set_bg(dim_toward(mean_pixel(top, bottom), target, dim_pct));
+    let mut sampled = cells.iter();
+    for y in area.y..area.y + area.height {
+        for x in area.x..area.x + area.width {
+            // Row-major, exactly the order `resample_video_cells` fills.
+            let Some(&(top, bottom)) = sampled.next() else {
+                return;
+            };
+            let cell = &mut buffer[(x, y)];
+            let target = match cell.bg {
+                Color::Reset => flat,
+                bg if bg == flat => flat,
+                bg if bg == surface => surface,
+                bg if bg == raised => raised,
+                _ => continue,
+            };
+            if cell.symbol() == " " {
+                cell.set_symbol(VIDEO_GLYPH);
+                cell.set_fg(dim_toward(top, target, dim_pct));
+                cell.set_bg(dim_toward(bottom, target, dim_pct));
+            } else {
+                cell.set_bg(dim_toward(mean_pixel(top, bottom), target, dim_pct));
+            }
         }
-    });
+    }
+}
+
+/// The two video colors one terminal cell carries: its top half's, then its
+/// bottom half's.
+type VideoCell = ((u8, u8, u8), (u8, u8, u8));
+
+/// Which video frame a resample was taken from: the player that loaded it,
+/// and the frame index within that player's clip. The generation is what
+/// keeps two clips that happen to share a frame index apart.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct VideoFrameId {
+    generation: u64,
+    index: u32,
+}
+
+/// The per-draw memo for `resample_video_cells`.
+///
+/// Sampling is the expensive half of the video post-pass and its cost scales
+/// with the *clip*, not the terminal: every source pixel is read once per
+/// draw, so a 825x464 capture is 383 K pixel reads, 1.1 M byte loads, sixty
+/// times a second in smooth mode. None of that work changes between draws
+/// unless the video frame advances, the terminal is resized, or the clip is
+/// swapped — which is exactly this cache's key.
+///
+/// What deliberately stays outside the key, and therefore per-draw, is the
+/// dim lerp: `background_dim` and the active theme can both change between
+/// any two draws, and folding either into the cached colors would freeze a
+/// stale palette onto the screen until the next frame tick. So the cache
+/// holds the *video's* colors and the painter still lerps every cell toward
+/// its chrome target on every draw — a few multiplies per cell against the
+/// hundreds of byte loads the cache removes.
+#[derive(Default)]
+pub struct VideoResample {
+    key: Option<(VideoFrameId, Rect, (u16, u16))>,
+    cells: Vec<VideoCell>,
+    /// Counts real resamples, for the test that proves the cache is hit.
+    #[cfg(test)]
+    resamples: u32,
+}
+
+impl VideoResample {
+    /// The sampled colors for every cell of `area`, recomputed only when the
+    /// frame, the geometry, or the clip has moved on.
+    fn cells(
+        &mut self,
+        frame: VideoFrameId,
+        area: Rect,
+        pixels: &[u8],
+        grid: (u16, u16),
+    ) -> &[VideoCell] {
+        let key = (frame, area, grid);
+        if self.key != Some(key) {
+            #[cfg(test)]
+            {
+                self.resamples += 1;
+            }
+            resample_video_cells(area, pixels, grid, &mut self.cells);
+            self.key = Some(key);
+        }
+        &self.cells
+    }
+
+    /// How many times the sampler actually ran, so a test can prove a
+    /// repeated draw served the cache.
+    #[cfg(test)]
+    pub fn resamples_for_test(&self) -> u32 {
+        self.resamples
+    }
 }
 
 /// Lerps a video pixel `dim_pct` of the way toward `target` — the theme color
@@ -1022,15 +1120,19 @@ fn mean_pixel(top: (u8, u8, u8), bottom: (u8, u8, u8)) -> (u8, u8, u8) {
     )
 }
 
-/// Walks every cell of `area`, handing the visitor the video colors for that
-/// cell's top and bottom halves. Keeping the sampling math and its bounds
-/// guards here leaves the painter to decide only what to do with the two
-/// colors.
+/// Fills `out` with the video colors for every cell of `area`, in row-major
+/// order — one entry per cell, top half then bottom half. Keeping the
+/// sampling math and its bounds guards here leaves the painter to decide only
+/// what to do with the two colors, and leaves `VideoResample` free to hold
+/// the answer across draws.
+///
+/// `out` is emptied when the frame cannot be sampled at all, which is the
+/// caller's signal to paint nothing rather than to paint black.
 ///
 /// Sampling is a box filter, not a nearest-neighbor pick: each half-cell
-/// averages *every* source pixel inside the region it covers. The capture
-/// grid is deliberately finer than any terminal (416x232 against, say,
-/// 200x100 half-rows), so one half-cell usually covers several source pixels
+/// averages *every* source pixel inside the region it covers. The capture is
+/// deliberately finer than any terminal (up to 832x464 against, say, 200x100
+/// half-rows), so one half-cell usually covers several source pixels
 /// and picking one of them threw the rest away — thin bright detail either
 /// dominated a cell or vanished from it depending on where the rounding
 /// landed. Averaging keeps that detail as tone.
@@ -1042,12 +1144,8 @@ fn mean_pixel(top: (u8, u8, u8), bottom: (u8, u8, u8)) -> (u8, u8, u8) {
 ///
 /// The arithmetic is integer throughout and allocation-free: three `u32`
 /// accumulators per half-cell, reset per half-cell rather than collected.
-fn for_each_video_cell(
-    area: Rect,
-    pixels: &[u8],
-    grid: (u16, u16),
-    mut visit: impl FnMut(u16, u16, (u8, u8, u8), (u8, u8, u8)),
-) {
+fn resample_video_cells(area: Rect, pixels: &[u8], grid: (u16, u16), out: &mut Vec<VideoCell>) {
+    out.clear();
     let (grid_w, grid_h) = (u32::from(grid.0), u32::from(grid.1));
     if grid_w == 0 || grid_h == 0 || area.is_empty() {
         return;
@@ -1057,6 +1155,7 @@ fn for_each_video_cell(
     if pixels.len() < (grid_w * grid_h * 3) as usize {
         return;
     }
+    out.reserve(usize::from(area.width) * usize::from(area.height));
     /// The half-open source range cell `index` of `cells` covers along an
     /// axis `extent` pixels long, never empty: when the cell is narrower
     /// than one pixel the range widens to the single pixel it sits on.
@@ -1089,12 +1188,7 @@ fn for_each_video_cell(
         let bottom = span(u32::from(cy) * 2 + 1, half_rows, grid_h);
         for cx in 0..area.width {
             let column = span(u32::from(cx), cols, grid_w);
-            visit(
-                area.x + cx,
-                area.y + cy,
-                average(column, top),
-                average(column, bottom),
-            );
+            out.push((average(column, top), average(column, bottom)));
         }
     }
 }
@@ -9635,6 +9729,66 @@ mod tests {
         path
     }
 
+    #[test]
+    #[ignore = "dev harness: prices the video post-pass cached against uncached; run with --ignored --nocapture"]
+    fn dev_bench_video_post_pass() {
+        const DRAWS: usize = 2_000;
+        let _theme = theme::test_support::activate(theme::ThemeId::Vitals);
+        // Content, not a flat fill: a flat frame would let the box filter's
+        // inner loop stay in cache in a way real footage never does.
+        let captures: [(u16, u16); 3] = [(416, 232), (640, 360), (825, 464)];
+        let sizes: [(u16, u16); 3] = [(120, 36), (170, 48), (200, 60)];
+        println!(
+            "{:<10} {:<9} {:>10} {:>12} {:>12} {:>10}",
+            "capture", "terminal", "cells", "uncached_us", "cached_us", "cache_KB"
+        );
+        for (grid_w, grid_h) in captures {
+            let pixels: Vec<u8> = (0..usize::from(grid_w) * usize::from(grid_h) * 3)
+                .map(|byte| (byte.wrapping_mul(37) >> 3) as u8)
+                .collect();
+            for (width, height) in sizes {
+                let mut resample = VideoResample::default();
+                let mut buffer = Buffer::empty(Rect::new(0, 0, width, height));
+                let mut time = |resample: &mut VideoResample, advance: bool| {
+                    let mut total = std::time::Duration::ZERO;
+                    for step in 0..DRAWS {
+                        let frame = VideoFrameId {
+                            generation: 1,
+                            index: if advance { step as u32 } else { 0 },
+                        };
+                        // Re-blanked between draws so the post-pass sees the
+                        // blank chrome cells it really sees, and outside the
+                        // clock so the reset is not charged to it.
+                        buffer.reset();
+                        let started = std::time::Instant::now();
+                        restore_background_bg(
+                            &mut buffer,
+                            resample,
+                            frame,
+                            &pixels,
+                            (grid_w, grid_h),
+                            30,
+                        );
+                        total += started.elapsed();
+                    }
+                    total.as_secs_f64() * 1_000_000.0 / DRAWS as f64
+                };
+                let uncached = time(&mut resample, true);
+                let cached = time(&mut resample, false);
+                let cells = usize::from(width) * usize::from(height);
+                println!(
+                    "{:<10} {:<9} {:>10} {:>12.1} {:>12.1} {:>10.1}",
+                    format!("{grid_w}x{grid_h}"),
+                    format!("{width}x{height}"),
+                    cells,
+                    uncached,
+                    cached,
+                    (cells * std::mem::size_of::<VideoCell>()) as f64 / 1024.0
+                );
+            }
+        }
+    }
+
     /// Every color the chrome paints with. A cell the UI left blank must come
     /// out of the video passes wearing a *video* foreground; if it wears one
     /// of these, the half-block glyph has been left behind over theme paint —
@@ -9730,6 +9884,23 @@ mod tests {
         );
     }
 
+    /// Paints `pixels` onto `buffer` through the real post-pass with a
+    /// throwaway resample cache, for tests about *what* gets painted rather
+    /// than about the caching.
+    fn paint_background(buffer: &mut Buffer, pixels: &[u8], grid: (u16, u16), dim_pct: u8) {
+        restore_background_bg(
+            buffer,
+            &mut VideoResample::default(),
+            VideoFrameId {
+                generation: 1,
+                index: 0,
+            },
+            pixels,
+            grid,
+            dim_pct,
+        );
+    }
+
     /// A one-cell-tall strip whose cells all sample the same clip column, so
     /// each cell's top pixel is the first grid row and its bottom pixel the
     /// second — the sampler's behavior pinned down to exact colors.
@@ -9754,7 +9925,7 @@ mod tests {
         buffer[(1, 0)].set_bg(palette().bg);
         buffer[(2, 0)].set_bg(palette().select_bg);
 
-        restore_background_bg(&mut buffer, &pixels, grid, 0);
+        paint_background(&mut buffer, &pixels, grid, 0);
 
         // Blank: two pixels, full vertical resolution, no averaging.
         assert_eq!(buffer[(0, 0)].symbol(), VIDEO_GLYPH);
@@ -9785,7 +9956,7 @@ mod tests {
         }
         let mut buffer = Buffer::empty(Rect::new(0, 0, 1, 1));
 
-        restore_background_bg(&mut buffer, &pixels, (2, 2), 0);
+        paint_background(&mut buffer, &pixels, (2, 2), 0);
 
         let gray = Color::Rgb(128, 128, 128);
         assert_eq!(buffer[(0, 0)].symbol(), VIDEO_GLYPH);
@@ -9802,13 +9973,144 @@ mod tests {
     }
 
     #[test]
+    fn downsampling_averages_the_covered_rows_and_not_just_the_columns() {
+        let _theme = theme::test_support::activate(theme::ThemeId::Vitals);
+        // The x-axis test above puts exactly one source *row* under each
+        // half-cell, so it never exercises the vertical half of the box
+        // filter. This one does the opposite: a 1x4 clip of horizontal
+        // stripes into a single cell gives each half-cell two source rows and
+        // one column, so only row averaging can produce the middle tone.
+        let mut pixels = Vec::new();
+        for row in 0..4 {
+            pixels.extend_from_slice(&[if row % 2 == 0 { 0_u8 } else { 255_u8 }; 3]);
+        }
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 1, 1));
+
+        paint_background(&mut buffer, &pixels, (1, 4), 0);
+
+        let gray = Color::Rgb(128, 128, 128);
+        assert_eq!(buffer[(0, 0)].symbol(), VIDEO_GLYPH);
+        assert_eq!(
+            buffer[(0, 0)].fg,
+            gray,
+            "the top half took row 0 instead of averaging rows 0 and 1"
+        );
+        assert_eq!(
+            buffer[(0, 0)].bg,
+            gray,
+            "the bottom half took row 2 instead of averaging rows 2 and 3"
+        );
+    }
+
+    #[test]
+    fn the_resample_is_reused_until_the_frame_geometry_or_clip_moves_on() {
+        let _theme = theme::test_support::activate(theme::ThemeId::Vitals);
+        // Sampling reads every source pixel, so at a 640x360 capture it is
+        // 230 K pixel reads — per draw, 60 times a second, for a picture that
+        // only changes at the clip's own fps. Nothing but the frame, the
+        // terminal geometry, and the clip identity can change the answer.
+        let (grid, pixels) = (
+            (8_u16, 8_u16),
+            (0..8 * 8 * 3).map(|byte| byte as u8).collect::<Vec<u8>>(),
+        );
+        let mut resample = VideoResample::default();
+        let frame = VideoFrameId {
+            generation: 4,
+            index: 7,
+        };
+        let paint = |resample: &mut VideoResample, frame, width, height| {
+            let mut buffer = Buffer::empty(Rect::new(0, 0, width, height));
+            restore_background_bg(&mut buffer, resample, frame, &pixels, grid, 30);
+            buffer
+        };
+
+        let first = paint(&mut resample, frame, 6, 3);
+        assert_eq!(resample.resamples_for_test(), 1);
+        let second = paint(&mut resample, frame, 6, 3);
+        assert_eq!(
+            resample.resamples_for_test(),
+            1,
+            "the same frame at the same size resampled again"
+        );
+        assert_eq!(
+            first, second,
+            "the cached resample painted a different frame"
+        );
+
+        // The frame ticking on must resample...
+        let advanced = VideoFrameId { index: 8, ..frame };
+        let _ = paint(&mut resample, advanced, 6, 3);
+        assert_eq!(
+            resample.resamples_for_test(),
+            2,
+            "an advanced frame reused a stale resample"
+        );
+
+        // ...as must a resize, at the same frame...
+        let resized = paint(&mut resample, advanced, 9, 4);
+        assert_eq!(
+            resample.resamples_for_test(),
+            3,
+            "a resize reused a stale resample"
+        );
+        assert_eq!(resized.area, Rect::new(0, 0, 9, 4));
+
+        // ...and so must a different clip that happens to sit on the same
+        // frame index at the same size.
+        let swapped = VideoFrameId {
+            generation: 5,
+            index: 8,
+        };
+        let _ = paint(&mut resample, swapped, 9, 4);
+        assert_eq!(
+            resample.resamples_for_test(),
+            4,
+            "a swapped clip was painted from the previous clip's resample"
+        );
+    }
+
+    #[test]
+    fn a_cached_resample_still_follows_the_live_dim_setting() {
+        let _theme = theme::test_support::activate(theme::ThemeId::Vitals);
+        // The cache holds the video's own colors; the lerp toward the theme
+        // has to stay per-draw, because `background_dim` can move between any
+        // two draws and a cached lerp would freeze the old strength on screen
+        // until the clip's next frame.
+        let (_, pixels, grid) = video_strip(1);
+        let mut resample = VideoResample::default();
+        let frame = VideoFrameId {
+            generation: 1,
+            index: 0,
+        };
+        let mut at = |dim| {
+            let mut buffer = Buffer::empty(Rect::new(0, 0, 1, 1));
+            restore_background_bg(&mut buffer, &mut resample, frame, &pixels, grid, dim);
+            buffer[(0, 0)].clone()
+        };
+
+        let bright = at(0);
+        let dimmed = at(80);
+        assert_eq!(bright.fg, Color::Rgb(200, 200, 200));
+        assert_eq!(dimmed.fg, dim_toward((200, 200, 200), palette().bg, 80));
+        assert_ne!(
+            bright.fg, dimmed.fg,
+            "the dim setting was baked into the cached resample"
+        );
+        assert_eq!(
+            resample.resamples_for_test(),
+            1,
+            "changing the dim must not cost a resample"
+        );
+    }
+
+    #[test]
     fn post_pass_dims_each_chrome_layer_toward_its_own_fill() {
         let _theme = theme::test_support::activate(theme::ThemeId::Vitals);
         let (mut buffer, pixels, grid) = video_strip(3);
         buffer[(1, 0)].set_bg(palette().surface);
         buffer[(2, 0)].set_bg(palette().surface_raised);
 
-        restore_background_bg(&mut buffer, &pixels, grid, 50);
+        paint_background(&mut buffer, &pixels, grid, 50);
 
         for (cell, target) in [
             ((0, 0), palette().bg),

@@ -2,7 +2,8 @@
 //! background cache.
 //!
 //! A video is converted exactly once: `ffmpeg.exe` is probed for its banner
-//! (fps/duration), then re-invoked to stream raw RGB frames on stdout —
+//! (fps, duration, and the source's own pixel size, which decides the
+//! capture size), then re-invoked to stream raw RGB frames on stdout —
 //! `mute`d and handed to `ClipWriter` one at a time so a multi-minute source
 //! never sits fully decoded in memory. The whole thing runs on a detached
 //! worker thread, mirroring `analyzer.rs`'s Codex worker: the caller gets a
@@ -13,18 +14,24 @@
 //!
 //! ## What a cache file costs
 //!
-//! A 416x232 frame is 290 KB raw, but `pulseclip` quantizes it to one byte
-//! per pixel and deflates that, so what lands on disk is 6.5-13 KB per
-//! frame — the low end for flat or synthetic footage, the high end for busy
-//! live action. At 60 fps that is roughly 0.4-0.8 MB per second of video: a
-//! 3-minute 60 fps clip is a 70-140 MB cache file, and a 15 s 30 fps clip
-//! about 3 MB.
+//! Capture size follows the source (see `capture_dims`), so cost does too.
+//! `pulseclip` quantizes each frame to one byte per pixel and deflates it,
+//! and what that compresses to depends almost entirely on the footage:
+//! measured through this pipeline, **0.05 bytes/pixel** for flat or
+//! synthetic content and **0.17 bytes/pixel** for dense detail, with
+//! per-pixel film grain — which deflate cannot do anything with — reaching
+//! 0.4.
 //!
-//! Those are measured through this pipeline rather than derived. Doubling
-//! each grid axis (208x116 -> 416x232) quadrupled the pixels but only
-//! multiplied the cache by ~3.2x: the same footage compresses to 0.16
-//! bytes/pixel at the coarse grid and 0.14 at the fine one, because finer
-//! sampling gives deflate more neighbouring-pixel redundancy to exploit.
+//! In frames, that is 12-39 KB at the 640x360 an SD source keeps and 20-66 KB
+//! at the 825x464 a 1080p source is fitted to. At 60 fps: **1-4 MB per second
+//! of video**, so a 3-minute 60 fps clip is a 200-700 MB cache file, and a
+//! 15 s 30 fps SD clip about 7 MB.
+//!
+//! Bytes/pixel falls as the capture gets finer — the same footage costs 0.164
+//! at 208x116 and 0.135 at 416x232 — because finer sampling gives deflate
+//! more neighbouring-pixel redundancy to exploit. It falls nowhere near fast
+//! enough to pay for the pixels, though: raising the ceiling is a real disk
+//! cost, not a free one.
 
 use crate::pulseclip::{ClipReader, ClipWriter, mute};
 use anyhow::{Context, Result, anyhow, bail};
@@ -38,19 +45,31 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
 
-/// Fixed capture grid: coarse enough that full video decoding at source
-/// resolution would be wasted work once everything is redrawn as half-block
-/// terminal cells, but fine enough that a full-screen terminal downsamples
-/// the clip rather than magnifying it. `GRID_H` must stay even — the
-/// renderer consumes two vertical pixels per cell.
-pub const GRID_W: u16 = 416;
-pub const GRID_H: u16 = 232;
+/// The conversion ceiling, not the conversion size. A clip is captured at
+/// its *own* resolution shrunk to fit inside this box with its aspect ratio
+/// intact — never stretched, never magnified. The box is deliberately finer
+/// than any terminal (a full-screen 200x60 window is 200x120 half-cells), so
+/// the renderer always downsamples the clip and averages detail into tone
+/// rather than magnifying a coarse capture into blocks.
+///
+/// `CAP_H` is even, and so is every height derived from it: the renderer
+/// consumes two vertical pixels per cell, so an odd height would leave a
+/// half-cell row with nothing to sample.
+pub const CAP_W: u16 = 832;
+pub const CAP_H: u16 = 464;
 
 /// Windows' own flag: the spawned ffmpeg gets no console window, matching
 /// the `DETACHED_PROCESS`-style spawns elsewhere in this crate.
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
-const FRAME_LEN: usize = GRID_W as usize * GRID_H as usize * 3;
+/// Raw RGB bytes in one frame at `dims`. ffmpeg streams fixed-size frames
+/// with no framing of their own, so this number *is* the frame boundary:
+/// getting it wrong desynchronizes the stream rather than failing loudly,
+/// which is why the dimensions are computed here and handed to ffmpeg as
+/// literals instead of being left for ffmpeg to derive.
+fn frame_len(dims: (u16, u16)) -> usize {
+    usize::from(dims.0) * usize::from(dims.1) * 3
+}
 
 /// Progress reported by the conversion worker thread.
 pub enum ConvertEvent {
@@ -91,9 +110,15 @@ pub fn backgrounds_dir() -> Result<PathBuf> {
 }
 
 /// The deterministic cache path for `source`: `{backgrounds_dir}\{hash}.pulseclip`,
-/// keyed on the source path, its mtime, and the capture grid so a changed
-/// file (or a grid-size change in a future release) reconverts instead of
-/// serving a stale cache.
+/// keyed on the source path, its mtime, and the resolution *cap* so a changed
+/// file (or a cap change in a future release) reconverts instead of serving a
+/// stale cache.
+///
+/// The cap, not the converted size: the converted size is a pure function of
+/// (source dimensions, cap), and the source's dimensions cannot change
+/// without its mtime changing — which is already in the key. Hashing the cap
+/// is also the only option available here, because callers ask for the cache
+/// path *before* anything has probed the source.
 pub fn cache_path(source: &Path) -> Result<PathBuf> {
     let metadata = fs::metadata(source)
         .with_context(|| format!("reading metadata for {}", source.display()))?;
@@ -105,7 +130,7 @@ pub fn cache_path(source: &Path) -> Result<PathBuf> {
         .context("source mtime predates the Unix epoch")?
         .as_millis() as u64;
 
-    let hash = cache_key(source, mtime_ms, GRID_W, GRID_H);
+    let hash = cache_key(source, mtime_ms, CAP_W, CAP_H);
 
     let dir = backgrounds_dir()?;
     fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
@@ -113,15 +138,15 @@ pub fn cache_path(source: &Path) -> Result<PathBuf> {
 }
 
 /// The cache filename's hash input, kept separate from `cache_path` so the
-/// grid's presence in the key is testable without a filesystem: a release
-/// that changes `GRID_W`/`GRID_H` must land on a different filename, or
-/// every existing cache would be served back at the wrong resolution.
-fn cache_key(source: &Path, mtime_ms: u64, grid_w: u16, grid_h: u16) -> u64 {
+/// cap's presence in the key is testable without a filesystem: a release
+/// that changes `CAP_W`/`CAP_H` must land on a different filename, or every
+/// existing cache would be served back at the wrong resolution.
+fn cache_key(source: &Path, mtime_ms: u64, cap_w: u16, cap_h: u16) -> u64 {
     let mut key = Vec::new();
     key.extend_from_slice(source.to_string_lossy().as_bytes());
     key.extend_from_slice(&mtime_ms.to_le_bytes());
-    key.extend_from_slice(&grid_w.to_le_bytes());
-    key.extend_from_slice(&grid_h.to_le_bytes());
+    key.extend_from_slice(&cap_w.to_le_bytes());
+    key.extend_from_slice(&cap_h.to_le_bytes());
     fnv1a64(&key)
 }
 
@@ -138,15 +163,75 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
     hash
 }
 
+/// The capture size for a source of `source_dims`: the source's own
+/// dimensions shrunk to fit inside `CAP_W` x `CAP_H` with the aspect ratio
+/// preserved, **never** enlarged, and always an even height.
+///
+/// So a 640x360 clip is captured at 640x360 — every pixel it has, no
+/// invented ones — while 1920x1080 is bound by the height and lands at
+/// 825x464. A source whose dimensions the banner didn't reveal falls back to
+/// the full box; that only happens for input ffmpeg is about to fail on
+/// anyway, and a deterministic size keeps the frame boundary well-defined.
+///
+/// The height is rounded *down* to even rather than to the nearest, because
+/// rounding up would enlarge the source by a row — the one thing this is not
+/// allowed to do. The single degenerate exception is a source only one pixel
+/// tall, which is floored to zero and then lifted back to the two rows a
+/// half-block cell needs.
+pub fn capture_dims(source_dims: Option<(u32, u32)>) -> (u16, u16) {
+    let cap_w = u32::from(CAP_W);
+    let cap_h = u32::from(CAP_H);
+    let Some((src_w, src_h)) = source_dims.filter(|(w, h)| *w > 0 && *h > 0) else {
+        return (CAP_W, CAP_H);
+    };
+    let (width, height) = if src_w <= cap_w && src_h <= cap_h {
+        // Already inside the box: keep every pixel the source has.
+        (src_w, src_h)
+    } else if u64::from(src_w) * u64::from(cap_h) >= u64::from(src_h) * u64::from(cap_w) {
+        // Wider than the box's aspect, so the width binds and the height
+        // follows from it.
+        (
+            cap_w,
+            round_div(u64::from(src_h) * u64::from(cap_w), u64::from(src_w)),
+        )
+    } else {
+        (
+            round_div(u64::from(src_w) * u64::from(cap_h), u64::from(src_h)),
+            cap_h,
+        )
+    };
+    (
+        width.clamp(1, cap_w) as u16,
+        (height & !1).clamp(2, cap_h) as u16,
+    )
+}
+
+/// Half-up integer division, so an aspect-derived axis lands on the nearest
+/// pixel rather than always truncating toward a squarer frame.
+fn round_div(numerator: u64, denominator: u64) -> u32 {
+    ((numerator + denominator / 2) / denominator).min(u64::from(u32::MAX)) as u32
+}
+
 /// Pure argument builder for the frame-streaming ffmpeg invocation. Kept
 /// separate from process spawning so it is unit-testable without ffmpeg
 /// installed.
-pub fn ffmpeg_args(source: &Path, capture_fps: f32) -> Vec<OsString> {
+///
+/// The scale filter carries the literal target size rather than an
+/// expression like `min(iw,832)` with `force_original_aspect_ratio=decrease`.
+/// Both express the same fit, but only the literal makes *this* code the
+/// single authority on the answer, and the answer has to be exact: raw
+/// rawvideo frames are unframed, so a size we predicted differently from the
+/// one ffmpeg chose would not be an error, it would be a stream read one
+/// frame-boundary out of step. The literal also survives sources ffmpeg
+/// auto-rotates, where the banner's dimensions and the decoder's output are
+/// transposed.
+pub fn ffmpeg_args(source: &Path, capture_fps: f32, dims: (u16, u16)) -> Vec<OsString> {
+    let (width, height) = dims;
     vec![
         OsString::from("-i"),
         OsString::from(source),
         OsString::from("-vf"),
-        OsString::from(format!("scale={GRID_W}:{GRID_H}")),
+        OsString::from(format!("scale={width}:{height}")),
         OsString::from("-r"),
         OsString::from(format_fps(capture_fps)),
         OsString::from("-f"),
@@ -169,14 +254,64 @@ fn format_fps(fps: f32) -> String {
     }
 }
 
+/// What the ffmpeg banner says about a source video.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Probe {
+    /// Capture rate, already clamped to the 60 fps ceiling.
+    pub fps: f32,
+    pub duration_secs: f32,
+    /// The source's own pixel size, or `None` when the banner carried no
+    /// recognizable one. Only the *fit* derived from it is ever used.
+    pub source_dims: Option<(u32, u32)>,
+}
+
 /// Parses ffmpeg's banner (written to stderr for every invocation) for the
-/// source's fps and duration, defaulting to `30.0`/`0.0` when either is
-/// unrecognizable. The returned fps is already clamped to the capture
-/// ceiling.
-pub fn parse_probe(stderr_text: &str) -> (f32, f32) {
-    let fps = parse_fps(stderr_text).unwrap_or(30.0).min(60.0);
-    let duration = parse_duration(stderr_text).unwrap_or(0.0);
-    (fps, duration)
+/// source's fps, duration, and pixel size, defaulting to `30.0`/`0.0`/`None`
+/// when any of them is unrecognizable.
+pub fn parse_probe(stderr_text: &str) -> Probe {
+    Probe {
+        fps: parse_fps(stderr_text).unwrap_or(30.0).min(60.0),
+        duration_secs: parse_duration(stderr_text).unwrap_or(0.0),
+        source_dims: parse_dims(stderr_text),
+    }
+}
+
+/// Pulls `WxH` off the first video stream's banner line.
+///
+/// That line is a comma-salad of codec details, several of which contain an
+/// `x` between digits — `(avc1 / 0x31637661)` most reliably. Both a zero
+/// width and an implausible axis reject a candidate and the scan moves on,
+/// which is what tells the real `640x360` from the hex FourCC beside it. The
+/// search is confined to the stream line so nothing in a file *path* printed
+/// above it can be mistaken for a resolution.
+fn parse_dims(text: &str) -> Option<(u32, u32)> {
+    /// No real capture is beyond this on either axis, and every false
+    /// positive seen in a banner is.
+    const PLAUSIBLE: u32 = 32_768;
+    let line = text.lines().find(|line| line.contains("Video:"))?;
+    let bytes = line.as_bytes();
+    for (index, _) in line.match_indices('x') {
+        let start = bytes[..index]
+            .iter()
+            .rposition(|byte| !byte.is_ascii_digit())
+            .map_or(0, |at| at + 1);
+        let end = index
+            + 1
+            + bytes[index + 1..]
+                .iter()
+                .position(|byte| !byte.is_ascii_digit())
+                .unwrap_or(bytes.len() - index - 1);
+        let (Ok(width), Ok(height)) = (
+            line[start..index].parse::<u32>(),
+            line[index + 1..end].parse::<u32>(),
+        ) else {
+            continue;
+        };
+        if (1..=PLAUSIBLE).contains(&width) && (1..=PLAUSIBLE).contains(&height) {
+            return Some((width, height));
+        }
+    }
+    None
 }
 
 /// Finds the first `" fps"` marker and walks backward over the digits/dot
@@ -256,9 +391,17 @@ fn run_convert(source: &Path, tx: &Sender<ConvertEvent>) {
 /// `finish()` has written a complete file.
 fn convert(source: &Path, cache: &Path, tx: &Sender<ConvertEvent>) -> Result<()> {
     let banner = probe(source)?;
-    let (capture_fps, duration_secs) = parse_probe(&banner);
+    let Probe {
+        fps: capture_fps,
+        duration_secs,
+        source_dims,
+    } = parse_probe(&banner);
+    // The capture size is settled here, before a single byte is read: the
+    // scale filter, the clip header, and the frame boundary the read loop
+    // trusts all come from this one value.
+    let dims = capture_dims(source_dims);
 
-    let args = ffmpeg_args(source, capture_fps);
+    let args = ffmpeg_args(source, capture_fps, dims);
     let mut child = ffmpeg_command()
         .args(&args)
         .stdin(Stdio::null())
@@ -271,8 +414,8 @@ fn convert(source: &Path, cache: &Path, tx: &Sender<ConvertEvent>) -> Result<()>
         .take()
         .context("ffmpeg produced no stdout pipe")?;
 
-    let mut writer = ClipWriter::create(cache, GRID_W, GRID_H, capture_fps)?;
-    let mut buffer = vec![0u8; FRAME_LEN];
+    let mut writer = ClipWriter::create(cache, dims.0, dims.1, capture_fps)?;
+    let mut buffer = vec![0u8; frame_len(dims)];
     let mut frames_read: u64 = 0;
     // Guards the progress denominator when the probe couldn't determine a
     // duration: every frame still reports forward progress, just capped
@@ -280,7 +423,11 @@ fn convert(source: &Path, cache: &Path, tx: &Sender<ConvertEvent>) -> Result<()>
     let expected_frames = (f64::from(duration_secs) * f64::from(capture_fps)).max(1.0);
     let mut last_percent: u8 = 0;
 
-    while read_frame(&mut stdout, &mut buffer)? {
+    // A frame that ends short is the one way a size disagreement with ffmpeg
+    // can show itself, so the expected size travels with the error.
+    while read_frame(&mut stdout, &mut buffer)
+        .with_context(|| format!("reading {}x{} frames from ffmpeg", dims.0, dims.1))?
+    {
         mute(&mut buffer);
         writer.push_frame(&buffer)?;
         frames_read += 1;
@@ -428,49 +575,180 @@ mod tests {
         let _ = fs::remove_file(&source);
     }
 
+    /// Renders the frame-streaming args for a source of `source_dims`, the
+    /// way `convert` composes them.
+    fn rendered_args(source_dims: Option<(u32, u32)>) -> Vec<String> {
+        ffmpeg_args(
+            Path::new(r"C:\videos\my clip (1).mp4"),
+            48.0,
+            capture_dims(source_dims),
+        )
+        .iter()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect()
+    }
+
     #[test]
     fn ffmpeg_args_pass_the_path_as_a_single_vector_item() {
-        let args = ffmpeg_args(Path::new(r"C:\videos\my clip (1).mp4"), 48.0);
-        let rendered: Vec<String> = args
-            .iter()
-            .map(|a| a.to_string_lossy().into_owned())
-            .collect();
+        let rendered = rendered_args(Some((1920, 1080)));
         assert_eq!(rendered[0], "-i");
         assert_eq!(rendered[1], r"C:\videos\my clip (1).mp4"); // spaces intact, no quoting
-        assert!(rendered.contains(&format!("scale={GRID_W}:{GRID_H}")));
-        assert!(rendered.contains(&"scale=416:232".to_string()));
         assert!(rendered.contains(&"48".to_string()));
         assert_eq!(rendered.last().unwrap(), "-");
     }
 
     #[test]
-    fn probe_parses_fps_and_duration_and_clamps_to_60() {
+    fn a_source_inside_the_cap_is_captured_at_its_own_size() {
+        // "More HD" must never mean "invented pixels": a 640x360 clip has
+        // 640x360 of real detail and gets converted at exactly that.
+        assert_eq!(capture_dims(Some((640, 360))), (640, 360));
+        assert!(rendered_args(Some((640, 360))).contains(&"scale=640:360".to_string()));
+        // ...including a source that is small on both axes.
+        assert_eq!(capture_dims(Some((320, 180))), (320, 180));
+        // ...and one that exactly fills the box.
+        assert_eq!(
+            capture_dims(Some((CAP_W.into(), CAP_H.into()))),
+            (CAP_W, CAP_H)
+        );
+    }
+
+    #[test]
+    fn a_1080p_source_is_fitted_inside_the_cap_with_its_aspect_intact() {
+        // 1080p is bound by the height: 464/1080 of 1920 is 824.9, so 825.
+        let dims = capture_dims(Some((1920, 1080)));
+        assert_eq!(dims, (825, CAP_H));
+        assert!(rendered_args(Some((1920, 1080))).contains(&"scale=825:464".to_string()));
+        // Nothing left the box, and the aspect survived to within a pixel.
+        assert!(dims.0 <= CAP_W && dims.1 <= CAP_H);
+        assert!((f64::from(dims.0) / f64::from(dims.1) - 16.0 / 9.0).abs() < 0.002);
+
+        // An ultra-wide source binds on the *other* axis instead.
+        let wide = capture_dims(Some((3840, 1080)));
+        assert_eq!(wide, (CAP_W, 234));
+        assert!(wide.0 <= CAP_W && wide.1 <= CAP_H);
+    }
+
+    #[test]
+    fn an_odd_capture_height_is_rounded_down_to_even_never_up() {
+        // The renderer paints two stacked pixels per cell, so an odd height
+        // leaves a half-cell row with nothing to sample. Rounding *down* is
+        // the point: rounding up would magnify the source by a row.
+        assert_eq!(CAP_H % 2, 0, "the cap itself must be an even height");
+        assert_eq!(capture_dims(Some((640, 361))), (640, 360));
+        assert_eq!(capture_dims(Some((640, 359))), (640, 358));
+        // A *fitted* source whose derived height lands odd: 1000x557 is
+        // bound by the width, and 557 * 832/1000 is 463.4, which rounds to
+        // the odd 463 and then floors to 462.
+        let dims = capture_dims(Some((1000, 557)));
+        assert_eq!(dims, (CAP_W, 462));
+        assert_eq!(dims.1 % 2, 0);
+        // Every derived height is even, whatever the source.
+        for height in 1..=2_000_u32 {
+            let (_, out_h) = capture_dims(Some((1920, height)));
+            assert_eq!(out_h % 2, 0, "odd capture height for source 1920x{height}");
+        }
+    }
+
+    #[test]
+    fn an_unreadable_source_size_falls_back_to_the_whole_box() {
+        // Only reachable for input ffmpeg is about to fail on anyway; what
+        // matters is that the frame boundary stays well-defined.
+        assert_eq!(capture_dims(None), (CAP_W, CAP_H));
+        assert_eq!(capture_dims(Some((0, 1080))), (CAP_W, CAP_H));
+        assert_eq!(capture_dims(Some((1920, 0))), (CAP_W, CAP_H));
+    }
+
+    #[test]
+    fn probe_parses_fps_duration_and_dimensions_and_clamps_fps_to_60() {
         let banner = "Input #0, mov,mp4, from 'clip.mp4':\n  Duration: 00:03:12.45, start: 0.0, bitrate: 5 kb/s\n  Stream #0:0: Video: h264, yuv420p, 1920x1080, 120 fps, 120 tbr\n";
-        let (fps, duration) = parse_probe(banner);
-        assert_eq!(fps, 60.0); // 120 clamped
-        assert!((duration - 192.45).abs() < 0.01);
+        let probe = parse_probe(banner);
+        assert_eq!(probe.fps, 60.0); // 120 clamped
+        assert!((probe.duration_secs - 192.45).abs() < 0.01);
+        assert_eq!(probe.source_dims, Some((1920, 1080)));
+    }
+
+    #[test]
+    fn probe_reads_the_real_size_past_the_hex_fourcc_beside_it() {
+        // Verbatim from ffmpeg 8.0. `0x31637661` is an `x` between digits on
+        // the same line and sits *before* the resolution.
+        let banner = "Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'C:\\clips\\smoke-test.mp4':\n  Duration: 00:00:15.00, start: 0.000000, bitrate: 796 kb/s\n  Stream #0:0[0x1](und): Video: h264 (High) (avc1 / 0x31637661), yuv420p(progressive), 640x360 [SAR 1:1 DAR 16:9], 793 kb/s, 30 fps, 30 tbr, 15360 tbn (default)\n";
+        let probe = parse_probe(banner);
+        assert_eq!(probe.source_dims, Some((640, 360)));
+        assert_eq!(probe.fps, 30.0);
+        assert_eq!(capture_dims(probe.source_dims), (640, 360));
     }
 
     #[test]
     fn probe_defaults_when_the_banner_is_unrecognizable() {
-        let (fps, duration) = parse_probe("garbage");
-        assert_eq!(fps, 30.0);
-        assert_eq!(duration, 0.0);
+        let probe = parse_probe("garbage");
+        assert_eq!(probe.fps, 30.0);
+        assert_eq!(probe.duration_secs, 0.0);
+        assert_eq!(probe.source_dims, None);
     }
 
     #[test]
-    fn the_capture_grid_is_even_and_in_the_cache_key() {
-        // The renderer paints two stacked pixels per cell, so an odd height
-        // would leave a half-cell row nothing could be sampled from.
-        assert_eq!(GRID_H % 2, 0, "the capture grid must be an even height");
-        // Raising the grid has to invalidate every cache written at the old
-        // one; the key carries the grid so the filename moves on its own.
+    fn the_resolution_cap_is_in_the_cache_key() {
+        // Raising the cap has to invalidate every cache written under the
+        // old one; the key carries the cap so the filename moves on its own.
+        // The *converted* size need not be in the key: it is a pure function
+        // of the cap and the source's own dimensions, and those cannot change
+        // without the mtime — already hashed — changing with them.
         let source = Path::new(r"C:\videos\clip.mp4");
         assert_ne!(
-            cache_key(source, 1_700_000_000_000, GRID_W, GRID_H),
-            cache_key(source, 1_700_000_000_000, 208, 116),
-            "the 208x116 caches would have been served back at the new grid"
+            cache_key(source, 1_700_000_000_000, CAP_W, CAP_H),
+            cache_key(source, 1_700_000_000_000, 416, 232),
+            "the 416x232 caches would have been served back under the new cap"
         );
+    }
+
+    #[test]
+    #[ignore = "dev harness: converts a real video with the installed ffmpeg and prices the cache; set PCPULSE_CONVERT_SOURCE and run with --ignored --nocapture"]
+    fn dev_bench_conversion_cost() {
+        let Some(source) = env::var_os("PCPULSE_CONVERT_SOURCE").map(PathBuf::from) else {
+            println!("set PCPULSE_CONVERT_SOURCE to a video file");
+            return;
+        };
+        // `backgrounds_dir` already routes the test binary to `%TEMP%`, so
+        // this can never deposit anything in the real profile.
+        let cache = cache_path(&source).unwrap();
+        let _ = fs::remove_file(&cache);
+
+        let banner = probe(&source).unwrap();
+        let parsed = parse_probe(&banner);
+        let dims = capture_dims(parsed.source_dims);
+        let started = std::time::Instant::now();
+        let (tx, rx) = bounded(1024);
+        run_convert(&source, &tx);
+        drop(tx);
+        let failure = rx.iter().find_map(|event| match event {
+            ConvertEvent::Failed(message) => Some(message),
+            _ => None,
+        });
+        let elapsed = started.elapsed();
+        assert!(failure.is_none(), "conversion failed: {failure:?}");
+
+        let bytes = fs::metadata(&cache).unwrap().len();
+        let mut reader = ClipReader::open(&cache).unwrap();
+        let frames = u64::from(reader.header().frame_count);
+        let decode_started = std::time::Instant::now();
+        for step in 0..200_u32 {
+            let _ = reader.frame(step % reader.header().frame_count).unwrap();
+        }
+        let per_decode = decode_started.elapsed().as_secs_f64() * 1_000.0 / 200.0;
+
+        println!("source     {}", source.display());
+        println!("source dims {:?}", parsed.source_dims);
+        println!("capture    {}x{} @ {} fps", dims.0, dims.1, parsed.fps);
+        println!("raw frame  {} B", frame_len(dims));
+        println!("frames     {frames}");
+        println!(
+            "cache      {bytes} B ({:.2} MB, {:.0} B/frame, {:.3} B/px)",
+            bytes as f64 / 1_048_576.0,
+            bytes as f64 / frames as f64,
+            bytes as f64 / frames as f64 / (f64::from(dims.0) * f64::from(dims.1))
+        );
+        println!("convert    {:.2} s", elapsed.as_secs_f64());
+        println!("decode     {per_decode:.3} ms/frame");
     }
 
     #[test]

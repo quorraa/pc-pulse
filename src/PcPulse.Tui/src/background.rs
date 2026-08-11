@@ -12,8 +12,14 @@
 //! Exactly one decoded frame is held at a time, and it is memoized on its
 //! index: `current_pixels` is called once per *draw*, which is 60 times a
 //! second in smooth mode, while the clip may only tick at 10-30fps. Without
-//! the memo the same frame was inflated from disk over and over — at the
-//! 416x232 capture grid that is a 290 KB decode each time.
+//! the memo the same frame was inflated from disk over and over — a clip
+//! converted from a 1080p source is 825x464, so that is a 1.1 MB inflate,
+//! about 3 ms, each time.
+//!
+//! Frame *dimensions* come from the clip's own header, never from a constant:
+//! clips are converted at a size derived from their source (see
+//! `clipconvert::capture_dims`), so two clips loaded by the same build can
+//! have different grids.
 //!
 //! Playback fps is a *tick rate*, not the source of the displayed frame: it
 //! only decides how often `advance_if_due` bothers checking whether the
@@ -24,13 +30,23 @@
 use crate::pulseclip::ClipReader;
 use anyhow::Result;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
+
+/// Hands every loaded player a number no other player in this process will
+/// ever wear. Swapping the configured video replaces the whole `Background`,
+/// so this is all a downstream cache needs to tell one clip's frame 7 from
+/// another's — no bookkeeping at the assignment sites, which are scattered
+/// across settings handling, conversion completion, and startup restore.
+static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 /// Plays a `.pulseclip` file back by deriving the current frame from wall
 /// time rather than advancing a running counter, so looping is a modulo and
 /// skipped frames never need re-encoding.
 pub struct Background {
     reader: ClipReader,
+    /// This player's process-unique id — see `NEXT_GENERATION`.
+    generation: u64,
     capture_fps: f32,
     frame_count: u32,
     /// When playback began; the frame index is always computed relative to
@@ -80,6 +96,7 @@ impl Background {
         let now = Instant::now();
         Ok(Self {
             reader,
+            generation: NEXT_GENERATION.fetch_add(1, Ordering::Relaxed),
             capture_fps,
             frame_count,
             started: now,
@@ -146,10 +163,25 @@ impl Background {
         self.last_tick + self.tick_interval()
     }
 
-    /// The grid dimensions of the underlying clip.
+    /// The grid dimensions of the underlying clip, as recorded in its
+    /// header. Clips are converted at a size derived from their *source*, so
+    /// this is the only authority on how wide a frame is — nothing may assume
+    /// a fixed capture grid.
     pub fn grid(&self) -> (u16, u16) {
         let header = self.reader.header();
         (header.grid_w, header.grid_h)
+    }
+
+    /// This player's process-unique id. Two clips can easily share a frame
+    /// index and a grid; a cache keyed on what is on screen needs this to
+    /// tell them apart.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// The index of the frame `current_pixels` will serve.
+    pub fn current_index(&self) -> u32 {
+        self.current_index
     }
 
     /// If a new tick is due at `now`, recomputes which frame wall time says
@@ -186,8 +218,15 @@ impl Background {
     /// A failed decode deliberately does *not* update the cache key, so the
     /// next call retries and `failed()` keeps reporting the live truth
     /// rather than latching on one bad read.
+    ///
+    /// A cache hit clears `failed` for the same reason it is set on a bad
+    /// read: it is a report of what this call served, not a tombstone. The
+    /// cached frame did decode cleanly, so returning it while still claiming
+    /// a failure would be a lie — one a looping clip can actually tell, by
+    /// failing on a late frame and then wrapping back to a cached early one.
     pub fn current_pixels(&mut self) -> &[u8] {
         if self.cached_index == Some(self.current_index) {
+            self.failed = None;
             return &self.pixels;
         }
         #[cfg(test)]
@@ -363,6 +402,56 @@ mod tests {
             after_failure + 1,
             "a frame that failed to decode must be retried, not cached"
         );
+    }
+
+    #[test]
+    fn wrapping_back_onto_a_good_cached_frame_clears_the_stale_failure() {
+        use std::io::Write;
+        // `failed()` is a report of what the last call served, not a
+        // tombstone. A looping clip really can fail on a late frame and then
+        // wrap onto an early one that is still cached and still good; saying
+        // "failed" while handing back that good frame is a lie.
+        //
+        // 16 frames at 8 fps, so this gets its own file: the test scribbles
+        // over the clip, and so does the retry test above.
+        let path = test_clip(16, 8.0);
+        let mut bg = Background::load(&path).unwrap();
+        let frame_zero = bg.current_pixels().to_vec();
+        let len = std::fs::metadata(&path).unwrap().len() as usize;
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .write_all(&vec![0u8; len])
+            .unwrap();
+
+        let t0 = bg.started_for_test();
+        assert!(bg.advance_if_due(t0 + Duration::from_millis(250))); // frame 2
+        let _ = bg.current_pixels();
+        assert!(bg.failed().is_some(), "the bad decode must be reported");
+
+        // One full loop later (16 frames at 8 fps = 2 s) the wall clock is
+        // back on frame 0, which never left the cache.
+        assert!(bg.advance_if_due(t0 + Duration::from_millis(2_000)));
+        let served = bg.current_pixels().to_vec();
+        assert_eq!(served, frame_zero, "the cached frame 0 must be served");
+        assert!(
+            bg.failed().is_none(),
+            "a served cache hit is a success, not a still-failing player"
+        );
+    }
+
+    #[test]
+    fn every_loaded_player_gets_its_own_generation() {
+        // A render-side cache keyed on the frame index would otherwise serve
+        // one clip's frame 7 for another's after a swap.
+        // Distinct clips: `test_clip` names its file after its arguments, and
+        // the first player holds its own open.
+        let first = Background::load(&test_clip(5, 4.0)).unwrap();
+        let second = Background::load(&test_clip(6, 4.0)).unwrap();
+        assert_ne!(first.generation(), second.generation());
+        assert_eq!(first.generation(), first.generation()); // stable per player
+        assert_eq!(first.current_index(), 0);
     }
 
     #[test]
