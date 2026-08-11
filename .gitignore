@@ -12,3 +12,4 @@ artifacts/
 *.log
 .playwright-mcp/
 .superpowers/
+.claude/
