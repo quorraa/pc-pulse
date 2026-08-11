@@ -325,11 +325,12 @@ fn run_loop(
                     dirty = true;
                     motion.observe(&app);
                 }
-                // Keep the cadence anchored to the previous deadline, but
-                // never schedule into the past after a slow frame.
-                let target = next_smooth_frame
-                    .map_or_else(|| frame_started + frame_budget, |at| at + frame_budget);
-                next_smooth_frame = Some(target.max(Instant::now()));
+                next_smooth_frame = Some(next_smooth_deadline(
+                    next_smooth_frame,
+                    frame_started,
+                    Instant::now(),
+                    frame_budget,
+                ));
             }
         }
         // Event-driven mode polls on the motion system's cadence; smooth
@@ -426,6 +427,90 @@ fn run_loop(
         }
     }
     Ok(())
+}
+
+/// The next fixed-cadence smooth-frame deadline after a draw.
+///
+/// Anchored to the previous deadline so on-schedule frames tick evenly, but
+/// clamped to one budget past the draw that just happened: draws triggered by
+/// motion cues, dirty events, or background ticks arrive on their own cadence,
+/// and advancing "previous deadline + budget" unconditionally let each of
+/// those push the deadline a fraction of a frame further into the future.
+/// The drift was invisible while something else kept forcing draws — and the
+/// moment that source stopped (a sample-beat cue ending), the stranded
+/// deadline paused every tween until the next event (field incident: meters
+/// froze briefly at the end of each pulse sweep). Never schedules into the
+/// past after a slow frame.
+fn next_smooth_deadline(
+    previous: Option<Instant>,
+    frame_started: Instant,
+    now: Instant,
+    budget: Duration,
+) -> Instant {
+    let anchored = previous.map_or_else(|| frame_started + budget, |at| at + budget);
+    anchored.min(frame_started + budget).max(now)
+}
+
+#[cfg(test)]
+mod cadence_tests {
+    use super::next_smooth_deadline;
+    use std::time::{Duration, Instant};
+
+    const BUDGET: Duration = Duration::from_micros(16_667);
+
+    /// On-schedule smooth frames keep the fixed cadence: each deadline is
+    /// exactly one budget after the previous one.
+    #[test]
+    fn steady_frames_keep_the_anchored_cadence() {
+        let t0 = Instant::now();
+        let prev = t0 + BUDGET;
+        // Drawn right at the deadline; "now" is a hair later.
+        let next = next_smooth_deadline(
+            Some(prev),
+            prev,
+            prev + Duration::from_micros(200),
+            BUDGET,
+        );
+        assert_eq!(next, prev + BUDGET);
+    }
+
+    /// Reproduces the meter-freeze bug: while a motion cue animates, draws
+    /// run on the 16 ms poll cadence — slightly faster than the budget — and
+    /// the old advance (previous deadline + budget, unconditionally) drifted
+    /// the deadline unboundedly into the future. When the cue ended, the
+    /// stranded deadline paused every tween until the next event. The
+    /// deadline must never end up more than one budget past the draw that
+    /// produced it.
+    #[test]
+    fn animation_cadence_draws_cannot_strand_the_deadline() {
+        let t0 = Instant::now();
+        let mut deadline = t0 + BUDGET;
+        let poll = Duration::from_millis(16);
+        for frame in 1..=600 {
+            // A cue-driven draw fires every 16 ms of wall time regardless of
+            // the smooth deadline.
+            let frame_started = t0 + poll * frame;
+            let now = frame_started + Duration::from_micros(300);
+            deadline = next_smooth_deadline(Some(deadline), frame_started, now, BUDGET);
+            assert!(
+                deadline <= frame_started + BUDGET,
+                "frame {frame}: deadline drifted {:?} past the draw",
+                deadline - frame_started
+            );
+        }
+    }
+
+    /// A slow frame never schedules into the past — the next deadline is at
+    /// least "now" so the loop cannot spin on an already-expired deadline.
+    #[test]
+    fn slow_frames_never_schedule_into_the_past() {
+        let t0 = Instant::now();
+        let prev = t0 + BUDGET;
+        let frame_started = prev + Duration::from_millis(40); // long stall
+        let now = frame_started + Duration::from_millis(30); // slow draw too
+        let next = next_smooth_deadline(Some(prev), frame_started, now, BUDGET);
+        assert!(next >= now);
+    }
 }
 
 #[cfg(test)]
