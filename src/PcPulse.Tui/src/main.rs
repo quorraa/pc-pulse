@@ -253,6 +253,7 @@ fn run_loop(
     healed: Option<String>,
 ) -> Result<()> {
     let mut app = App::new();
+    let effects = effective.effects;
     app.adopt_client_prefs(effective, store);
     // Surface a launch-time heal once, before the first draw; the next
     // worker event replaces it like any other status line.
@@ -260,10 +261,10 @@ fn run_loop(
         app.status = message;
         app.status_is_error = false;
     }
-    let mut motion = MotionSystem::new(&app, effective.effects);
+    let mut motion = MotionSystem::new(&app, effects);
     // MotionSystem does not expose its enabled state; mirror it so TUNE
     // toggles can be reconciled through `toggle()`.
-    let mut motion_enabled = effective.effects;
+    let mut motion_enabled = effects;
     let mut dirty = true;
     let mut last_frame = Instant::now();
     let mut terminal_area = Rect::default();
