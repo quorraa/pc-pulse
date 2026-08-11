@@ -13,6 +13,7 @@ use pcpulse_service::models::{
 };
 use ratatui::{
     Frame,
+    buffer::Buffer,
     crossterm::event::{MouseButton, MouseEvent, MouseEventKind},
     layout::{Alignment, Constraint, Direction, Layout, Margin, Rect},
     style::{Color, Style},
@@ -870,6 +871,24 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
         );
         return;
     }
+    // One decode per draw, copied out of the player so the rest of `draw`
+    // can keep `app` borrowed mutably. `current_pixels` re-reads the clip
+    // every call, so sampling it per cell would be ruinous.
+    let video = app
+        .background
+        .as_mut()
+        .filter(|_| app.client_prefs.background_enabled)
+        .map(|background| (background.current_pixels().to_vec(), background.grid()));
+    // After the base wash above, never before: that block styles every cell
+    // in `area` and would erase the frame we just painted.
+    if let Some((pixels, grid)) = &video {
+        paint_background(
+            frame.buffer_mut(),
+            pixels,
+            *grid,
+            app.client_prefs.background_dim,
+        );
+    }
     let rail = rail_width(area).is_some();
     let broadsheet = !rail && broadsheet();
     let regions = regions(area);
@@ -901,6 +920,116 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     }
     render_modal(frame, app);
     render_help_overlay(frame, app, regions.body);
+    // Every page paints its own chrome over the video; this hands the video
+    // back to the cells whose background is still the theme's flat backdrop.
+    if let Some((pixels, grid)) = &video {
+        restore_background_bg(
+            frame.buffer_mut(),
+            pixels,
+            *grid,
+            app.client_prefs.background_dim,
+        );
+    }
+}
+
+/// The glyph the video is painted with: its top half takes the foreground
+/// color, its bottom half the background, so one cell carries two pixels.
+const VIDEO_GLYPH: &str = "▀";
+
+/// Pre-pass: fills the whole buffer with the current video frame, two
+/// vertically stacked pixels per cell. Runs before any page chrome, which
+/// then paints over whatever it means to be opaque.
+fn paint_background(buffer: &mut Buffer, pixels: &[u8], grid: (u16, u16), dim_pct: u8) {
+    let area = buffer.area;
+    for_each_video_cell(area, pixels, grid, |x, y, top, bottom| {
+        let cell = &mut buffer[(x, y)];
+        cell.set_symbol(VIDEO_GLYPH);
+        cell.set_fg(dim_toward_bg(top, dim_pct));
+        cell.set_bg(dim_toward_bg(bottom, dim_pct));
+    });
+}
+
+/// Post-pass: page chrome styles whole rects at a time, so panels re-flatten
+/// their backgrounds to the theme's. Any cell left sitting on the flat
+/// backdrop (or on nothing at all) gets the video back behind it; every
+/// other background — selection bars, severity fills, raised surfaces — is
+/// an intentional choice and stays exactly as drawn.
+///
+/// A glyph covers the full cell, so the background it sits on is the mean of
+/// the cell's two video pixels rather than just the lower one.
+fn restore_background_bg(buffer: &mut Buffer, pixels: &[u8], grid: (u16, u16), dim_pct: u8) {
+    let flat = palette().bg;
+    for_each_video_cell(buffer.area, pixels, grid, |x, y, top, bottom| {
+        let cell = &mut buffer[(x, y)];
+        if cell.bg != Color::Reset && cell.bg != flat {
+            return;
+        }
+        let mean = (
+            mean_channel(top.0, bottom.0),
+            mean_channel(top.1, bottom.1),
+            mean_channel(top.2, bottom.2),
+        );
+        cell.set_bg(dim_toward_bg(mean, dim_pct));
+    });
+}
+
+/// Lerps a video pixel `dim_pct` of the way toward the theme's background
+/// color. This is the whole legibility budget: at 0 the clip plays at full
+/// strength, at 100 it is indistinguishable from a plain backdrop.
+fn dim_toward_bg(rgb: (u8, u8, u8), dim_pct: u8) -> Color {
+    let (br, bg, bb) = match palette().bg {
+        Color::Rgb(r, g, b) => (r, g, b),
+        // No shipped palette is indexed, but a fallback beats a panic.
+        _ => (0, 0, 0),
+    };
+    let toward = f32::from(dim_pct.min(100)) / 100.0;
+    let lerp = |from: u8, to: u8| {
+        (f32::from(from) + (f32::from(to) - f32::from(from)) * toward).round() as u8
+    };
+    Color::Rgb(lerp(rgb.0, br), lerp(rgb.1, bg), lerp(rgb.2, bb))
+}
+
+fn mean_channel(top: u8, bottom: u8) -> u8 {
+    ((u16::from(top) + u16::from(bottom)) / 2) as u8
+}
+
+/// Walks every cell of `area`, handing the visitor the nearest-neighbor
+/// video colors for that cell's top and bottom halves. Both passes sample
+/// through here so they can never disagree about which pixel lands where.
+fn for_each_video_cell(
+    area: Rect,
+    pixels: &[u8],
+    grid: (u16, u16),
+    mut visit: impl FnMut(u16, u16, (u8, u8, u8), (u8, u8, u8)),
+) {
+    let (grid_w, grid_h) = (u32::from(grid.0), u32::from(grid.1));
+    if grid_w == 0 || grid_h == 0 || area.is_empty() {
+        return;
+    }
+    // A short frame means a decode failed mid-clip; skip rather than risk
+    // indexing past it.
+    if pixels.len() < (grid_w * grid_h * 3) as usize {
+        return;
+    }
+    let sample = |px: u32, py: u32| {
+        let base = ((py.min(grid_h - 1) * grid_w + px.min(grid_w - 1)) * 3) as usize;
+        (pixels[base], pixels[base + 1], pixels[base + 2])
+    };
+    // Rows are counted in half-cells: each cell shows two stacked pixels.
+    let half_rows = u32::from(area.height) * 2;
+    for cy in 0..area.height {
+        let top = u32::from(cy) * 2 * grid_h / half_rows;
+        let bottom = (u32::from(cy) * 2 + 1) * grid_h / half_rows;
+        for cx in 0..area.width {
+            let px = u32::from(cx) * grid_w / u32::from(area.width);
+            visit(
+                area.x + cx,
+                area.y + cy,
+                sample(px, top),
+                sample(px, bottom),
+            );
+        }
+    }
 }
 
 /// The '?' overlay rect: a centered panel filling ~80% of the page body.
@@ -9407,5 +9536,100 @@ mod tests {
             )
             .expect("write demo frames");
         }
+    }
+
+    /// A two-frame clip on a 4x2 grid: small enough that the sampler has to
+    /// stretch every pixel across many cells, and with differing frames so
+    /// the player has something to loop over.
+    fn background_clip(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(name);
+        std::fs::create_dir_all(&dir).expect("clip directory");
+        let path = dir.join("two-frame.pulseclip");
+        let mut writer =
+            crate::pulseclip::ClipWriter::create(&path, 4, 2, 2.0).expect("clip writer");
+        writer.push_frame(&[200u8; 4 * 2 * 3]).expect("frame 0");
+        writer.push_frame(&[40u8; 4 * 2 * 3]).expect("frame 1");
+        writer.finish().expect("finish clip");
+        path
+    }
+
+    fn app_with_background(clip: &std::path::Path) -> App {
+        let mut app = sample_app();
+        app.background = Some(crate::background::Background::load(clip).expect("load clip"));
+        app.client_prefs.background_enabled = true;
+        app.client_prefs.background_dim = 30;
+        app
+    }
+
+    #[test]
+    fn background_paints_under_text_and_respects_intentional_backgrounds() {
+        let _theme = theme::test_support::activate(theme::ThemeId::Vitals);
+        let clip = background_clip("ui-bg");
+        let with_bg = render(&mut app_with_background(&clip));
+        let without = render(&mut sample_app());
+
+        let mut video_backed_cells = 0;
+        let mut two_pixel_cells = 0;
+        for (a, b) in with_bg
+            .buffer()
+            .content()
+            .iter()
+            .zip(without.buffer().content())
+        {
+            // Every glyph and fg color the UI drew must be identical — the
+            // video may only fill cells the UI left blank, and backgrounds.
+            if b.symbol() != " " {
+                assert_eq!(a.symbol(), b.symbol(), "the video moved a glyph");
+                assert_eq!(a.fg, b.fg, "the video recolored drawn text");
+            } else if a.symbol() == VIDEO_GLYPH && a.fg != b.fg {
+                // A blank cell keeps both of its video pixels: top half in
+                // the foreground, bottom half behind it.
+                two_pixel_cells += 1;
+            }
+            if b.bg != Color::Reset && b.bg != palette().bg {
+                assert_eq!(a.bg, b.bg, "an intentional fill was overpainted");
+            } else if a.bg != b.bg {
+                video_backed_cells += 1;
+            }
+        }
+        assert!(video_backed_cells > 0, "no cell ever received video bg");
+        assert!(two_pixel_cells > 0, "no blank cell kept its top pixel");
+    }
+
+    #[test]
+    fn background_disabled_draws_identically_to_no_background() {
+        // With the toggle off, even a loaded clip must change nothing.
+        let _theme = theme::test_support::activate(theme::ThemeId::Vitals);
+        let clip = background_clip("ui-bg-off");
+        let mut app = app_with_background(&clip);
+        app.client_prefs.background_enabled = false;
+        let with_clip = render(&mut app);
+        let plain = render(&mut sample_app());
+        assert_eq!(with_clip.buffer(), plain.buffer());
+    }
+
+    #[test]
+    fn background_is_suppressed_below_the_minimum_terminal_size() {
+        // The resize notice fills the frame with its own panel, so video
+        // would only ever survive as a slab of half-block glyphs under it.
+        let _theme = theme::test_support::activate(theme::ThemeId::Vitals);
+        let clip = background_clip("ui-bg-small");
+        let with_clip = render_size(&mut app_with_background(&clip), 40, 12);
+        let plain = render_size(&mut sample_app(), 40, 12);
+        assert_eq!(with_clip.buffer(), plain.buffer());
+    }
+
+    #[test]
+    fn dim_lerps_the_video_toward_the_theme_background() {
+        let _theme = theme::test_support::activate(theme::ThemeId::Vitals);
+        let Color::Rgb(br, bg, bb) = palette().bg else {
+            panic!("every shipped palette is true color");
+        };
+        assert_eq!(dim_toward_bg((200, 100, 40), 0), Color::Rgb(200, 100, 40));
+        assert_eq!(dim_toward_bg((200, 100, 40), 100), Color::Rgb(br, bg, bb));
+        let Color::Rgb(hr, _, _) = dim_toward_bg((205, 100, 40), 50) else {
+            panic!("dimming stays true color");
+        };
+        assert_eq!(hr, ((205 + u16::from(br)) / 2) as u8);
     }
 }

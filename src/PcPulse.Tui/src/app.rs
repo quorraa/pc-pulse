@@ -1072,6 +1072,10 @@ pub struct App {
     /// The client preferences in force for this run (CLI flags already
     /// folded in). `t` / `m` / TUNE edits update and persist them.
     pub client_prefs: UiPrefs,
+    /// The video clip painted behind the UI, once one has been loaded.
+    /// `None` — the default, and what every headless test uses — means the
+    /// renderer's background passes are skipped entirely.
+    pub background: Option<crate::background::Background>,
     pub prefs_store: Option<PrefsStore>,
     /// Smooth-refresh tween state: previous displayed sample, frame clock,
     /// and the session frame governor. Inert while `refresh_fps` is 0.
@@ -1184,6 +1188,7 @@ impl App {
             mode: InputMode::Normal,
             help_overlay: None,
             client_prefs: UiPrefs::default(),
+            background: None,
             prefs_store: None,
             smooth: crate::tween::SmoothState::default(),
             needs_terminal_clear: false,
