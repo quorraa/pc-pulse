@@ -4,6 +4,7 @@ use crate::{
     chat_history::{ChatHistoryStore, ChatSession},
     client::PipeClient,
     clipconvert::{self, ConvertEvent},
+    filepicker::{self, PickEvent},
     prefs::{self, PrefsStore, UiPrefs},
     theme,
     update::{self, UpdateInfo},
@@ -496,9 +497,9 @@ impl SettingField {
                  request is ever made."
             }
             Self::ClientBackgroundVideo => {
-                "Path to a video file to play, muted and dimmed, behind every page. First use \
-                 converts it once with ffmpeg (winget install ffmpeg); afterwards it costs \
-                 almost nothing. Enter edits; empty turns it off."
+                "A video file to play, muted and dimmed, behind every page. Enter opens a file \
+                 picker; Delete or Backspace turns it off. First use converts the clip once \
+                 with ffmpeg (winget install ffmpeg); afterwards it costs almost nothing."
             }
             Self::ClientBackgroundQuality => {
                 "How much detail the background video keeps: low, medium, high (the default),                  or ultra. Sharper looks better and costs more disk for the converted clip and                  more CPU while it plays. Enter cycles; each quality is converted once, so                  changing this converts the video again at the new size."
@@ -1160,6 +1161,10 @@ pub struct App {
     /// wants a *different* clip out of a different cache file, and a guard
     /// that looked only at the path would wave it through as already running.
     converting: Option<(String, (u16, u16))>,
+    /// The Explorer file dialog, while one is open. `is_some()` is exactly
+    /// "a dialog is up", which is both the guard against opening a second
+    /// one and the reason the status line says so.
+    pick_rx: Option<Receiver<PickEvent>>,
     /// Collects the cache files a freshly loaded clip supersedes. The real
     /// path is [`clipconvert::sweep_superseded`]; the inert test app
     /// substitutes a no-op, because every test in this binary shares one
@@ -1282,6 +1287,7 @@ impl App {
             background_resample: crate::ui::VideoResample::default(),
             convert_rx: None,
             converting: None,
+            pick_rx: None,
             sweep_superseded: clipconvert::sweep_superseded,
             prefs_store: None,
             smooth: crate::tween::SmoothState::default(),
@@ -1455,7 +1461,95 @@ impl App {
             }
         }
         changed |= self.drain_conversion();
+        changed |= self.drain_file_pick();
         changed
+    }
+
+    /// Pump the Explorer file dialog. It answers exactly once, so the
+    /// receiver is let go the moment anything arrives — including a
+    /// disconnect, which is a dialog thread that died without speaking and
+    /// must not leave the row believing a dialog is still on screen.
+    fn drain_file_pick(&mut self) -> bool {
+        let event = match &self.pick_rx {
+            Some(receiver) => match receiver.try_recv() {
+                Ok(event) => event,
+                Err(crossbeam_channel::TryRecvError::Empty) => return false,
+                Err(crossbeam_channel::TryRecvError::Disconnected) => PickEvent::Cancelled,
+            },
+            None => return false,
+        };
+        self.pick_rx = None;
+        match event {
+            PickEvent::Picked(path) => {
+                let path = path.to_string_lossy().into_owned();
+                // The dialog was told the file must exist, so this is a
+                // formality — but the answer is a path from outside this
+                // process and is checked like the typed one.
+                if std::path::Path::new(&path).is_file() {
+                    self.set_background_video(path);
+                } else {
+                    self.set_error(format!("No video file at {path}"));
+                }
+            }
+            // Dismissed: nothing changes, and the "Choosing a video…" line
+            // goes quietly rather than announcing the non-event.
+            PickEvent::Cancelled => {
+                self.status.clear();
+                self.status_is_error = false;
+            }
+            // No dialog could be shown, so the row falls back to what it
+            // was before there was one. It must never be a dead end.
+            PickEvent::Unavailable => {
+                self.status.clear();
+                self.status_is_error = false;
+                self.mode = InputMode::EditSetting {
+                    field: SettingField::ClientBackgroundVideo,
+                    typed: self.client_prefs.background_video.clone(),
+                };
+            }
+        }
+        true
+    }
+
+    /// Open the Explorer dialog for the background-video row, unless one is
+    /// already up: a second Enter while the dialog has focus would spawn a
+    /// second thread whose answer would overwrite the first's.
+    fn open_background_picker(&mut self) {
+        if self.pick_rx.is_some() {
+            return;
+        }
+        let start = filepicker::start_dir(&self.client_prefs.background_video);
+        self.adopt_file_pick(filepicker::spawn_pick(start));
+    }
+
+    /// Take ownership of a dialog's answer channel. Split from
+    /// [`Self::open_background_picker`] because the dialog itself cannot run
+    /// in a test: everything downstream of this call is driven by a channel
+    /// the test makes itself.
+    pub(crate) fn adopt_file_pick(&mut self, receiver: Receiver<PickEvent>) {
+        self.pick_rx = Some(receiver);
+        self.status = "Choosing a video…".into();
+        self.status_is_error = false;
+    }
+
+    /// Turn the background off: forget the path, drop the player, and stop
+    /// any conversion working toward it.
+    fn clear_background_video(&mut self) {
+        self.client_prefs.background_video.clear();
+        self.background = None;
+        self.forget_conversion();
+        self.status = "Background video off · saved for your user".into();
+        self.status_is_error = false;
+        self.persist_client_prefs();
+    }
+
+    /// Adopt a chosen video: persist the path and convert it (or load what
+    /// is already converted for it). Shared by the Explorer dialog and the
+    /// typed-path fallback, which must not diverge.
+    fn set_background_video(&mut self, path: String) {
+        self.client_prefs.background_video = path;
+        self.persist_client_prefs();
+        self.start_background_conversion();
     }
 
     /// Pump the background-video conversion worker. Collected before it is
@@ -1849,6 +1943,16 @@ impl App {
             KeyCode::Char(']') if self.page == Page::Analyzer && !self.analyzer_running => {
                 self.analyzer_window_hours = (self.analyzer_window_hours * 2).min(24);
             }
+            // Enter on the video row opens a dialog rather than a text
+            // box, so there is no longer an "empty it and commit" gesture:
+            // Delete and Backspace are it. Every other TUNE row ignores
+            // both keys.
+            KeyCode::Delete | KeyCode::Backspace
+                if self.page == Page::Settings
+                    && self.focused_setting() == Some(SettingField::ClientBackgroundVideo) =>
+            {
+                self.clear_background_video();
+            }
             KeyCode::Enter | KeyCode::Char('e') if self.page == Page::Settings => {
                 self.begin_setting_edit();
             }
@@ -2088,21 +2192,14 @@ impl App {
                 // pasted path should not have to be de-quoted by hand.
                 let path = typed.trim().trim_matches('"').trim().to_string();
                 if path.is_empty() {
-                    self.client_prefs.background_video.clear();
-                    self.background = None;
-                    self.forget_conversion();
                     self.mode = InputMode::Normal;
-                    self.status = "Background video off · saved for your user".into();
-                    self.status_is_error = false;
-                    self.persist_client_prefs();
+                    self.clear_background_video();
                 } else if !std::path::Path::new(&path).is_file() {
                     self.set_error(format!("No video file at {path}"));
                     self.mode = InputMode::EditSetting { field, typed };
                 } else {
-                    self.client_prefs.background_video = path;
                     self.mode = InputMode::Normal;
-                    self.persist_client_prefs();
-                    self.start_background_conversion();
+                    self.set_background_video(path);
                 }
             }
             KeyCode::Enter if field == SettingField::ClientBackgroundDim => {
@@ -2283,9 +2380,14 @@ impl App {
         self.status_is_error = false;
     }
 
-    pub(crate) fn begin_setting_edit(&mut self) {
+    /// The TUNE row the cursor is on, if the page has any rows at all.
+    pub(crate) fn focused_setting(&self) -> Option<SettingField> {
         let index = self.setting_state.selected().unwrap_or(0);
-        let Some(field) = self.visible_setting_fields().get(index).copied() else {
+        self.visible_setting_fields().get(index).copied()
+    }
+
+    pub(crate) fn begin_setting_edit(&mut self) {
+        let Some(field) = self.focused_setting() else {
             return;
         };
         match field {
@@ -2384,15 +2486,13 @@ impl App {
                 self.status_is_error = false;
                 self.persist_client_prefs();
             }
-            // Both of these prefill with what the person would type, not
-            // with the display value: an empty box rather than "off", and a
-            // bare number rather than "auto (matches clip)".
-            SettingField::ClientBackgroundVideo => {
-                self.mode = InputMode::EditSetting {
-                    field,
-                    typed: self.client_prefs.background_video.clone(),
-                };
-            }
+            // The one setting whose value lives out in the filesystem gets
+            // the dialog every other Windows program opens, rather than
+            // asking the person to know the path by heart. The typed editor
+            // is still there behind it, for a dialog that cannot be shown.
+            SettingField::ClientBackgroundVideo => self.open_background_picker(),
+            // This prefills with what the person would type, not with the
+            // display value: a bare number rather than "auto (matches clip)".
             SettingField::ClientBackgroundFps => {
                 self.mode = InputMode::EditSetting {
                     field,
@@ -5119,6 +5219,210 @@ mod tests {
         assert!(app.convert_rx.as_ref().unwrap().same_channel(&running));
     }
 
+    /// Puts the TUNE cursor on the background-video row.
+    fn focus_video_row(app: &mut App) {
+        app.page = Page::Settings;
+        let row = app
+            .visible_setting_fields()
+            .iter()
+            .position(|field| *field == SettingField::ClientBackgroundVideo)
+            .unwrap();
+        app.setting_state.select(Some(row));
+    }
+
+    /// Arms the app with a dialog channel a test drives by hand. The real
+    /// dialog is modal COM and cannot run headless, so every test goes in
+    /// through here — and pressing Enter on the row with one already armed
+    /// is exactly the double-open case, which must not reach the shell.
+    fn arm_picker(app: &mut App) -> crossbeam_channel::Sender<PickEvent> {
+        let (tx, rx) = bounded::<PickEvent>(1);
+        app.adopt_file_pick(rx);
+        tx
+    }
+
+    #[test]
+    fn choosing_a_file_commits_it_exactly_as_a_typed_path_would() {
+        let (store, prefs_path) = scratch_prefs_store("picker-commit");
+        let source = scratch_background("picker", 20.0);
+        let mut app = App::new_inert();
+        app.adopt_client_prefs(UiPrefs::default(), Some(store.clone()));
+        focus_video_row(&mut app);
+
+        let dialog = arm_picker(&mut app);
+        assert_eq!(app.status, "Choosing a video…");
+        assert!(!app.status_is_error);
+        // Nothing has happened yet: a dialog on screen is not a change.
+        assert!(!app.drain_events());
+        assert!(app.client_prefs.background_video.is_empty());
+
+        dialog
+            .send(PickEvent::Picked(source.to_path_buf()))
+            .unwrap();
+        assert!(app.drain_events());
+
+        assert_eq!(app.client_prefs.background_video, source.to_string_lossy());
+        assert_eq!(store.load().background_video, source.to_string_lossy());
+        assert!(app.convert_rx.is_some(), "status was {}", app.status);
+        wait_for_background(&mut app);
+        assert!(app.background.is_some(), "status was {}", app.status);
+        let _ = std::fs::remove_file(prefs_path);
+    }
+
+    #[test]
+    fn a_dismissed_dialog_changes_nothing_and_says_nothing() {
+        let source = scratch_background("picker-cancel", 20.0);
+        let mut app = App::new_inert();
+        app.adopt_client_prefs(
+            UiPrefs {
+                background_video: source.to_string_lossy().into_owned(),
+                ..UiPrefs::default()
+            },
+            None,
+        );
+        assert!(app.background.is_some(), "status was {}", app.status);
+        focus_video_row(&mut app);
+
+        let dialog = arm_picker(&mut app);
+        dialog.send(PickEvent::Cancelled).unwrap();
+        app.drain_events();
+
+        // The clip that was playing is still playing, the path is untouched,
+        // and the "Choosing a video…" line goes quietly rather than
+        // announcing a non-event.
+        assert_eq!(app.client_prefs.background_video, source.to_string_lossy());
+        assert!(app.background.is_some());
+        assert_eq!(app.status, "");
+        assert!(!app.status_is_error);
+        assert!(matches!(app.mode, InputMode::Normal));
+        // ...and the row is ready to open a dialog again.
+        assert!(app.pick_rx.is_none());
+    }
+
+    #[test]
+    fn a_dialog_thread_that_dies_without_answering_releases_the_row() {
+        // Otherwise the row believes a dialog is still on screen forever
+        // and Enter does nothing for the rest of the session.
+        let mut app = App::new_inert();
+        let dialog = arm_picker(&mut app);
+        drop(dialog);
+
+        app.drain_events();
+
+        assert!(app.pick_rx.is_none());
+        assert_eq!(app.status, "");
+    }
+
+    #[test]
+    fn a_dialog_that_cannot_be_shown_falls_back_to_the_typed_path_editor() {
+        // A machine whose shell will not give us a dialog must still be
+        // able to set a background; the row can never be a dead end.
+        let mut app = App::new_inert();
+        app.client_prefs.background_video = r"C:\clips\current.mp4".into();
+        focus_video_row(&mut app);
+
+        let dialog = arm_picker(&mut app);
+        dialog.send(PickEvent::Unavailable).unwrap();
+        app.drain_events();
+
+        assert!(matches!(
+            app.mode,
+            InputMode::EditSetting { field: SettingField::ClientBackgroundVideo, ref typed }
+                if typed == r"C:\clips\current.mp4"
+        ));
+        assert!(!app.status_is_error, "status was {}", app.status);
+        assert!(app.pick_rx.is_none());
+    }
+
+    #[test]
+    fn enter_while_a_dialog_is_up_does_not_open_a_second_one() {
+        // A second dialog would be a second thread whose answer overwrites
+        // the first's — and this is also what keeps this whole test module
+        // from ever reaching the real, modal shell dialog.
+        let mut app = App::new_inert();
+        focus_video_row(&mut app);
+        let dialog = arm_picker(&mut app);
+        let armed = app.pick_rx.clone().unwrap();
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(
+            app.pick_rx.as_ref().unwrap().same_channel(&armed),
+            "a second dialog replaced the one already on screen"
+        );
+        assert!(matches!(app.mode, InputMode::Normal), "no typed edit opens");
+        // The dialog already up still lands normally.
+        dialog.send(PickEvent::Cancelled).unwrap();
+        app.drain_events();
+        assert!(app.pick_rx.is_none());
+    }
+
+    #[test]
+    fn delete_or_backspace_on_the_video_row_turns_the_background_off() {
+        for key in [KeyCode::Delete, KeyCode::Backspace] {
+            let (store, prefs_path) = scratch_prefs_store("picker-clear");
+            let source = scratch_background("picker-clear", 20.0);
+            let mut app = App::new_inert();
+            app.adopt_client_prefs(
+                UiPrefs {
+                    background_video: source.to_string_lossy().into_owned(),
+                    ..UiPrefs::default()
+                },
+                Some(store.clone()),
+            );
+            assert!(app.background.is_some(), "status was {}", app.status);
+            focus_video_row(&mut app);
+
+            app.handle_key(KeyEvent::new(key, KeyModifiers::NONE));
+
+            assert!(app.client_prefs.background_video.is_empty(), "{key:?}");
+            assert!(store.load().background_video.is_empty(), "{key:?}");
+            assert!(app.background.is_none(), "{key:?}");
+            assert!(app.convert_rx.is_none(), "{key:?}");
+            assert_eq!(
+                app.setting_value(SettingField::ClientBackgroundVideo),
+                "off"
+            );
+            assert!(!app.status_is_error);
+            let _ = std::fs::remove_file(prefs_path);
+        }
+    }
+
+    #[test]
+    fn delete_leaves_every_other_tune_row_alone() {
+        // The clear gesture belongs to one row; it must not become a way to
+        // blank the theme or the dim percentage by leaning on a key.
+        let source = scratch_background("picker-other-row", 20.0);
+        let mut app = App::new_inert();
+        app.adopt_client_prefs(
+            UiPrefs {
+                background_video: source.to_string_lossy().into_owned(),
+                ..UiPrefs::default()
+            },
+            None,
+        );
+        app.page = Page::Settings;
+        for field in [
+            SettingField::ClientBackgroundQuality,
+            SettingField::ClientBackgroundDim,
+            SettingField::ClientTheme,
+            SettingField::Sustained,
+        ] {
+            let row = app
+                .visible_setting_fields()
+                .iter()
+                .position(|other| *other == field)
+                .unwrap();
+            app.setting_state.select(Some(row));
+            app.handle_key(KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE));
+            app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+            assert_eq!(
+                app.client_prefs.background_video,
+                source.to_string_lossy(),
+                "{field:?} cleared the video row"
+            );
+        }
+    }
+
     #[test]
     fn committing_a_dim_edit_clamps_and_persists() {
         let (store, path) = scratch_prefs_store("background-dim");
@@ -5301,20 +5605,15 @@ mod tests {
 
     #[test]
     fn committing_a_background_path_converts_it_then_an_empty_one_turns_it_off() {
+        // The typed editor is the fallback behind the Explorer dialog — it
+        // is what a machine whose shell will not give us a dialog gets, so
+        // it has to keep working exactly as it did.
         let (store, prefs_path) = scratch_prefs_store("background-video");
         let source = scratch_background("commit", 20.0);
         let mut app = App::new_inert();
         app.adopt_client_prefs(UiPrefs::default(), Some(store.clone()));
         app.page = Page::Settings;
         app.setting_state.select(Some(5));
-
-        // Enter opens a typed edit prefilled with the stored path (none yet).
-        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        assert!(matches!(
-            app.mode,
-            InputMode::EditSetting { field: SettingField::ClientBackgroundVideo, ref typed }
-                if typed.is_empty()
-        ));
 
         // A pasted, quoted Windows path commits and starts the conversion.
         app.mode = InputMode::EditSetting {

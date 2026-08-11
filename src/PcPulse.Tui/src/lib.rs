@@ -9,6 +9,7 @@ pub mod client;
 pub mod clipconvert;
 pub mod crashdump;
 pub mod effects;
+pub mod filepicker;
 pub mod format;
 pub mod notifier;
 pub mod prefs;

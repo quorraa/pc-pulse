@@ -6070,7 +6070,7 @@ const HELP_GLOBAL: [(&str, &str); 12] = [
     ("q / Ctrl-C", "quit"),
     ("?", "keys overlay on any page"),
 ];
-const HELP_CONTEXTUAL: [(&str, &str); 22] = [
+const HELP_CONTEXTUAL: [(&str, &str); 23] = [
     ("/", "filter name / path / PID"),
     ("o", "cycle process sort"),
     ("g", "agent-only process focus"),
@@ -6096,6 +6096,10 @@ const HELP_CONTEXTUAL: [(&str, &str); 22] = [
     (
         "Enter on Refresh rate",
         "cycle off / 30 / 60 fps smooth refresh",
+    ),
+    (
+        "Enter on Background video",
+        "choose a video file; Del / Backspace turns it off",
     ),
     ("s", "save settings"),
     ("Esc", "cancel input / modal"),
