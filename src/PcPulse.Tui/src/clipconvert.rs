@@ -518,7 +518,8 @@ fn probe(source: &Path) -> Result<String> {
     Ok(banner)
 }
 
-/// Reads exactly one frame (`FRAME_LEN` bytes) from `reader` into `buf`.
+/// Reads exactly one frame — `buf.len()` bytes, sized by `frame_len` for
+/// the capture dimensions in force — from `reader` into `buf`.
 /// Returns `Ok(true)` on a full frame, `Ok(false)` on a clean end-of-stream
 /// (no bytes read before EOF), and `Err` for a short read that stops
 /// mid-frame or any I/O error.

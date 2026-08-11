@@ -179,7 +179,11 @@ impl Background {
         self.generation
     }
 
-    /// The index of the frame `current_pixels` will serve.
+    /// The index wall time says is current — the frame `current_pixels`
+    /// will try to serve. It is what actually comes back on every call but
+    /// one: a decode that fails serves the previously decoded frame instead
+    /// and reports the failure through `failed()`, leaving this index
+    /// pointing at the frame that could not be read.
     pub fn current_index(&self) -> u32 {
         self.current_index
     }
