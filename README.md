@@ -14,7 +14,7 @@ PC Pulse alerts on sustained conditions and learned baseline deviations, not iso
 
 ## Quick start
 
-1. Download `PcPulse-1.16.1-x64.msi` and `SHA256SUMS.txt` from the [latest release](https://github.com/quorraa/pc-pulse/releases/latest).
+1. Download `PcPulse-1.16.2-x64.msi` and `SHA256SUMS.txt` from the [latest release](https://github.com/quorraa/pc-pulse/releases/latest).
 2. Verify the MSI's SHA-256 hash against the manifest.
 3. Install the MSI from an elevated terminal or Explorer.
 4. Open **PC Pulse** from Start. The collector runs as the `PcPulseCollector` Windows service.
@@ -115,7 +115,7 @@ For automation, `PcPulse.exe analyze 1` produces a one-shot plan, and `agent-con
 
 ## Updates
 
-The TUI checks this repository's GitHub releases for a newer version once per launch, at most every 20 hours, using Windows' bundled `curl.exe` — a client-side courtesy; the collector service never touches the network. When a newer release exists, the chrome shows a quiet `⇡ v1.16.1 available · u` badge: the first `u` downloads the MSI and `SHA256SUMS.txt` to your Downloads folder and verifies the SHA-256 (a file that fails verification is deleted), and the second `u` launches the installer — never silently, never automatically. The "Update checks" row in Settings' CLIENT section switches the check off entirely; when off, no update-related network request is ever made.
+The TUI checks this repository's GitHub releases for a newer version once per launch, at most every 20 hours, using Windows' bundled `curl.exe` — a client-side courtesy; the collector service never touches the network. When a newer release exists, the chrome shows a quiet `⇡ v1.16.2 available · u` badge: the first `u` downloads the MSI and `SHA256SUMS.txt` to your Downloads folder and verifies the SHA-256 (a file that fails verification is deleted), and the second `u` launches the installer — never silently, never automatically. The "Update checks" row in Settings' CLIENT section switches the check off entirely; when off, no update-related network request is ever made.
 
 ## Build and test
 
@@ -130,7 +130,7 @@ cargo build --workspace --release
 Build the three executables, MSI, and SHA-256 manifest (add `-CertificateThumbprint YOUR_SHA1_THUMBPRINT` for a signed release):
 
 ```powershell
-.\scripts\Build-Release.ps1 -Architecture x64 -Version 1.16.1
+.\scripts\Build-Release.ps1 -Architecture x64 -Version 1.16.2
 ```
 
 Outputs land in `artifacts`. `scripts\Measure-CollectorBudget.ps1` validates the collector's resource budgets from an elevated terminal.
@@ -145,7 +145,7 @@ Repository layout:
 ## Install and run
 
 ```powershell
-msiexec.exe /i .\artifacts\PcPulse-1.16.1-x64.msi
+msiexec.exe /i .\artifacts\PcPulse-1.16.2-x64.msi
 ```
 
 Open **PC Pulse** from Start, or run `& "$env:ProgramFiles\PC Pulse\PcPulse.exe"`. Verify the service and IPC:
@@ -162,7 +162,7 @@ For scripts and agent runs, `PcPulse.exe ping | snapshot | alerts | logs 24 | ag
 Uninstall via Apps > Installed apps, or:
 
 ```powershell
-msiexec.exe /x .\artifacts\PcPulse-1.16.1-x64.msi
+msiexec.exe /x .\artifacts\PcPulse-1.16.2-x64.msi
 ```
 
 For development installs, `scripts\Uninstall-Service.ps1` removes everything; pass `-KeepHistory` to retain `%ProgramData%\PcPulse`.
