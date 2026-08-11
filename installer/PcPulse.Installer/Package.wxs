@@ -8,6 +8,15 @@
     <!-- Icon Id carries an .exe suffix so ICE50 accepts it on the advertised
          Start Menu shortcut, whose key file is PcPulse.exe. -->
     <Icon Id="PcPulseIcon.exe" SourceFile="..\..\docs\media\pcpulse.ico" />
+
+    <!-- The notification helper must not outlive its replacement: a stale
+         tray kept running pre-upgrade code until logoff (field incident).
+         WM_CLOSE first (its window procedure exits cleanly), terminate as
+         the fallback; the Run key or the TUI's startup self-heal brings the
+         fresh one back. -->
+    <util:CloseApplication Id="CloseNotifier" Target="PcPulse.Notify.exe"
+                           CloseMessage="yes" TerminateProcess="0" RebootPrompt="no"
+                           Description="PC Pulse tray helper is restarting for the upgrade." />
     <Property Id="ARPPRODUCTICON" Value="PcPulseIcon.exe" />
 
     <Feature Id="MainFeature" Title="PC Pulse" Level="1">

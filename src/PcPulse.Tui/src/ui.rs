@@ -2963,18 +2963,20 @@ fn render_pressure_field(frame: &mut Frame<'_>, app: &App, area: Rect) {
         " ∿ PRESSURE FIELD  CPU {:>5.1}%  /  MEM {:>5.1}% ",
         shown.cpu_percent, memory_now
     );
-    // Half-block cells paint a dense field; braille reads as scattered dots
-    // for slowly-varying series at live-pane sizes.
+    // Braille line traces, like the CHRONICLE resource field: with x-bounds
+    // spanning real history and the 8 Hz live tail in smooth mode the lines
+    // read continuous, and the half-block band this replaced looked blocky
+    // (user feedback) rather than like a plotted signal.
     let datasets = vec![
         Dataset::default()
             .name("CPU")
-            .marker(symbols::Marker::HalfBlock)
+            .marker(symbols::Marker::Braille)
             .graph_type(GraphType::Line)
             .style(Style::default().fg(palette().ok))
             .data(&cpu),
         Dataset::default()
             .name("MEM")
-            .marker(symbols::Marker::HalfBlock)
+            .marker(symbols::Marker::Braille)
             .graph_type(GraphType::Line)
             .style(Style::default().fg(palette().alt))
             .data(&memory),
@@ -7179,8 +7181,9 @@ mod tests {
         let backend = render(&mut app);
         let buffer = backend.buffer();
         let width = usize::from(buffer.area.width);
-        // The CPU series must paint a dense half-block band across the pane,
-        // not a couple of stray dots pinned to one edge.
+        // The CPU series must paint a continuous braille trace across the
+        // pane — not a couple of stray dots pinned to one edge (the original
+        // x-bounds bug) and not the blocky half-block band it briefly became.
         let dense = buffer
             .content()
             .iter()
@@ -7189,8 +7192,9 @@ mod tests {
                 let x = (index % width) as u16;
                 let y = (index / width) as u16;
                 point_in(field, (x, y))
-                    && matches!(cell.symbol(), "▀" | "▄" | "█")
-                    && (cell.fg == palette().ok || cell.bg == palette().ok)
+                    && ('\u{2800}'..='\u{28FF}')
+                        .contains(&cell.symbol().chars().next().unwrap_or(' '))
+                    && cell.fg == palette().ok
             })
             .count();
         assert!(dense > 40, "pressure field too sparse: {dense} cells");
