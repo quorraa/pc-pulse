@@ -26,7 +26,13 @@
         <File Id="CollectorExe" Source="..\..\artifacts\publish\PcPulse.Service.exe" KeyPath="yes" />
         <ServiceInstall Id="CollectorServiceInstall" Name="PcPulseCollector"
                         DisplayName="PC Pulse Collector" Description="Collects low-overhead Windows performance and diagnostic evidence for PC Pulse."
-                        Type="ownProcess" Start="auto" ErrorControl="normal" Account="LocalSystem" />
+                        Type="ownProcess" Start="auto" ErrorControl="normal" Account="LocalSystem">
+          <!-- Start-only grant for interactive standard users so the TUI's
+               launch-time self-heal can restart a stopped collector without
+               a UAC prompt. Deliberately excludes stop, pause, and any
+               configuration rights. -->
+          <util:PermissionEx User="Users" ServiceQueryStatus="yes" ServiceStart="yes" />
+        </ServiceInstall>
         <ServiceControl Id="CollectorServiceControl" Name="PcPulseCollector"
                         Start="install" Stop="both" Remove="uninstall" Wait="yes" />
         <util:ServiceConfig ServiceName="PcPulseCollector" FirstFailureActionType="restart" SecondFailureActionType="restart"

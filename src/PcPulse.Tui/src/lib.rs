@@ -2,6 +2,7 @@
 
 pub mod analyzer;
 pub mod app;
+pub mod bootstrap;
 pub mod chat_history;
 pub mod client;
 pub mod crashdump;
@@ -13,3 +14,4 @@ pub mod theme;
 pub mod treemap;
 pub mod tween;
 pub mod ui;
+pub mod update;

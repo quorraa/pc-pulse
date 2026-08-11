@@ -49,6 +49,12 @@ pub struct UiPrefs {
     /// Smooth-refresh rate: `0` = event-driven (default), else 30 or 60 fps
     /// fixed-cadence drawing with tweened meters.
     pub refresh_fps: u32,
+    /// Whether the TUI may ask GitHub for a newer release at launch. Off
+    /// means no update-related network request is ever made.
+    pub update_checks: bool,
+    /// When the last release check completed (Unix ms); launches within the
+    /// 20-hour cadence window skip the check entirely.
+    pub last_update_check_ms: i64,
 }
 
 impl Default for UiPrefs {
@@ -58,6 +64,8 @@ impl Default for UiPrefs {
             effects: true,
             analyzer_timeout_secs: DEFAULT_ANALYZER_TIMEOUT_SECS,
             refresh_fps: 0,
+            update_checks: true,
+            last_update_check_ms: 0,
         }
     }
 }
@@ -178,6 +186,8 @@ mod tests {
             effects: false,
             analyzer_timeout_secs: 600,
             refresh_fps: 30,
+            update_checks: false,
+            last_update_check_ms: 1_800_000_000_000,
         };
         store.save(&prefs).unwrap();
         assert_eq!(store.load(), prefs);
@@ -185,6 +195,8 @@ mod tests {
         assert!(raw.contains("\"avionics\""));
         assert!(raw.contains("analyzerTimeoutSecs"));
         assert!(raw.contains("refreshFps"));
+        assert!(raw.contains("updateChecks"));
+        assert!(raw.contains("lastUpdateCheckMs"));
         let _ = fs::remove_file(path);
     }
 
@@ -211,6 +223,7 @@ mod tests {
             effects: true,
             analyzer_timeout_secs: 450,
             refresh_fps: 60,
+            ..UiPrefs::default()
         };
         store.save(&stored).unwrap();
         let effective = store.load().overridden(Some(ThemeId::Vitals), true);
@@ -286,6 +299,29 @@ mod tests {
                 .unwrap()
                 .contains("\"refreshFps\": 60")
         );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn update_check_prefs_round_trip_and_default_to_on() {
+        // Absent fields (files written by pre-v1.16 releases) mean checks
+        // are on and never performed yet.
+        let (store, path) = scratch_store("updates");
+        fs::write(&path, br#"{ "theme": "vitals" }"#).unwrap();
+        let prefs = store.load();
+        assert!(prefs.update_checks, "the toggle defaults to on");
+        assert_eq!(prefs.last_update_check_ms, 0);
+        // An explicit off and a stamped check time survive the round trip.
+        store
+            .save(&UiPrefs {
+                update_checks: false,
+                last_update_check_ms: 1_755_000_000_123,
+                ..UiPrefs::default()
+            })
+            .unwrap();
+        let reloaded = store.load();
+        assert!(!reloaded.update_checks);
+        assert_eq!(reloaded.last_update_check_ms, 1_755_000_000_123);
         let _ = fs::remove_file(path);
     }
 

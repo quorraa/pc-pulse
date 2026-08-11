@@ -2,6 +2,7 @@ use anyhow::{Result, bail};
 use pcpulse_tui::{
     analyzer,
     app::{App, InputMode},
+    bootstrap,
     client::PipeClient,
     effects::MotionSystem,
     prefs, theme, ui,
@@ -210,6 +211,12 @@ fn run_tui(options: TuiOptions) -> Result<()> {
     }
     let effective = saved.overridden(options.theme, options.effects_off);
     theme::set_active(effective.theme);
+    // Self-heal the companions before the terminal takes over and before
+    // App::new spawns the worker: start a stopped collector service and
+    // bring back a missing tray helper. Best-effort and bounded — every
+    // failure degrades to the existing offline panel, and the pipe-retry
+    // loop meets a freshly started service as it comes up.
+    let healed = bootstrap::ensure_companions();
     let mut terminal = ratatui::try_init()?;
     if let Err(error) = execute!(std::io::stdout(), EnableMouseCapture) {
         let _ = ratatui::try_restore();
@@ -218,7 +225,7 @@ fn run_tui(options: TuiOptions) -> Result<()> {
     let result = terminal
         .clear()
         .map_err(anyhow::Error::from)
-        .and_then(|_| run_loop(&mut terminal, effective, store));
+        .and_then(|_| run_loop(&mut terminal, effective, store, healed));
     let mouse_restore =
         execute!(std::io::stdout(), DisableMouseCapture).map_err(anyhow::Error::from);
     let restore = ratatui::try_restore().map_err(anyhow::Error::from);
@@ -229,9 +236,16 @@ fn run_loop(
     terminal: &mut ratatui::DefaultTerminal,
     effective: prefs::UiPrefs,
     store: Option<prefs::PrefsStore>,
+    healed: Option<String>,
 ) -> Result<()> {
     let mut app = App::new();
     app.adopt_client_prefs(effective, store);
+    // Surface a launch-time heal once, before the first draw; the next
+    // worker event replaces it like any other status line.
+    if let Some(message) = healed {
+        app.status = message;
+        app.status_is_error = false;
+    }
     let mut motion = MotionSystem::new(&app, effective.effects);
     // MotionSystem does not expose its enabled state; mirror it so TUNE
     // toggles can be reconciled through `toggle()`.

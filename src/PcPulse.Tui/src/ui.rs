@@ -2,7 +2,7 @@ use crate::{
     analyzer::ChatRole,
     app::{
         AlertSort, AlertView, App, InputMode, Page, ProcessSort, SettingField, SettingSort,
-        SuspectSort, TreeSort,
+        SuspectSort, TreeSort, UpdateState,
     },
     format,
     theme::{self, LayoutKind, palette},
@@ -1031,6 +1031,27 @@ fn render_rail_keys(frame: &mut Frame<'_>, app: &App, area: Rect) {
         Paragraph::new(lines).style(Style::default().bg(palette().surface)),
         area,
     );
+    // The update badge seats on the rail's last free row, directly above
+    // the bottom status block — persistent chrome, never a status line.
+    // The rail's size floor guarantees slack below the nine bezel keys.
+    if area.height > Page::ALL.len() as u16
+        && let Some(badge) = update_badge_text(app, true)
+    {
+        let row = Rect {
+            x: area.x,
+            y: area.bottom().saturating_sub(1),
+            width: area.width,
+            height: 1,
+        };
+        frame.render_widget(
+            Paragraph::new(Line::styled(
+                format!(" {badge}"),
+                Style::default().fg(palette().info).bold(),
+            ))
+            .style(Style::default().bg(palette().surface)),
+            row,
+        );
+    }
 }
 
 /// Bottom status block: link state, sample clock, motion badge, abbreviated
@@ -1193,6 +1214,34 @@ fn rail_status_line(app: &App) -> Line<'static> {
     }
 }
 
+/// The chrome update badge: persistent, unobtrusive, present in all three
+/// profiles once a newer release is known. `compact` fits the vitals
+/// header corner and the 16-column rail; the ledger dateline prints the
+/// full form.
+fn update_badge_text(app: &App, compact: bool) -> Option<String> {
+    let (version, suffix) = match &app.update {
+        UpdateState::Idle => return None,
+        UpdateState::Available(info) => {
+            (&info.version, if compact { " · u" } else { " available · u" })
+        }
+        UpdateState::Downloading(info) => {
+            (&info.version, if compact { " ↓…" } else { " downloading…" })
+        }
+        UpdateState::Verified { info, .. } => (
+            &info.version,
+            if compact {
+                " ready · u"
+            } else {
+                " verified — press u to install"
+            },
+        ),
+        UpdateState::Launched(info) => {
+            (&info.version, if compact { " …" } else { " installing" })
+        }
+    };
+    Some(format!("⇡ v{version}{suffix}"))
+}
+
 fn render_header(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let (status, status_color) = if app.connected {
         let etw = app
@@ -1264,25 +1313,30 @@ fn render_header(frame: &mut Frame<'_>, app: &App, area: Rect) {
     } else {
         "awaiting first telemetry frame".into()
     };
+    let mut header_right = Vec::new();
+    if let Some(badge) = update_badge_text(app, true) {
+        header_right.push(Span::styled(
+            format!("{badge}   "),
+            Style::default().fg(palette().info).bold(),
+        ));
+    }
+    header_right.push(Span::styled(
+        format!("♥ {status}"),
+        Style::default().fg(status_color).bold(),
+    ));
+    header_right.push(Span::styled(
+        format!("   ⚑ {active} OPEN   v{version} "),
+        Style::default()
+            .fg(if active > 0 {
+                palette().warn
+            } else {
+                palette().muted
+            })
+            .bold(),
+    ));
     frame.render_widget(
         Paragraph::new(vec![
-            Line::from(vec![
-                Span::styled(
-                    format!("♥ {status}"),
-                    Style::default().fg(status_color).bold(),
-                ),
-                Span::styled(
-                    format!("   ⚑ {active} OPEN   v{version} "),
-                    Style::default()
-                        .fg(if active > 0 {
-                            palette().warn
-                        } else {
-                            palette().muted
-                        })
-                        .bold(),
-                ),
-            ])
-            .alignment(Alignment::Right),
+            Line::from(header_right).alignment(Alignment::Right),
             Line::styled(telemetry, Style::default().fg(palette().muted))
                 .alignment(Alignment::Right),
         ])
@@ -1530,6 +1584,12 @@ fn render_masthead(frame: &mut Frame<'_>, app: &App, area: Rect) {
         ),
         Style::default().fg(palette().alt).bold(),
     ));
+    if let Some(badge) = update_badge_text(app, false) {
+        dateline.push(Span::styled(
+            format!(" · {badge}"),
+            Style::default().fg(palette().info).bold(),
+        ));
+    }
     frame.render_widget(
         Paragraph::new(Line::from(dateline))
             .alignment(Alignment::Center)
@@ -5704,7 +5764,7 @@ fn render_setting_detail(
 /// to sit on one line at ≥100 terminal columns; anything that still must
 /// wrap does so through [`help_lines`]' hanging indent, so the two-column
 /// grid never sheds orphan full-width words.
-const HELP_GLOBAL: [(&str, &str); 11] = [
+const HELP_GLOBAL: [(&str, &str); 12] = [
     ("1–8", "jump to a page"),
     ("Tab / Shift-Tab", "next / previous page"),
     ("j / k, ↑ / ↓", "move selection"),
@@ -5714,6 +5774,7 @@ const HELP_GLOBAL: [(&str, &str); 11] = [
     ("mouse wheel", "scroll the active view"),
     ("m", "toggle motion effects"),
     ("t", "cycle presentation profile"),
+    ("u", "download and install a newer release when the header shows one"),
     ("q / Ctrl-C", "quit"),
     ("?", "keys overlay on any page"),
 ];
@@ -7377,7 +7438,10 @@ mod tests {
         let mut app = sample_app();
         assert_eq!(app.page, Page::Overview);
         app.help_overlay = Some(0);
-        let backend = render(&mut app);
+        // A little taller than the default fixture: the global section
+        // grew a `u` row, and this probe reads an unscrolled overlay all
+        // the way down to the Oracle rows.
+        let backend = render_size(&mut app, 150, 50);
         let text = buffer_text(backend.buffer());
         // The overlay shows the same keys content the Keys page carries…
         assert!(text.contains("? KEYS"));
@@ -7874,6 +7938,70 @@ mod tests {
         assert_eq!(market_value(3, &sample), 15.0);
         assert_eq!(market_value(4, &sample), 7.0);
         assert_eq!(market_value(5, &sample), 125.0);
+    }
+
+    fn arm_available_update(app: &mut App) {
+        app.update = UpdateState::Available(crate::update::UpdateInfo {
+            version: "9.9.9".into(),
+            html_url: "https://example.invalid/release".into(),
+            msi_name: "PcPulse-9.9.9-x64.msi".into(),
+            msi_url: "https://example.invalid/PcPulse-9.9.9-x64.msi".into(),
+            msi_size_bytes: 2_000_000,
+            sums_name: "SHA256SUMS.txt".into(),
+            sums_url: "https://example.invalid/SHA256SUMS.txt".into(),
+        });
+    }
+
+    #[test]
+    fn update_badge_prints_in_all_three_profiles_when_available() {
+        // Vitals: the statusline header's right side.
+        {
+            let _theme = theme::test_support::activate(theme::ThemeId::Vitals);
+            let mut app = sample_app();
+            let clean = buffer_text(render(&mut app).buffer());
+            assert!(!clean.contains("⇡ v"), "no badge while Idle");
+            arm_available_update(&mut app);
+            let text = buffer_text(render(&mut app).buffer());
+            assert!(text.contains("⇡ v9.9.9 · u"), "vitals header badge");
+        }
+        // Avionics: the rail's bottom block, compact for 16 columns.
+        {
+            let _theme = theme::test_support::activate(theme::ThemeId::Avionics);
+            let mut app = sample_app();
+            arm_available_update(&mut app);
+            let text = buffer_text(render(&mut app).buffer());
+            assert!(text.contains("⇡ v9.9.9 · u"), "rail badge");
+        }
+        // Ledger: the masthead dateline prints the full form.
+        {
+            let _theme = theme::test_support::activate(theme::ThemeId::Ledger);
+            let mut app = sample_app();
+            arm_available_update(&mut app);
+            let text = buffer_text(render(&mut app).buffer());
+            assert!(
+                text.contains("⇡ v9.9.9 available · u"),
+                "masthead dateline badge"
+            );
+        }
+    }
+
+    #[test]
+    fn update_badge_tracks_the_download_and_verify_phases() {
+        let _theme = theme::test_support::activate(theme::ThemeId::Vitals);
+        let mut app = sample_app();
+        arm_available_update(&mut app);
+        let UpdateState::Available(info) = app.update.clone() else {
+            unreachable!();
+        };
+        app.update = UpdateState::Downloading(info.clone());
+        let text = buffer_text(render(&mut app).buffer());
+        assert!(text.contains("⇡ v9.9.9 ↓…"), "downloading phase");
+        app.update = UpdateState::Verified {
+            info,
+            installer: std::path::PathBuf::from(r"C:\Users\x\Downloads\PcPulse-9.9.9-x64.msi"),
+        };
+        let text = buffer_text(render(&mut app).buffer());
+        assert!(text.contains("⇡ v9.9.9 ready · u"), "verified phase");
     }
 
     #[test]

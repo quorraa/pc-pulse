@@ -4,6 +4,7 @@ use crate::{
     client::PipeClient,
     prefs::{self, PrefsStore, UiPrefs},
     theme,
+    update::{self, UpdateInfo},
 };
 use chrono::Utc;
 use crossbeam_channel::{Receiver, Sender, bounded, select};
@@ -21,6 +22,7 @@ use ratatui::{
 };
 use std::{
     collections::VecDeque,
+    path::PathBuf,
     str::FromStr,
     sync::{
         Arc,
@@ -289,6 +291,7 @@ pub enum SettingField {
     ClientEffects,
     ClientRefresh,
     ClientTimeout,
+    ClientUpdates,
     SampleInterval,
     Retention,
     Sustained,
@@ -313,11 +316,12 @@ pub enum SettingField {
 impl SettingField {
     /// Local terminal preferences: stored per user in `ui-prefs.json` and
     /// never sent to (or validated by) the collector service.
-    pub const CLIENT: [Self; 4] = [
+    pub const CLIENT: [Self; 5] = [
         Self::ClientTheme,
         Self::ClientEffects,
         Self::ClientRefresh,
         Self::ClientTimeout,
+        Self::ClientUpdates,
     ];
 
     /// Service-validated detector settings, saved through the pipe with `s`.
@@ -343,11 +347,12 @@ impl SettingField {
         Self::AgentPatterns,
     ];
 
-    pub const ALL: [Self; 23] = [
+    pub const ALL: [Self; 24] = [
         Self::ClientTheme,
         Self::ClientEffects,
         Self::ClientRefresh,
         Self::ClientTimeout,
+        Self::ClientUpdates,
         Self::SampleInterval,
         Self::Retention,
         Self::Sustained,
@@ -372,7 +377,11 @@ impl SettingField {
     pub const fn is_client(self) -> bool {
         matches!(
             self,
-            Self::ClientTheme | Self::ClientEffects | Self::ClientRefresh | Self::ClientTimeout
+            Self::ClientTheme
+                | Self::ClientEffects
+                | Self::ClientRefresh
+                | Self::ClientTimeout
+                | Self::ClientUpdates
         )
     }
 
@@ -382,6 +391,7 @@ impl SettingField {
             Self::ClientEffects => "Motion effects",
             Self::ClientRefresh => "Refresh rate",
             Self::ClientTimeout => "Oracle time budget",
+            Self::ClientUpdates => "Update checks",
             Self::SampleInterval => "Sample interval",
             Self::Retention => "History retention",
             Self::Sustained => "Sustained samples",
@@ -406,7 +416,9 @@ impl SettingField {
 
     pub const fn unit(self) -> &'static str {
         match self {
-            Self::ClientTheme | Self::ClientEffects | Self::ClientRefresh => "local",
+            Self::ClientTheme | Self::ClientEffects | Self::ClientRefresh | Self::ClientUpdates => {
+                "local"
+            }
             Self::ClientTimeout => "seconds",
             Self::SampleInterval | Self::SlowLaunch => "ms",
             Self::Retention => "days",
@@ -444,6 +456,11 @@ impl SettingField {
             Self::ClientTimeout => {
                 "How many seconds one Oracle analysis may run before it is cancelled. Saved \
                  for your user and applied the next time PC Pulse starts."
+            }
+            Self::ClientUpdates => {
+                "Whether PC Pulse asks GitHub for a newer release once per launch (at most \
+                 every 20 hours). Enter toggles; off means no update-related network \
+                 request is ever made."
             }
             Self::SampleInterval => {
                 "How often PC Pulse measures the whole machine, in milliseconds. Shorter \
@@ -529,9 +546,11 @@ impl SettingField {
         match self {
             // Client preferences live outside the service `Settings`; the
             // TUNE page reads them through `App::setting_value`.
-            Self::ClientTheme | Self::ClientEffects | Self::ClientRefresh | Self::ClientTimeout => {
-                String::new()
-            }
+            Self::ClientTheme
+            | Self::ClientEffects
+            | Self::ClientRefresh
+            | Self::ClientTimeout
+            | Self::ClientUpdates => String::new(),
             Self::SampleInterval => settings.sample_interval_ms.to_string(),
             Self::Retention => settings.retention_days.to_string(),
             Self::Sustained => settings.sustained_samples.to_string(),
@@ -561,7 +580,11 @@ impl SettingField {
 
     pub fn assign(self, settings: &mut Settings, input: &str) -> Result<(), String> {
         match self {
-            Self::ClientTheme | Self::ClientEffects | Self::ClientRefresh | Self::ClientTimeout => {
+            Self::ClientTheme
+            | Self::ClientEffects
+            | Self::ClientRefresh
+            | Self::ClientTimeout
+            | Self::ClientUpdates => {
                 return Err("local client preference — edited through its own handler".into());
             }
             Self::SampleInterval => {
@@ -657,6 +680,12 @@ pub enum WorkerCommand {
         archived: bool,
     },
     Terminate(u32),
+    /// One launch-time release check against GitHub; sent only when the
+    /// `updateChecks` preference is on and the 20-hour cadence is due.
+    CheckUpdate,
+    /// Download the release's MSI and checksum manifest into the user's
+    /// Downloads folder and verify the SHA-256 (the first `u` press).
+    DownloadUpdate(UpdateInfo),
     /// Reconcile live polling with the effective refresh rate: `fps == 0`
     /// stops the `live` requests entirely (event-driven mode stays
     /// byte-identical to pre-live behavior); otherwise the worker polls at
@@ -683,6 +712,12 @@ pub enum WorkerEvent {
     Chat(Result<ChatResponse, String>),
     Settings(Result<Settings, String>),
     Action(Result<String, String>),
+    /// The launch-time release check: `Ok(Some)` = a newer release with a
+    /// downloadable MSI, `Ok(None)` = up to date, `Err` = offline, rate
+    /// limited, or curl missing — all failures stay silent in the UI.
+    UpdateCheck(Result<Option<UpdateInfo>, String>),
+    /// The verified installer path from a `DownloadUpdate` run.
+    UpdateDownload(Result<PathBuf, String>),
 }
 
 pub struct Worker {
@@ -849,6 +884,38 @@ fn worker_loop(commands: Receiver<WorkerCommand>, events: Sender<WorkerEvent>) {
                         let _ = events.send(WorkerEvent::Action(result));
                         next_snapshot = Instant::now();
                     }
+                    Ok(WorkerCommand::CheckUpdate) => {
+                        // Fire-and-forget on its own thread so a slow or
+                        // stalled HTTPS exchange never delays snapshots.
+                        let update_events = events.clone();
+                        let _ = thread::Builder::new()
+                            .name("pcpulse-update-check".into())
+                            .spawn(move || {
+                                let result = update::check_for_update(
+                                    &update::SystemTransport,
+                                    env!("CARGO_PKG_VERSION"),
+                                )
+                                .map_err(error_text);
+                                let _ = update_events.send(WorkerEvent::UpdateCheck(result));
+                            });
+                    }
+                    Ok(WorkerCommand::DownloadUpdate(info)) => {
+                        let update_events = events.clone();
+                        let _ = thread::Builder::new()
+                            .name("pcpulse-update-download".into())
+                            .spawn(move || {
+                                let result = update::downloads_directory()
+                                    .and_then(|directory| {
+                                        update::download_and_verify(
+                                            &update::SystemTransport,
+                                            &info,
+                                            &directory,
+                                        )
+                                    })
+                                    .map_err(error_text);
+                                let _ = update_events.send(WorkerEvent::UpdateDownload(result));
+                            });
+                    }
                     Ok(WorkerCommand::ConfigureLive { fps }) => {
                         live_every = live_poll_interval(fps);
                         next_live = Instant::now();
@@ -901,6 +968,23 @@ fn error_text(error: anyhow::Error) -> String {
 /// Where the Oracle `y` copy writes its text; swappable so tests never
 /// spawn `clip.exe`.
 pub(crate) type ClipboardSink = Box<dyn Fn(&str) -> Result<(), String>>;
+
+/// How a verified installer is launched on the second `u` press; swappable
+/// so tests never spawn `msiexec.exe`.
+pub(crate) type InstallerLauncher = Box<dyn Fn(&std::path::Path) -> Result<(), String>>;
+
+/// The `u`-key update flow: strictly forward, one press per transition.
+/// `Idle → Available` on discovery, `Available → Downloading` on the first
+/// press, `Downloading → Verified` when the checksum matches (a failure
+/// resets to `Available`), `Verified → Launched` on the second press.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UpdateState {
+    Idle,
+    Available(UpdateInfo),
+    Downloading(UpdateInfo),
+    Verified { info: UpdateInfo, installer: PathBuf },
+    Launched(UpdateInfo),
+}
 
 pub struct App {
     pub page: Page,
@@ -1001,6 +1085,12 @@ pub struct App {
     /// Clipboard sink for the Oracle `y` copy. The real path pipes UTF-16LE
     /// into `clip.exe`; tests substitute a recorder.
     pub(crate) clipboard: ClipboardSink,
+    /// Where the release update flow stands; the chrome badge and the `u`
+    /// key both read this.
+    pub update: UpdateState,
+    /// Installer launcher for the second `u` press. The real path spawns
+    /// `msiexec.exe /i` detached; tests substitute a recorder.
+    pub(crate) installer: InstallerLauncher,
     pub process_state: TableState,
     pub tree_state: TableState,
     pub alert_state: TableState,
@@ -1099,6 +1189,10 @@ impl App {
             needs_terminal_clear: false,
             effects_request: None,
             clipboard: Box::new(write_clipboard_via_clip),
+            update: UpdateState::Idle,
+            installer: Box::new(|msi| {
+                update::launch_installer(msi).map_err(|error| format!("{error:#}"))
+            }),
             process_state: TableState::default().with_selected(0),
             tree_state: TableState::default().with_selected(0),
             alert_state: TableState::default().with_selected(0),
@@ -1251,9 +1345,106 @@ impl App {
                     let _ = self.worker.commands.try_send(WorkerCommand::RefreshAlerts);
                 }
                 WorkerEvent::Action(Err(error)) => self.set_error(error),
+                WorkerEvent::UpdateCheck(result) => self.finish_update_check(result),
+                WorkerEvent::UpdateDownload(result) => self.finish_update_download(result),
             }
         }
         changed
+    }
+
+    /// A completed launch-time release check. The completion time is
+    /// stamped and persisted whatever the outcome, so a failing endpoint
+    /// is asked at most once per cadence window too. Only a genuine newer
+    /// release speaks: `Ok(None)` and every failure stay silent.
+    fn finish_update_check(&mut self, result: Result<Option<UpdateInfo>, String>) {
+        self.client_prefs.last_update_check_ms = Utc::now().timestamp_millis();
+        self.persist_client_prefs();
+        if let Ok(Some(info)) = result {
+            self.status = format!(
+                "PC Pulse v{} is available — press u to download",
+                info.version
+            );
+            self.status_is_error = false;
+            self.update = UpdateState::Available(info);
+        }
+    }
+
+    /// A completed download-and-verify run. Success arms the second `u`
+    /// press; failure reports once and resets to `Available` so the flow
+    /// can be retried.
+    fn finish_update_download(&mut self, result: Result<PathBuf, String>) {
+        let UpdateState::Downloading(info) = self.update.clone() else {
+            return;
+        };
+        match result {
+            Ok(installer) => {
+                self.status = format!(
+                    "v{} downloaded and checksum verified — press u again to open the installer",
+                    info.version
+                );
+                self.status_is_error = false;
+                self.update = UpdateState::Verified { info, installer };
+            }
+            Err(error) => {
+                self.set_error(format!("Update download failed: {error}"));
+                self.update = UpdateState::Available(info);
+            }
+        }
+    }
+
+    /// The `u` key: advance the update flow one deliberate step. Inert
+    /// while no update is known; a repeat press during a download or after
+    /// launch only restates where things stand (the double-press guard).
+    pub(crate) fn press_update_key(&mut self) {
+        match self.update.clone() {
+            UpdateState::Idle => {}
+            UpdateState::Available(info) => {
+                let command = WorkerCommand::DownloadUpdate(info.clone());
+                if self.worker.commands.try_send(command).is_ok() {
+                    self.status = format!(
+                        "Downloading v{} and its checksum manifest to Downloads…",
+                        info.version
+                    );
+                    self.status_is_error = false;
+                    self.update = UpdateState::Downloading(info);
+                } else {
+                    self.set_error("update download queue is busy".into());
+                }
+            }
+            UpdateState::Downloading(info) => {
+                self.status = format!("v{} is still downloading…", info.version);
+                self.status_is_error = false;
+            }
+            UpdateState::Verified { info, installer } => match (self.installer)(&installer) {
+                Ok(()) => {
+                    self.status =
+                        "Installer launched — the collector service restarts during install"
+                            .into();
+                    self.status_is_error = false;
+                    self.update = UpdateState::Launched(info);
+                }
+                Err(error) => self.set_error(format!("Failed to launch the installer: {error}")),
+            },
+            UpdateState::Launched(_) => {
+                self.status = "Installer already launched — finish the install there".into();
+                self.status_is_error = false;
+            }
+        }
+    }
+
+    /// Ask the worker for one release check, unless the preference is off
+    /// or the last check was within the 20-hour cadence window. With the
+    /// preference off no update-related network request is ever made.
+    pub(crate) fn request_update_check(&mut self, now_ms: i64) {
+        if !self.client_prefs.update_checks {
+            return;
+        }
+        if now_ms.saturating_sub(self.client_prefs.last_update_check_ms)
+            < update::UPDATE_CHECK_INTERVAL_MS
+        {
+            return;
+        }
+        let _ = self.worker.commands.try_send(WorkerCommand::CheckUpdate);
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> bool {
@@ -1410,6 +1601,10 @@ impl App {
                 self.mode = InputMode::Chat(String::new());
             }
             KeyCode::Char('r') => self.refresh_page(),
+            // Global on every page, but inert until a newer release is
+            // known: first press downloads + verifies, second press opens
+            // the installer.
+            KeyCode::Char('u') => self.press_update_key(),
             KeyCode::Char('[') if self.page == Page::Timeline => {
                 self.timeline_hours = (self.timeline_hours / 2).max(1);
                 self.refresh_page();
@@ -1814,6 +2009,21 @@ impl App {
                 self.status_is_error = false;
                 self.persist_client_prefs();
             }
+            // The update-checks row is a two-position switch like effects:
+            // Enter flips it and persists immediately.
+            SettingField::ClientUpdates => {
+                self.client_prefs.update_checks = !self.client_prefs.update_checks;
+                self.status = format!(
+                    "Update checks {} · saved for your user",
+                    if self.client_prefs.update_checks {
+                        "enabled"
+                    } else {
+                        "disabled"
+                    }
+                );
+                self.status_is_error = false;
+                self.persist_client_prefs();
+            }
             _ => {
                 self.mode = InputMode::EditSetting {
                     field,
@@ -1838,6 +2048,12 @@ impl App {
                 refresh_label(prefs::normalize_refresh_fps(self.client_prefs.refresh_fps)).into()
             }
             SettingField::ClientTimeout => self.client_prefs.analyzer_timeout_secs.to_string(),
+            SettingField::ClientUpdates => if self.client_prefs.update_checks {
+                "on"
+            } else {
+                "off"
+            }
+            .into(),
             _ => field.value(&self.settings),
         }
     }
@@ -1850,6 +2066,9 @@ impl App {
         // A stored 30/60 fps preference arms the worker's live poller from
         // the first frame; at 0 fps nothing is sent.
         self.sync_live_polling();
+        // The once-per-launch release check, gated by the preference and
+        // the 20-hour cadence.
+        self.request_update_check(Utc::now().timestamp_millis());
     }
 
     /// Write the current client preferences to disk; without a store (tests,
@@ -3425,6 +3644,235 @@ mod tests {
     const INVESTIGATION_TAIL: &str =
         " Explain the likely root cause, whether it is still occurring, and the safest next steps.";
 
+    fn stub_update_info(version: &str) -> UpdateInfo {
+        UpdateInfo {
+            version: version.into(),
+            html_url: "https://example.invalid/release".into(),
+            msi_name: format!("PcPulse-{version}-x64.msi"),
+            msi_url: "https://example.invalid/installer.msi".into(),
+            msi_size_bytes: 2_000_000,
+            sums_name: "SHA256SUMS.txt".into(),
+            sums_url: "https://example.invalid/SHA256SUMS.txt".into(),
+        }
+    }
+
+    #[test]
+    fn update_check_is_gated_by_the_preference_and_the_20_hour_window() {
+        let now = 1_800_000_000_000_i64;
+        // Preference off: never touch the network, no matter how stale.
+        let (mut app, commands) = app_with_captive_worker();
+        app.client_prefs.update_checks = false;
+        app.client_prefs.last_update_check_ms = 0;
+        app.request_update_check(now);
+        assert!(
+            !commands
+                .try_iter()
+                .any(|command| matches!(command, WorkerCommand::CheckUpdate)),
+            "the off switch means no CheckUpdate command"
+        );
+        // Checked recently: within the 20-hour window the launch is silent.
+        let (mut app, commands) = app_with_captive_worker();
+        app.client_prefs.last_update_check_ms =
+            now - crate::update::UPDATE_CHECK_INTERVAL_MS + 60_000;
+        app.request_update_check(now);
+        assert!(
+            !commands
+                .try_iter()
+                .any(|command| matches!(command, WorkerCommand::CheckUpdate)),
+            "a fresh check timestamp skips the network"
+        );
+        // Stale (or never checked): exactly one command goes out.
+        let (mut app, commands) = app_with_captive_worker();
+        app.client_prefs.last_update_check_ms = now - crate::update::UPDATE_CHECK_INTERVAL_MS;
+        app.request_update_check(now);
+        assert_eq!(
+            commands
+                .try_iter()
+                .filter(|command| matches!(command, WorkerCommand::CheckUpdate))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn adopting_prefs_with_checks_off_sends_no_update_command() {
+        let (mut app, commands) = app_with_captive_worker();
+        app.adopt_client_prefs(
+            UiPrefs {
+                update_checks: false,
+                ..UiPrefs::default()
+            },
+            None,
+        );
+        assert!(
+            !commands
+                .try_iter()
+                .any(|command| matches!(command, WorkerCommand::CheckUpdate)),
+        );
+        // The default preferences (on, never checked) do ask once.
+        let (mut app, commands) = app_with_captive_worker();
+        app.adopt_client_prefs(UiPrefs::default(), None);
+        assert!(
+            commands
+                .try_iter()
+                .any(|command| matches!(command, WorkerCommand::CheckUpdate)),
+        );
+    }
+
+    #[test]
+    fn update_discovery_stamps_the_check_time_and_announces_once() {
+        let (store, path) = scratch_prefs_store("update-stamp");
+        let (mut app, _commands) = app_with_captive_worker();
+        app.client_prefs = UiPrefs::default();
+        app.prefs_store = Some(store.clone());
+        app.finish_update_check(Ok(Some(stub_update_info("1.16.0"))));
+        assert_eq!(
+            app.update,
+            UpdateState::Available(stub_update_info("1.16.0"))
+        );
+        assert_eq!(
+            app.status,
+            "PC Pulse v1.16.0 is available — press u to download"
+        );
+        assert!(!app.status_is_error);
+        assert!(
+            store.load().last_update_check_ms > 0,
+            "the completed check is stamped and persisted"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn up_to_date_and_failed_checks_stay_silent_but_still_stamp() {
+        for result in [Ok(None), Err("curl.exe was not found".to_string())] {
+            let (store, path) = scratch_prefs_store("update-silent");
+            let (mut app, _commands) = app_with_captive_worker();
+            app.prefs_store = Some(store.clone());
+            app.status.clear();
+            app.finish_update_check(result);
+            assert_eq!(app.update, UpdateState::Idle);
+            assert!(app.status.is_empty(), "no status noise: {}", app.status);
+            assert!(!app.status_is_error, "never a status error");
+            assert!(store.load().last_update_check_ms > 0);
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    #[test]
+    fn the_update_key_walks_the_state_machine_and_guards_double_presses() {
+        let (mut app, commands) = app_with_captive_worker();
+        let launched = std::rc::Rc::new(std::cell::RefCell::new(Vec::<PathBuf>::new()));
+        let recorder = std::rc::Rc::clone(&launched);
+        app.installer = Box::new(move |msi| {
+            recorder.borrow_mut().push(msi.to_path_buf());
+            Ok(())
+        });
+
+        // Idle: `u` is inert — no state change, no command, no status.
+        app.handle_key(key(KeyCode::Char('u')));
+        assert_eq!(app.update, UpdateState::Idle);
+        assert_eq!(commands.try_iter().count(), 0);
+
+        // Available → first press downloads.
+        let info = stub_update_info("1.16.0");
+        app.update = UpdateState::Available(info.clone());
+        app.handle_key(key(KeyCode::Char('u')));
+        assert_eq!(app.update, UpdateState::Downloading(info.clone()));
+        assert!(app.status.contains("Downloading v1.16.0"));
+        let sent: Vec<WorkerCommand> = commands.try_iter().collect();
+        assert_eq!(
+            sent.iter()
+                .filter(|command| matches!(command, WorkerCommand::DownloadUpdate(sent_info) if *sent_info == info))
+                .count(),
+            1
+        );
+
+        // Downloading: a second press must not enqueue another download.
+        app.handle_key(key(KeyCode::Char('u')));
+        assert_eq!(app.update, UpdateState::Downloading(info.clone()));
+        assert!(app.status.contains("still downloading"));
+        assert_eq!(commands.try_iter().count(), 0, "double-press guard");
+
+        // Verified → second press launches the installer exactly once.
+        let installer = PathBuf::from(r"C:\Users\x\Downloads\PcPulse-1.16.0-x64.msi");
+        app.finish_update_download(Ok(installer.clone()));
+        assert_eq!(
+            app.update,
+            UpdateState::Verified {
+                info: info.clone(),
+                installer: installer.clone()
+            }
+        );
+        assert!(app.status.contains("checksum verified"));
+        assert!(app.status.contains("press u again"));
+        app.handle_key(key(KeyCode::Char('u')));
+        assert_eq!(app.update, UpdateState::Launched(info.clone()));
+        assert!(app.status.contains("Installer launched"));
+        assert!(app.status.contains("collector service restarts"));
+        assert_eq!(launched.borrow().as_slice(), [installer]);
+
+        // Launched: further presses only restate, never relaunch.
+        app.handle_key(key(KeyCode::Char('u')));
+        assert_eq!(app.update, UpdateState::Launched(info));
+        assert_eq!(launched.borrow().len(), 1);
+    }
+
+    #[test]
+    fn a_failed_download_resets_to_available_for_retry() {
+        let (mut app, commands) = app_with_captive_worker();
+        let info = stub_update_info("1.16.0");
+        app.update = UpdateState::Downloading(info.clone());
+        app.finish_update_download(Err("checksum mismatch for the installer".into()));
+        assert_eq!(app.update, UpdateState::Available(info.clone()));
+        assert!(app.status_is_error);
+        assert!(app.status.contains("checksum mismatch"));
+        // The flow is immediately retryable.
+        app.handle_key(key(KeyCode::Char('u')));
+        assert_eq!(app.update, UpdateState::Downloading(info));
+        assert!(
+            commands
+                .try_iter()
+                .any(|command| matches!(command, WorkerCommand::DownloadUpdate(_))),
+        );
+    }
+
+    #[test]
+    fn a_stray_download_event_without_a_download_in_flight_is_ignored() {
+        let (mut app, _commands) = app_with_captive_worker();
+        app.finish_update_download(Ok(PathBuf::from(r"C:\stray.msi")));
+        assert_eq!(app.update, UpdateState::Idle);
+        app.update = UpdateState::Available(stub_update_info("1.16.0"));
+        app.finish_update_download(Err("late failure".into()));
+        assert_eq!(
+            app.update,
+            UpdateState::Available(stub_update_info("1.16.0")),
+            "only a Downloading state consumes download results"
+        );
+    }
+
+    #[test]
+    fn enter_on_the_update_checks_row_toggles_and_persists() {
+        let (store, path) = scratch_prefs_store("update-toggle");
+        let mut app = App::new_inert();
+        app.adopt_client_prefs(UiPrefs::default(), Some(store.clone()));
+        app.page = Page::Settings;
+        app.setting_state.select(Some(4));
+        assert_eq!(app.setting_value(SettingField::ClientUpdates), "on");
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(!app.client_prefs.update_checks);
+        assert_eq!(app.setting_value(SettingField::ClientUpdates), "off");
+        assert!(app.status.contains("Update checks disabled"));
+        assert!(matches!(app.mode, InputMode::Normal), "no typed edit opens");
+        assert!(!store.load().update_checks);
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(store.load().update_checks);
+        assert!(app.status.contains("Update checks enabled"));
+        let _ = std::fs::remove_file(path);
+    }
+
     #[test]
     fn investigate_composes_the_question_and_submits_through_the_chat_path() {
         let (mut app, commands) = app_with_captive_worker();
@@ -3852,7 +4300,7 @@ mod tests {
         for sort in [SettingSort::Name, SettingSort::Value, SettingSort::Unit] {
             app.setting_sort = sort;
             let fields = app.visible_setting_fields();
-            assert_eq!(&fields[..4], &SettingField::CLIENT, "{sort:?}");
+            assert_eq!(&fields[..5], &SettingField::CLIENT, "{sort:?}");
             assert_eq!(fields.len(), SettingField::ALL.len());
         }
         assert!(SettingField::ClientTheme.is_client());

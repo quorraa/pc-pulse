@@ -60,7 +60,7 @@ Nine views:
 4. **Findings** — active/resolved history with ownership, explanation, evidence, and recommendations.
 5. **Timeline** — persisted CPU, memory, and disk-latency charts over configurable windows.
 6. **Oracle** — evidence-aware chat with the dedicated systems analyzer and the live Windows diagnostic feed.
-7. **Settings** — all detector thresholds and notification state, plain-language explanations, plus per-user CLIENT settings (theme, motion effects, refresh rate, Oracle time budget).
+7. **Settings** — all detector thresholds and notification state, plain-language explanations, plus per-user CLIENT settings (theme, motion effects, refresh rate, Oracle time budget, update checks).
 8. **Gauges** — thermal-zone and GPU temperature meters with live history sparklines, plus CPU/GPU clocks and GPU utilization; degrades to an honest unavailable state when sensors are denied.
 9. **Keys** — the complete keyboard reference. This page has no digit key: it sits last in the `Tab` cycle and its tab entry prints `?`; pressing `?` anywhere opens the same reference as an overlay.
 
@@ -95,6 +95,7 @@ Important keys:
 | `m` | Toggle finite TachyonFX motion effects; the choice is saved per user |
 | Refresh rate (Settings CLIENT row) | Off (event-driven, default) / 30 / 60 fps, saved per user; 30/60 draws on a fixed cadence with smooth interpolation of meters between telemetry samples, and drops a tier automatically if frames keep exceeding their budget. With a v1.11+ service, smooth mode streams system telemetry live at up to 8 Hz; per-process data stays on the two-second cadence |
 | `t` | Cycle presentation profiles (vitals / avionics / ledger); the choice is saved per user |
+| `u` | Download and install a newer release when the chrome badge shows one — the first press fetches the MSI and `SHA256SUMS.txt` into Downloads and verifies the SHA-256, the second press opens the installer |
 | `?` | Open the keys overlay on top of any page; `Esc`, `?`, or a click closes it (the full Keys page is the `?`-labeled last tab) |
 | `q` / `Ctrl-C` | Exit the TUI; the collector continues |
 | Left-click | Select tabs, process/tree/finding rows, settings, or the Oracle prompt; clicking a Chat Vault row opens that chat and keeps the vault focused for rename/delete |
@@ -111,6 +112,10 @@ Important keys:
 Oracle is a chatbot inside the TUI — press `Enter` on view `6`, type a question, and submit. Every turn receives a fresh, bounded, redacted evidence bundle; answers must cite exact collected references, and no proposed action is ever executed. The collector never invokes AI: the client runs `pcpulse-systems-analyzer` through the user's Codex CLI in an ephemeral read-only sandbox, and requires `codex login status` to report ChatGPT authentication (API-key sessions are refused rather than silently billed). Press `y` to copy the latest answer, `i` on a finding to investigate it in a new chat, and `r`/`d` in Chat Vault to rename or delete sessions. Analyzer failures are logged to `%LOCALAPPDATA%\PcPulse\analyzer-last-error.log` (overwritten on each failure).
 
 For automation, `PcPulse.exe analyze 1` produces a one-shot plan, and `agent-context`, `plan-schema`, `agent-prompt`, and `import-plan` expose the same contract to other agents — see the [systems-analyzer integration guide](docs/agent-integration.md).
+
+## Updates
+
+The TUI checks this repository's GitHub releases for a newer version once per launch, at most every 20 hours, using Windows' bundled `curl.exe` — a client-side courtesy; the collector service never touches the network. When a newer release exists, the chrome shows a quiet `⇡ v1.16.0 available · u` badge: the first `u` downloads the MSI and `SHA256SUMS.txt` to your Downloads folder and verifies the SHA-256 (a file that fails verification is deleted), and the second `u` launches the installer — never silently, never automatically. The "Update checks" row in Settings' CLIENT section switches the check off entirely; when off, no update-related network request is ever made.
 
 ## Build and test
 
@@ -150,6 +155,8 @@ Get-Service PcPulseCollector
 .\scripts\Test-Pipe.ps1
 ```
 
+Opening PC Pulse also starts the collector service if it is stopped and brings back the tray helper if it is not running; the tray stays until you exit it from its own right-click menu. The installer grants standard users start-only rights on the service (never stop or configure), so this self-heal needs no elevation — on older installs without the grant, the TUI falls back to a single visible UAC prompt, and declining it simply leaves the offline panel in charge.
+
 For scripts and agent runs, `PcPulse.exe ping | snapshot | alerts | logs 24 | agent-context 1 | analyze 1 | plan | settings` all emit formatted JSON. The development-equivalent service setup is `scripts\Install-Service.ps1`.
 
 Uninstall via Apps > Installed apps, or:
@@ -162,7 +169,7 @@ For development installs, `scripts\Uninstall-Service.ps1` removes everything; pa
 
 ## Storage, privacy, and security
 
-Everything stays local: bounded SQLite history and service settings in `%ProgramData%\PcPulse` (`history.db`, `settings.json`; configurable 1–365 day retention), per-user chat history and UI preferences in `%LOCALAPPDATA%\PcPulse` (`chat-history.json`, `ui-prefs.json`). Diagnostic event fields are bounded and redacted before persistence — user-profile paths become `%USERPROFILE%` and credential-like values are removed. PC Pulse never collects the Security event log, process command lines, environment variables, file contents, browser data, or keystrokes. The collector has no network path; only an explicit Oracle question or `analyze` run sends the redacted evidence bundle to the user's ChatGPT-authenticated Codex session. The named pipe rejects remote clients, caps messages at 1 MiB, and grants access only to LocalSystem, administrators, and interactive users; termination requires `confirmed: true` and always refuses PID 0, PID 4, and the collector itself.
+Everything stays local: bounded SQLite history and service settings in `%ProgramData%\PcPulse` (`history.db`, `settings.json`; configurable 1–365 day retention), per-user chat history and UI preferences in `%LOCALAPPDATA%\PcPulse` (`chat-history.json`, `ui-prefs.json`). Diagnostic event fields are bounded and redacted before persistence — user-profile paths become `%USERPROFILE%` and credential-like values are removed. PC Pulse never collects the Security event log, process command lines, environment variables, file contents, browser data, or keystrokes. The collector has no network path; the client's only network touchpoints are an explicit Oracle question or `analyze` run (which sends the redacted evidence bundle to the user's ChatGPT-authenticated Codex session), an explicit deep crash-dump analysis (Microsoft's public symbol server), and the TUI's rate-limited release update check against GitHub, which is switched off from Settings' CLIENT section. The named pipe rejects remote clients, caps messages at 1 MiB, and grants access only to LocalSystem, administrators, and interactive users; termination requires `confirmed: true` and always refuses PID 0, PID 4, and the collector itself.
 
 ## Documentation
 
