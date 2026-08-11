@@ -137,6 +137,54 @@ pub fn cache_path(source: &Path) -> Result<PathBuf> {
     Ok(dir.join(format!("{hash:016x}.pulseclip")))
 }
 
+/// Delete every converted clip in the cache root except `keep`.
+///
+/// Exactly one background is ever live, so every other `.pulseclip` beside
+/// it is dead weight: a clip converted from a video that has since been
+/// replaced, one converted at a quality that has since changed, or the
+/// `.pulseclip.tmp` an interrupted conversion abandoned. At up to hundreds
+/// of megabytes per clip that directory grew without bound; this is what
+/// collects it. Called after a *successful* load, so the survivor is known
+/// to be a file that opens.
+///
+/// The directory swept is `keep`'s own parent rather than a second call to
+/// [`backgrounds_dir`], and that is deliberate: every path that reaches
+/// here came from [`cache_path`], which builds `backgrounds_dir().join(..)`,
+/// so the two are the same directory — and taking it from `keep` makes the
+/// sweep and its survivor *provably* the same place. Asking twice could,
+/// if the two ever disagreed, sweep a directory the live file is not in and
+/// so delete every clip there while sparing nothing.
+///
+/// Every failure is ignored on purpose. A file still held open by a worker
+/// whose conversion was superseded mid-stream, or one locked by something
+/// else, is not worth a word in the status line: the next successful load
+/// sweeps it instead.
+pub fn sweep_superseded(keep: &Path) {
+    let (Some(dir), Some(survivor)) = (keep.parent(), keep.file_name()) else {
+        return;
+    };
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        // Windows filenames are case-insensitive, and nothing else in this
+        // directory belongs to anyone else, but the sweep is still confined
+        // to the two extensions this module writes.
+        if !is_cache_file(&name) || name.eq_ignore_ascii_case(survivor) {
+            continue;
+        }
+        let _ = fs::remove_file(entry.path());
+    }
+}
+
+/// Whether `name` is something this module wrote: a converted clip or the
+/// temp sibling one is streamed into.
+fn is_cache_file(name: &std::ffi::OsStr) -> bool {
+    let name = name.to_string_lossy().to_ascii_lowercase();
+    name.ends_with(".pulseclip") || name.ends_with(".pulseclip.tmp")
+}
+
 /// The cache filename's hash input, kept separate from `cache_path` so the
 /// cap's presence in the key is testable without a filesystem: a release
 /// that changes `CAP_W`/`CAP_H` must land on a different filename, or every
@@ -543,6 +591,53 @@ mod tests {
             );
         }
         let _ = fs::remove_file(&source);
+    }
+
+    #[test]
+    fn every_cache_path_lives_directly_in_the_backgrounds_dir() {
+        // `sweep_superseded` takes the directory to sweep from the file it
+        // is keeping, which is only the cache root because `cache_path`
+        // puts it there. Pin that.
+        let source = scratch_source("parent");
+        let cache = cache_path(&source).unwrap();
+        assert_eq!(cache.parent().unwrap(), backgrounds_dir().unwrap());
+        let _ = fs::remove_file(&source);
+    }
+
+    #[test]
+    fn the_sweep_keeps_the_live_clip_and_nothing_else_it_wrote() {
+        // A directory of this test's own: the scratch cache root is shared
+        // by every test in this binary, and a sweep there would delete
+        // fixtures other tests are still using.
+        let dir = std::env::temp_dir().join(format!("pcpulse-sweep-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let live = dir.join("aaaa000000000001.pulseclip");
+        let superseded = dir.join("bbbb000000000002.pulseclip");
+        let abandoned = dir.join("cccc000000000003.pulseclip.tmp");
+        let bystander = dir.join("notes.txt");
+        for file in [&live, &superseded, &abandoned, &bystander] {
+            fs::write(file, b"x").unwrap();
+        }
+
+        sweep_superseded(&live);
+
+        assert!(live.exists(), "the clip now playing was deleted");
+        assert!(!superseded.exists(), "a superseded clip survived");
+        assert!(!abandoned.exists(), "an abandoned temp file survived");
+        assert!(bystander.exists(), "the sweep reached past its own files");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_sweep_of_a_directory_that_is_not_there_is_silent() {
+        // Nothing to collect is not a failure, and neither is a cache root
+        // that has not been created yet.
+        sweep_superseded(
+            &std::env::temp_dir()
+                .join("pcpulse-no-such-dir")
+                .join("x.pulseclip"),
+        );
+        sweep_superseded(Path::new("x.pulseclip"));
     }
 
     #[test]

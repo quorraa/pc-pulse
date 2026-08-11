@@ -1145,6 +1145,12 @@ pub struct App {
     /// receiver so a repeated commit of the same path can recognize its own
     /// conversion instead of starting a rival one over the same cache file.
     converting: Option<String>,
+    /// Collects the cache files a freshly loaded clip supersedes. The real
+    /// path is [`clipconvert::sweep_superseded`]; the inert test app
+    /// substitutes a no-op, because every test in this binary shares one
+    /// scratch cache root and a sweep there would delete the fixtures the
+    /// other tests are still using.
+    pub(crate) sweep_superseded: fn(&std::path::Path),
     pub prefs_store: Option<PrefsStore>,
     /// Smooth-refresh tween state: previous displayed sample, frame clock,
     /// and the session frame governor. Inert while `refresh_fps` is 0.
@@ -1261,6 +1267,7 @@ impl App {
             background_resample: crate::ui::VideoResample::default(),
             convert_rx: None,
             converting: None,
+            sweep_superseded: clipconvert::sweep_superseded,
             prefs_store: None,
             smooth: crate::tween::SmoothState::default(),
             needs_terminal_clear: false,
@@ -1287,14 +1294,20 @@ impl App {
         let (event_source, events) = bounded(1);
         drop(command_sink);
         drop(event_source);
-        Self::with_worker(
+        let mut app = Self::with_worker(
             Worker {
                 commands,
                 events,
                 handle: None,
             },
             false,
-        )
+        );
+        // Every test in this binary shares one scratch cache root, so a
+        // real sweep here would collect the clips other tests planted for
+        // themselves. The two tests that exercise the sweep install the
+        // real one and point it at a directory of their own.
+        app.sweep_superseded = |_| {};
+        app
     }
 
     pub fn drain_events(&mut self) -> bool {
@@ -1495,6 +1508,10 @@ impl App {
     /// Open a converted clip and hand it the stored playback rate. Returns
     /// whether it loaded; a failure clears the player and speaks once
     /// through the status line rather than taking the TUI down.
+    ///
+    /// This is the single place a background becomes live — startup restore,
+    /// a finished conversion, a changed path or quality all arrive here — so
+    /// it is also where the caches this one supersedes are collected.
     fn load_background(&mut self, cache: &std::path::Path) -> bool {
         match Background::load(cache) {
             Ok(mut background) => {
@@ -1502,6 +1519,7 @@ impl App {
                     background.set_playback_fps(self.client_prefs.background_fps);
                 }
                 self.background = Some(background);
+                (self.sweep_superseded)(cache);
                 true
             }
             Err(error) => {
@@ -4972,6 +4990,62 @@ mod tests {
             "a cached clip converts nothing: {}",
             app.status
         );
+    }
+
+    #[test]
+    fn loading_a_background_collects_the_caches_it_supersedes() {
+        // A cache root of this test's own, because the scratch root is
+        // shared by every test in this binary and a sweep there would
+        // delete fixtures the others are still using. `load_background`
+        // sweeps the directory the clip it loaded lives in, so a real clip
+        // planted here is loaded and swept exactly as one in the real
+        // `%LOCALAPPDATA%\PcPulse\backgrounds` would be.
+        let dir = std::env::temp_dir().join(format!(
+            "pcpulse-app-sweep-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_millis()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let live = dir.join("0000000000000001.pulseclip");
+        let mut writer = crate::pulseclip::ClipWriter::create(&live, 4, 2, 20.0).unwrap();
+        writer.push_frame(&[7u8; 4 * 2 * 3]).unwrap();
+        writer.finish().unwrap();
+        let superseded = dir.join("0000000000000002.pulseclip");
+        let abandoned = dir.join("0000000000000003.pulseclip.tmp");
+        std::fs::write(&superseded, b"a clip from a video that is no longer set").unwrap();
+        std::fs::write(&abandoned, b"an interrupted conversion").unwrap();
+
+        let mut app = App::new_inert();
+        app.sweep_superseded = crate::clipconvert::sweep_superseded;
+        assert!(app.load_background(&live), "status was {}", app.status);
+
+        assert!(live.exists(), "the clip now playing was collected");
+        assert!(!superseded.exists(), "a superseded cache survived the load");
+        assert!(!abandoned.exists(), "an abandoned temp file survived");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failed_load_collects_nothing() {
+        // The sweep's whole premise is that the survivor opens. A file that
+        // does not is no reason to throw away the clips beside it.
+        let dir = std::env::temp_dir().join(format!(
+            "pcpulse-app-nosweep-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_millis()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let broken = dir.join("0000000000000001.pulseclip");
+        let other = dir.join("0000000000000002.pulseclip");
+        std::fs::write(&broken, b"not a clip").unwrap();
+        std::fs::write(&other, b"still wanted").unwrap();
+
+        let mut app = App::new_inert();
+        app.sweep_superseded = crate::clipconvert::sweep_superseded;
+        assert!(!app.load_background(&broken));
+
+        assert!(other.exists(), "a failed load swept the directory anyway");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
