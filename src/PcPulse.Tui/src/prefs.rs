@@ -29,6 +29,18 @@ pub const MIN_ANALYZER_TIMEOUT_SECS: u64 = 30;
 pub const MAX_ANALYZER_TIMEOUT_SECS: u64 = 1_800;
 pub const DEFAULT_ANALYZER_TIMEOUT_SECS: u64 = 300;
 
+/// Bounds for the background-video dim percentage: how much the video is
+/// darkened toward the theme background so foreground text stays legible.
+pub const MIN_BACKGROUND_DIM: u8 = 10;
+pub const MAX_BACKGROUND_DIM: u8 = 60;
+pub const DEFAULT_BACKGROUND_DIM: u8 = 30;
+
+/// Bounds for a fixed background-video playback rate; `0` is the sentinel
+/// meaning "use the clip's own capture fps" and is left untouched by the
+/// clamp.
+pub const MIN_BACKGROUND_FPS: u32 = 1;
+pub const MAX_BACKGROUND_FPS: u32 = 60;
+
 /// Normalize a stored refresh-rate preference to the supported tiers:
 /// `0` stays event-driven, everything else snaps to 30 or 60 fps.
 pub fn normalize_refresh_fps(fps: u32) -> u32 {
@@ -39,7 +51,7 @@ pub fn normalize_refresh_fps(fps: u32) -> u32 {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct UiPrefs {
     #[serde(with = "theme_name")]
@@ -55,6 +67,18 @@ pub struct UiPrefs {
     /// When the last release check completed (Unix ms); launches within the
     /// 20-hour cadence window skip the check entirely.
     pub last_update_check_ms: i64,
+    /// Source path of the video clip painted behind the UI; empty means no
+    /// background has been set yet.
+    pub background_video: String,
+    /// Whether the configured background video is drawn. Only meaningful
+    /// once `background_video` names a clip.
+    pub background_enabled: bool,
+    /// How much the background video is darkened toward the theme's
+    /// background color, as a percent; higher keeps foreground text legible.
+    pub background_dim: u8,
+    /// Playback rate for the background video, in frames per second; `0`
+    /// means "use the clip's own capture fps" instead of a fixed rate.
+    pub background_fps: u32,
 }
 
 impl Default for UiPrefs {
@@ -66,6 +90,10 @@ impl Default for UiPrefs {
             refresh_fps: 0,
             update_checks: true,
             last_update_check_ms: 0,
+            background_video: String::new(),
+            background_enabled: true,
+            background_dim: DEFAULT_BACKGROUND_DIM,
+            background_fps: 0,
         }
     }
 }
@@ -88,6 +116,14 @@ impl UiPrefs {
             .analyzer_timeout_secs
             .clamp(MIN_ANALYZER_TIMEOUT_SECS, MAX_ANALYZER_TIMEOUT_SECS);
         self.refresh_fps = normalize_refresh_fps(self.refresh_fps);
+        self.background_dim = self
+            .background_dim
+            .clamp(MIN_BACKGROUND_DIM, MAX_BACKGROUND_DIM);
+        if self.background_fps != 0 {
+            self.background_fps = self
+                .background_fps
+                .clamp(MIN_BACKGROUND_FPS, MAX_BACKGROUND_FPS);
+        }
         self
     }
 }
@@ -140,7 +176,7 @@ impl PrefsStore {
         let parent = self.path.parent().context("ui-prefs path has no parent")?;
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
-        let payload = serde_json::to_vec_pretty(&prefs.normalized())?;
+        let payload = serde_json::to_vec_pretty(&prefs.clone().normalized())?;
         let temporary = self.path.with_extension("json.tmp");
         fs::write(&temporary, payload)
             .with_context(|| format!("failed to write {}", temporary.display()))?;
@@ -188,6 +224,10 @@ mod tests {
             refresh_fps: 30,
             update_checks: false,
             last_update_check_ms: 1_800_000_000_000,
+            background_video: "C:\\clips\\demo.pulseclip".to_string(),
+            background_enabled: false,
+            background_dim: 45,
+            background_fps: 24,
         };
         store.save(&prefs).unwrap();
         assert_eq!(store.load(), prefs);
@@ -197,6 +237,10 @@ mod tests {
         assert!(raw.contains("refreshFps"));
         assert!(raw.contains("updateChecks"));
         assert!(raw.contains("lastUpdateCheckMs"));
+        assert!(raw.contains("backgroundVideo"));
+        assert!(raw.contains("backgroundEnabled"));
+        assert!(raw.contains("backgroundDim"));
+        assert!(raw.contains("backgroundFps"));
         let _ = fs::remove_file(path);
     }
 
@@ -323,6 +367,37 @@ mod tests {
         assert!(!reloaded.update_checks);
         assert_eq!(reloaded.last_update_check_ms, 1_755_000_000_123);
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn pre_background_prefs_files_gain_background_defaults() {
+        let old = r#"{"theme":"ledger","effects":false,"analyzerTimeoutSecs":120,"refreshFps":60,"updateChecks":true,"lastUpdateCheckMs":5}"#;
+        let prefs: UiPrefs = serde_json::from_str(old).unwrap();
+        assert_eq!(prefs.background_video, "");
+        assert!(prefs.background_enabled);
+        assert_eq!(prefs.background_dim, 30);
+        assert_eq!(prefs.background_fps, 0);
+        assert_eq!(prefs.theme, ThemeId::Ledger); // untouched fields survive
+    }
+
+    #[test]
+    fn normalized_clamps_background_dim_and_fps() {
+        let mut prefs = UiPrefs {
+            background_dim: 95,
+            background_fps: 240,
+            ..UiPrefs::default()
+        };
+        prefs = prefs.normalized();
+        assert_eq!(prefs.background_dim, 60);
+        assert_eq!(prefs.background_fps, 60);
+        let mut low = UiPrefs {
+            background_dim: 3,
+            background_fps: 0,
+            ..UiPrefs::default()
+        };
+        low = low.normalized();
+        assert_eq!(low.background_dim, 10);
+        assert_eq!(low.background_fps, 0); // sentinel survives normalization
     }
 
     #[test]
