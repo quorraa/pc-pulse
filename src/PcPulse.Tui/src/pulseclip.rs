@@ -148,6 +148,14 @@ pub struct ClipReader {
     offsets: Vec<u64>,
     decode_buf: Vec<u8>,
     frame_buf: Vec<u8>,
+    /// Total on-disk file size, captured at `open()` time. Used to reject
+    /// length fields read from the file (seek_table_len, compressed_len)
+    /// that claim more data than the file could possibly contain, before
+    /// they're used to size an allocation — an untrusted u32/u64 length
+    /// fed straight into `Vec::with_capacity`/`vec![0; n]` can demand
+    /// gigabytes and abort the process, which is worse than the panic this
+    /// codec is meant to avoid.
+    file_len: u64,
 }
 
 impl ClipReader {
@@ -157,6 +165,10 @@ impl ClipReader {
     pub fn open(path: &Path) -> Result<Self> {
         let file = File::open(path)
             .with_context(|| format!("opening pulseclip file at {}", path.display()))?;
+        let file_len = file
+            .metadata()
+            .with_context(|| format!("reading pulseclip file metadata at {}", path.display()))?
+            .len();
         let mut file = BufReader::new(file);
 
         let mut magic = [0u8; 6];
@@ -179,6 +191,21 @@ impl ClipReader {
             bail!("pulseclip grid dimensions must be non-zero, got {grid_w}x{grid_h}");
         }
 
+        // The seek table is `seek_table_len` u64 entries (8 bytes each),
+        // starting right after this point (HEADER_LEN + 4 bytes in). Reject
+        // a claimed table larger than the file could possibly hold before
+        // sizing an allocation from it: `seek_table_len` is an untrusted
+        // u32 read straight off disk, and a corrupt file can claim close to
+        // u32::MAX entries (~34GB) to force an allocator abort.
+        let table_bytes = u64::from(seek_table_len) * 8;
+        let remaining_after_header = file_len.saturating_sub(HEADER_LEN + 4);
+        if table_bytes > remaining_after_header {
+            bail!(
+                "pulseclip seek table claims {seek_table_len} entries ({table_bytes} bytes), \
+                 but only {remaining_after_header} bytes remain in the file"
+            );
+        }
+
         let mut offsets = Vec::with_capacity(seek_table_len as usize);
         for i in 0..seek_table_len {
             offsets.push(
@@ -199,6 +226,7 @@ impl ClipReader {
             offsets,
             decode_buf: Vec::new(),
             frame_buf: vec![0u8; frame_len],
+            file_len,
         })
     }
 
@@ -220,6 +248,17 @@ impl ClipReader {
 
         let compressed_len = read_u32(&mut self.file)
             .with_context(|| format!("reading compressed_len for frame {index}"))?;
+        // Reject a claimed compressed length larger than the file could
+        // possibly hold before allocating: `compressed_len` is an
+        // untrusted u32 read straight off disk, and a corrupt file can
+        // claim up to u32::MAX bytes (~4GB) to force an allocator abort.
+        let remaining = self.file_len.saturating_sub(offset.saturating_add(4));
+        if u64::from(compressed_len) > remaining {
+            bail!(
+                "pulseclip frame {index}: compressed_len {compressed_len} exceeds {remaining} \
+                 remaining bytes in the file"
+            );
+        }
         let mut compressed = vec![0u8; compressed_len as usize];
         self.file
             .read_exact(&mut compressed)
@@ -399,5 +438,69 @@ mod tests {
             .write_all(b"PCLIP1\x08\x00")
             .unwrap();
         assert!(ClipReader::open(&path).is_err());
+    }
+
+    #[test]
+    fn forged_seek_table_len_is_rejected_without_aborting() {
+        let dir = std::env::temp_dir().join("pulseclip-forged-table");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("bad.pulseclip");
+
+        // A header claiming ~4 billion seek table entries (~34GB) in a file
+        // that's only 22 bytes long. Vec::with_capacity on the raw claimed
+        // length would abort the process; open() must reject it instead.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"PCLIP1");
+        bytes.extend_from_slice(&1u16.to_le_bytes()); // grid_w
+        bytes.extend_from_slice(&1u16.to_le_bytes()); // grid_h
+        bytes.extend_from_slice(&1.0f32.to_le_bytes()); // capture_fps
+        bytes.extend_from_slice(&u32::MAX.to_le_bytes()); // frame_count
+        bytes.extend_from_slice(&u32::MAX.to_le_bytes()); // seek_table_len
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(&bytes)
+            .unwrap();
+
+        let err = match ClipReader::open(&path) {
+            Ok(_) => panic!("forged seek_table_len should have been rejected"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("seek table"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn forged_compressed_len_is_rejected_without_aborting() {
+        let dir = std::env::temp_dir().join("pulseclip-forged-frame");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("bad.pulseclip");
+
+        // A structurally valid 1-frame file whose seek table is honest, but
+        // whose frame declares a compressed_len of ~4GB with no compressed
+        // bytes actually following it. vec![0u8; compressed_len] on the raw
+        // claimed length would abort the process; frame() must reject it.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"PCLIP1");
+        bytes.extend_from_slice(&1u16.to_le_bytes()); // grid_w
+        bytes.extend_from_slice(&1u16.to_le_bytes()); // grid_h
+        bytes.extend_from_slice(&1.0f32.to_le_bytes()); // capture_fps
+        bytes.extend_from_slice(&1u32.to_le_bytes()); // frame_count
+        bytes.extend_from_slice(&1u32.to_le_bytes()); // seek_table_len
+        let frame_offset = bytes.len() as u64 + 8; // right after the 1-entry table
+        bytes.extend_from_slice(&frame_offset.to_le_bytes());
+        bytes.extend_from_slice(&u32::MAX.to_le_bytes()); // forged compressed_len
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(&bytes)
+            .unwrap();
+
+        let mut reader = ClipReader::open(&path).unwrap();
+        let err = reader.frame(0).unwrap_err();
+        assert!(
+            err.to_string().contains("compressed_len"),
+            "unexpected error: {err}"
+        );
     }
 }
