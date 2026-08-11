@@ -941,43 +941,54 @@ const VIDEO_GLYPH: &str = "▀";
 /// then paints over whatever it means to be opaque.
 fn paint_background(buffer: &mut Buffer, pixels: &[u8], grid: (u16, u16), dim_pct: u8) {
     let area = buffer.area;
+    let flat = palette().bg;
     for_each_video_cell(area, pixels, grid, |x, y, top, bottom| {
         let cell = &mut buffer[(x, y)];
         cell.set_symbol(VIDEO_GLYPH);
-        cell.set_fg(dim_toward_bg(top, dim_pct));
-        cell.set_bg(dim_toward_bg(bottom, dim_pct));
+        cell.set_fg(dim_toward(top, flat, dim_pct));
+        cell.set_bg(dim_toward(bottom, flat, dim_pct));
     });
 }
 
-/// Post-pass: page chrome styles whole rects at a time, so panels re-flatten
-/// their backgrounds to the theme's. Any cell left sitting on the flat
-/// backdrop (or on nothing at all) gets the video back behind it; every
-/// other background — selection bars, severity fills, raised surfaces — is
-/// an intentional choice and stays exactly as drawn.
+/// Post-pass: page chrome styles whole rects at a time, so both the flat
+/// backdrop and every panel fill re-flatten the video away. This hands it
+/// back to each of those cells, so text, panels, and gaps all sit *on* the
+/// video instead of punching solid rectangles through it.
+///
+/// The layering survives because each cell is dimmed toward the color it was
+/// already wearing: gutters toward `bg`, panels toward `surface`. Panels stay
+/// exactly as much lighter than the gutters as they are today, and both carry
+/// the clip. Any other background — selection bars, severity chips, raised
+/// surfaces, statusline accents — is a semantic choice and stays untouched.
 ///
 /// A glyph covers the full cell, so the background it sits on is the mean of
 /// the cell's two video pixels rather than just the lower one.
 fn restore_background_bg(buffer: &mut Buffer, pixels: &[u8], grid: (u16, u16), dim_pct: u8) {
     let flat = palette().bg;
+    let surface = palette().surface;
     for_each_video_cell(buffer.area, pixels, grid, |x, y, top, bottom| {
         let cell = &mut buffer[(x, y)];
-        if cell.bg != Color::Reset && cell.bg != flat {
-            return;
-        }
+        let target = match cell.bg {
+            Color::Reset => flat,
+            bg if bg == flat => flat,
+            bg if bg == surface => surface,
+            _ => return,
+        };
         let mean = (
             mean_channel(top.0, bottom.0),
             mean_channel(top.1, bottom.1),
             mean_channel(top.2, bottom.2),
         );
-        cell.set_bg(dim_toward_bg(mean, dim_pct));
+        cell.set_bg(dim_toward(mean, target, dim_pct));
     });
 }
 
-/// Lerps a video pixel `dim_pct` of the way toward the theme's background
-/// color. This is the whole legibility budget: at 0 the clip plays at full
-/// strength, at 100 it is indistinguishable from a plain backdrop.
-fn dim_toward_bg(rgb: (u8, u8, u8), dim_pct: u8) -> Color {
-    let (br, bg, bb) = match palette().bg {
+/// Lerps a video pixel `dim_pct` of the way toward `target` — the theme color
+/// the cell would have worn without a background. This is the whole
+/// legibility budget: at 0 the clip plays at full strength, at 100 it is
+/// indistinguishable from the flat theme.
+fn dim_toward(rgb: (u8, u8, u8), target: Color, dim_pct: u8) -> Color {
+    let (tr, tg, tb) = match target {
         Color::Rgb(r, g, b) => (r, g, b),
         // No shipped palette is indexed, but a fallback beats a panic.
         _ => (0, 0, 0),
@@ -986,7 +997,7 @@ fn dim_toward_bg(rgb: (u8, u8, u8), dim_pct: u8) -> Color {
     let lerp = |from: u8, to: u8| {
         (f32::from(from) + (f32::from(to) - f32::from(from)) * toward).round() as u8
     };
-    Color::Rgb(lerp(rgb.0, br), lerp(rgb.1, bg), lerp(rgb.2, bb))
+    Color::Rgb(lerp(rgb.0, tr), lerp(rgb.1, tg), lerp(rgb.2, tb))
 }
 
 fn mean_channel(top: u8, bottom: u8) -> u8 {
@@ -9586,13 +9597,20 @@ mod tests {
                 // the foreground, bottom half behind it.
                 two_pixel_cells += 1;
             }
-            if b.bg != Color::Reset && b.bg != palette().bg {
-                assert_eq!(a.bg, b.bg, "an intentional fill was overpainted");
+            // The flat backdrop and the panel fills both carry the video; a
+            // semantic fill (selection bar, severity chip) never does.
+            if b.bg != Color::Reset && b.bg != palette().bg && b.bg != palette().surface {
+                assert_eq!(a.bg, b.bg, "a semantic fill was overpainted");
             } else if a.bg != b.bg {
                 video_backed_cells += 1;
             }
         }
-        assert!(video_backed_cells > 0, "no cell ever received video bg");
+        let total = with_bg.buffer().content().len();
+        assert!(
+            video_backed_cells * 2 > total,
+            "the video reached only {video_backed_cells} of {total} cells — chrome \
+             is meant to sit on it, not punch through it"
+        );
         assert!(two_pixel_cells > 0, "no blank cell kept its top pixel");
     }
 
@@ -9620,16 +9638,27 @@ mod tests {
     }
 
     #[test]
-    fn dim_lerps_the_video_toward_the_theme_background() {
+    fn dim_lerps_the_video_toward_the_cell_s_own_theme_color() {
         let _theme = theme::test_support::activate(theme::ThemeId::Vitals);
-        let Color::Rgb(br, bg, bb) = palette().bg else {
+        let flat = palette().bg;
+        let (Color::Rgb(br, _, _), Color::Rgb(sr, _, _)) = (flat, palette().surface) else {
             panic!("every shipped palette is true color");
         };
-        assert_eq!(dim_toward_bg((200, 100, 40), 0), Color::Rgb(200, 100, 40));
-        assert_eq!(dim_toward_bg((200, 100, 40), 100), Color::Rgb(br, bg, bb));
-        let Color::Rgb(hr, _, _) = dim_toward_bg((205, 100, 40), 50) else {
+        assert_eq!(
+            dim_toward((200, 100, 40), flat, 0),
+            Color::Rgb(200, 100, 40)
+        );
+        assert_eq!(dim_toward((200, 100, 40), flat, 100), flat);
+        let Color::Rgb(hr, _, _) = dim_toward((205, 100, 40), flat, 50) else {
             panic!("dimming stays true color");
         };
-        assert_eq!(hr, ((205 + u16::from(br)) / 2) as u8);
+        assert_eq!(hr, ((205.0 + f32::from(br)) / 2.0).round() as u8);
+        // Panels dim toward their own fill, which is what keeps them lighter
+        // than the gutters once both are carrying the same clip.
+        let Color::Rgb(pr, _, _) = dim_toward((205, 100, 40), palette().surface, 50) else {
+            panic!("dimming stays true color");
+        };
+        assert_eq!(pr, ((205.0 + f32::from(sr)) / 2.0).round() as u8);
+        assert!(pr > hr, "a panel must stay lighter than the backdrop");
     }
 }
