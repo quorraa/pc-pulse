@@ -871,24 +871,6 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
         );
         return;
     }
-    // One decode per draw, copied out of the player so the rest of `draw`
-    // can keep `app` borrowed mutably. `current_pixels` re-reads the clip
-    // every call, so sampling it per cell would be ruinous.
-    let video = app
-        .background
-        .as_mut()
-        .filter(|_| app.client_prefs.background_enabled)
-        .map(|background| (background.current_pixels().to_vec(), background.grid()));
-    // After the base wash above, never before: that block styles every cell
-    // in `area` and would erase the frame we just painted.
-    if let Some((pixels, grid)) = &video {
-        paint_background(
-            frame.buffer_mut(),
-            pixels,
-            *grid,
-            app.client_prefs.background_dim,
-        );
-    }
     let rail = rail_width(area).is_some();
     let broadsheet = !rail && broadsheet();
     let regions = regions(area);
@@ -920,13 +902,20 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     }
     render_modal(frame, app);
     render_help_overlay(frame, app, regions.body);
-    // Every page paints its own chrome over the video; this hands the video
-    // back to the cells whose background is still the theme's flat backdrop.
-    if let Some((pixels, grid)) = &video {
+    // Last, once the page has drawn: the video can only tell chrome from
+    // content by reading what the page left in the buffer. One decode per
+    // draw, copied out of the player because `current_pixels` re-reads the
+    // clip on every call — sampling it per cell would be ruinous.
+    if let Some((pixels, grid)) = app
+        .background
+        .as_mut()
+        .filter(|_| app.client_prefs.background_enabled)
+        .map(|background| (background.current_pixels().to_vec(), background.grid()))
+    {
         restore_background_bg(
             frame.buffer_mut(),
-            pixels,
-            *grid,
+            &pixels,
+            grid,
             app.client_prefs.background_dim,
         );
     }
@@ -936,30 +925,15 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
 /// color, its bottom half the background, so one cell carries two pixels.
 const VIDEO_GLYPH: &str = "▀";
 
-/// Pre-pass: seeds every cell's *background* with the current video frame, so
-/// anything drawn afterwards that sets no background of its own is already
-/// sitting on the video rather than on the flat backdrop.
+/// Paints the current video frame into the finished buffer, *after* the page
+/// has drawn.
 ///
-/// Deliberately touches nothing but the background. The symbol and the
-/// foreground belong to whatever the UI is about to draw: `Block::render`
-/// calls `Buffer::set_style`, which rewrites fg and bg across the block's
-/// whole rect but leaves symbols alone, so a glyph painted here would survive
-/// inside every panel wearing `palette().text` — a bright slab over two
-/// thirds of the frame. The half-block trick therefore belongs in the
-/// post-pass, where a cell that is *still blank* is proof that nothing was
-/// drawn over it.
-fn paint_background(buffer: &mut Buffer, pixels: &[u8], grid: (u16, u16), dim_pct: u8) {
-    let area = buffer.area;
-    let flat = palette().bg;
-    for_each_video_cell(area, pixels, grid, |x, y, top, bottom| {
-        buffer[(x, y)].set_bg(dim_toward(mean_pixel(top, bottom), flat, dim_pct));
-    });
-}
-
-/// Post-pass: page chrome styles whole rects at a time, so both the flat
-/// backdrop and every panel fill re-flatten the video away. This hands it
-/// back to each of those cells, so text, panels, and gaps all sit *on* the
-/// video instead of punching solid rectangles through it.
+/// Page chrome styles whole rects at a time, so both the flat backdrop and
+/// every panel fill flatten the video away as they draw. This hands it back
+/// to each of those cells, so text, panels, and gaps all sit *on* the video
+/// instead of punching solid rectangles through it. Running last is not a
+/// preference: reading what the page left behind is the only way to tell
+/// chrome from content.
 ///
 /// The layering survives because each cell is dimmed toward the color it was
 /// already wearing: gutters toward `bg`, panels toward `surface`, raised
@@ -977,23 +951,38 @@ fn paint_background(buffer: &mut Buffer, pixels: &[u8], grid: (u16, u16), dim_pc
 ///   left alone; only the background changes, to the *mean* of the cell's two
 ///   pixels, because one background has to stand in for both halves.
 ///
-/// The blank/drawn split is decided on `symbol() == " "` after the page has
-/// drawn, which is the only sound test available: the UI draws `▀` itself
-/// (the broadsheet headline's block digits are built from `▀ ▄ █`), so "the
-/// cell holds the video glyph" would misread those as background.
+/// The blank/drawn split is decided on `symbol() == " "`, which is the only
+/// sound test available: the UI draws `▀` itself (the broadsheet headline's
+/// block digits are built from `▀ ▄ █`), so "the cell holds the video glyph"
+/// would misread those as background.
+///
+/// ## Effects interaction (accepted, deliberately)
+///
+/// Filling blank cells makes essentially the whole buffer non-empty, which
+/// changes what `tachyonfx`'s `CellFilter::NonEmpty` selects: the 21 cues in
+/// `effects.rs` that use it to mean "transform content, not empty space" now
+/// sweep the video layer too, since with a background there is no empty space
+/// left. That is accepted rather than bounded, because:
+///
+/// 1. the only way to exclude video cells is a symbol predicate, and the UI
+///    draws `▀` itself — excluding it would degrade authored motion even with
+///    no clip loaded;
+/// 2. the cues are color and symbol transforms over a layer that is itself
+///    block glyphs in video colors, so they read as a sweep across the
+///    backdrop, which is what the "monitor boot" and "channel switch" cues are
+///    already saying;
+/// 3. nothing accumulates — every frame redraws from scratch and the effect
+///    manager forces a cleanup base render when the last effect ends. That
+///    part is pinned by `motion_cues_leave_the_video_layer_exactly_as_drawn`.
 fn restore_background_bg(buffer: &mut Buffer, pixels: &[u8], grid: (u16, u16), dim_pct: u8) {
     let flat = palette().bg;
     let surface = palette().surface;
     let raised = palette().surface_raised;
     for_each_video_cell(buffer.area, pixels, grid, |x, y, top, bottom| {
-        let mean = mean_pixel(top, bottom);
-        // A cell nothing has drawn on still wears the pre-pass's seed, which
-        // is recomputed here rather than color-matched against the palette.
-        let seeded = dim_toward(mean, flat, dim_pct);
         let cell = &mut buffer[(x, y)];
         let target = match cell.bg {
             Color::Reset => flat,
-            bg if bg == flat || bg == seeded => flat,
+            bg if bg == flat => flat,
             bg if bg == surface => surface,
             bg if bg == raised => raised,
             _ => return,
@@ -1003,7 +992,7 @@ fn restore_background_bg(buffer: &mut Buffer, pixels: &[u8], grid: (u16, u16), d
             cell.set_fg(dim_toward(top, target, dim_pct));
             cell.set_bg(dim_toward(bottom, target, dim_pct));
         } else {
-            cell.set_bg(dim_toward(mean, target, dim_pct));
+            cell.set_bg(dim_toward(mean_pixel(top, bottom), target, dim_pct));
         }
     });
 }
@@ -1037,8 +1026,9 @@ fn mean_pixel(top: (u8, u8, u8), bottom: (u8, u8, u8)) -> (u8, u8, u8) {
 }
 
 /// Walks every cell of `area`, handing the visitor the nearest-neighbor
-/// video colors for that cell's top and bottom halves. Both passes sample
-/// through here so they can never disagree about which pixel lands where.
+/// video colors for that cell's top and bottom halves. Keeping the sampling
+/// math and its bounds guards here leaves the painter to decide only what to
+/// do with the two colors.
 fn for_each_video_cell(
     area: Rect,
     pixels: &[u8],
@@ -9766,27 +9756,12 @@ mod tests {
     }
 
     #[test]
-    fn pre_pass_seeds_only_the_background() {
-        let _theme = theme::test_support::activate(theme::ThemeId::Vitals);
-        let (mut buffer, pixels, grid) = video_strip(1);
-        buffer[(0, 0)].set_symbol("X");
-        buffer[(0, 0)].set_fg(palette().ok);
-
-        paint_background(&mut buffer, &pixels, grid, 0);
-
-        // Symbols and foregrounds belong to the UI: painting a glyph here is
-        // what produced the bright slab under every panel.
-        assert_eq!(buffer[(0, 0)].symbol(), "X");
-        assert_eq!(buffer[(0, 0)].fg, palette().ok);
-        assert_eq!(buffer[(0, 0)].bg, Color::Rgb(120, 120, 120));
-    }
-
-    #[test]
     fn motion_cues_leave_the_video_layer_exactly_as_drawn() {
         // The video makes every cell non-empty, so tachyonfx's
         // `CellFilter::NonEmpty` cues now sweep the background as well as the
-        // text. That is accepted (see `restore_background_bg`); what must not
-        // happen is a cue leaving the video layer altered once it settles.
+        // text. That is accepted, with the reasoning under "Effects
+        // interaction" on `restore_background_bg`; what must not happen is a
+        // cue leaving the video layer altered once it settles.
         let _theme = theme::test_support::activate(theme::ThemeId::Vitals);
         let clip = background_clip("ui-bg-motion");
         let mut app = app_with_background(&clip);
