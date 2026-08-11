@@ -3,7 +3,7 @@ use crate::{
     background::Background,
     chat_history::{ChatHistoryStore, ChatSession},
     client::PipeClient,
-    clipconvert::{self, ConvertEvent},
+    clipconvert::{self, ConvertEvent, ConvertHandle},
     filepicker::{self, PickEvent},
     prefs::{self, PrefsStore, UiPrefs},
     theme,
@@ -1163,9 +1163,10 @@ pub struct App {
     pub background_resample: crate::ui::VideoResample,
     /// The live one-time ffmpeg conversion, while one is running. `drain_events`
     /// polls it and drops it the moment the worker reports `Done` or `Failed`,
-    /// so `is_some()` is exactly "a conversion is in flight".
-    pub convert_rx: Option<Receiver<ConvertEvent>>,
-    /// The source path *and resolution cap* [`Self::convert_rx`] is
+    /// so `is_some()` is exactly "a conversion is in flight". Letting go of
+    /// the handle is also what stops the worker — see [`Self::forget_conversion`].
+    pub convert_worker: Option<ConvertHandle>,
+    /// The source path *and resolution cap* [`Self::convert_worker`] is
     /// converting. Kept beside the receiver so a repeated commit of the same
     /// path can recognize its own conversion instead of starting a rival one
     /// over the same cache file — and the cap belongs in that key as much as
@@ -1297,7 +1298,7 @@ impl App {
             client_prefs: UiPrefs::default(),
             background: None,
             background_resample: crate::ui::VideoResample::default(),
-            convert_rx: None,
+            convert_worker: None,
             converting: None,
             pick_rx: None,
             sweep_superseded: clipconvert::sweep_superseded,
@@ -1568,8 +1569,8 @@ impl App {
     /// handled because every outcome touches `self`, and a finished
     /// conversion (either way) drops the receiver.
     fn drain_conversion(&mut self) -> bool {
-        let events: Vec<ConvertEvent> = match &self.convert_rx {
-            Some(receiver) => receiver.try_iter().collect(),
+        let events: Vec<ConvertEvent> = match &self.convert_worker {
+            Some(worker) => worker.events.try_iter().collect(),
             None => return false,
         };
         let mut changed = false;
@@ -1628,16 +1629,32 @@ impl App {
             }
             return;
         }
+        // Whatever was running is working toward a cache file this call is
+        // walking away from, so it is stopped rather than merely dropped.
+        // This is the only place a worker is replaced, which is what keeps
+        // "superseded" and "cancelled" the same event everywhere.
+        self.forget_conversion();
         self.converting = Some((source.clone(), cap));
-        self.convert_rx = Some(clipconvert::spawn_convert(PathBuf::from(source), cap));
+        self.convert_worker = Some(clipconvert::spawn_convert(PathBuf::from(source), cap));
         self.status = CONVERTING_STATUS.into();
         self.status_is_error = false;
     }
 
-    /// Let go of the conversion worker: the receiver and the source it was
+    /// Let go of the conversion worker: the handle and the source it was
     /// converting always travel together.
+    ///
+    /// Letting go also *stops* it. Every way a conversion is superseded — a
+    /// new video, a new quality ceiling, the background switched off, a
+    /// re-pick — comes through here, and before this call cancelled the
+    /// worker each of them left one running: an ffmpeg decoding at full tilt
+    /// into a cache file the app had already stopped listening for, and
+    /// several at once if the preset was cycled. A conversion that finished
+    /// on its own is cancelled here too, which costs an atomic store into a
+    /// flag nothing reads any more.
     fn forget_conversion(&mut self) {
-        self.convert_rx = None;
+        if let Some(worker) = self.convert_worker.take() {
+            worker.cancel();
+        }
         self.converting = None;
     }
 
@@ -5058,7 +5075,7 @@ mod tests {
     /// Pump `drain_events` until the conversion worker's message lands.
     fn wait_for_background(app: &mut App) {
         let deadline = Instant::now() + Duration::from_secs(5);
-        while app.convert_rx.is_some() && Instant::now() < deadline {
+        while app.convert_worker.is_some() && Instant::now() < deadline {
             app.drain_events();
             thread::sleep(Duration::from_millis(5));
         }
@@ -5172,7 +5189,7 @@ mod tests {
         assert!(app.status.contains("Background quality: high (832x464)"));
         assert!(!app.status_is_error);
         // With no video set there is nothing to reconvert.
-        assert!(app.convert_rx.is_none(), "status was {}", app.status);
+        assert!(app.convert_worker.is_none(), "status was {}", app.status);
         let _ = std::fs::remove_file(path);
     }
 
@@ -5195,7 +5212,7 @@ mod tests {
         // wrong clip now — and the cache it came from is keyed on that
         // ceiling, so it cannot simply be reopened.
         assert!(app.background.is_none(), "the old-ceiling clip stayed up");
-        assert!(app.convert_rx.is_some(), "status was {}", app.status);
+        assert!(app.convert_worker.is_some(), "status was {}", app.status);
         assert_eq!(
             app.converting.as_ref().map(|(_, cap)| *cap),
             Some(crate::clipconvert::BackgroundQuality::Ultra.cap()),
@@ -5216,7 +5233,10 @@ mod tests {
         let mut app = App::new_inert();
         app.client_prefs.background_video = path.clone();
         app.start_background_conversion();
-        let first = app.convert_rx.clone().expect("a conversion is in flight");
+        let first = app
+            .convert_worker
+            .clone()
+            .expect("a conversion is in flight");
         assert_eq!(
             app.converting,
             Some((
@@ -5228,7 +5248,7 @@ mod tests {
         cycle_quality(&mut app);
 
         assert!(
-            !app.convert_rx.as_ref().unwrap().same_channel(&first),
+            !app.convert_worker.as_ref().unwrap().same_channel(&first),
             "the quality change was swallowed by the running conversion"
         );
         assert_eq!(
@@ -5238,9 +5258,45 @@ mod tests {
 
         // ...while the *same* quality re-requested against the same source
         // still recognizes its own worker and leaves it alone.
-        let running = app.convert_rx.clone().unwrap();
+        let running = app.convert_worker.clone().unwrap();
         app.start_background_conversion();
-        assert!(app.convert_rx.as_ref().unwrap().same_channel(&running));
+        assert!(app.convert_worker.as_ref().unwrap().same_channel(&running));
+    }
+
+    #[test]
+    fn every_superseding_path_cancels_the_worker_it_walks_away_from() {
+        // Dropping the receiver only stopped *us* listening: the worker kept
+        // an ffmpeg running to the end of a clip nobody would ever load, and
+        // cycling the preset a few times stacked several of them at once.
+        let source = scratch_source("cancel-supersede");
+        let mut app = App::new_inert();
+        app.client_prefs.background_video = source.to_string_lossy().into_owned();
+
+        // (1) A quality change: same source, new ceiling, new worker.
+        app.start_background_conversion();
+        let first = app
+            .convert_worker
+            .clone()
+            .expect("a conversion is in flight");
+        assert!(!first.is_cancelled(), "a fresh worker starts cancelled");
+        cycle_quality(&mut app);
+        assert!(
+            first.is_cancelled(),
+            "the old-ceiling worker was left running"
+        );
+        let second = app.convert_worker.clone().expect("the replacement runs");
+        assert!(!second.is_cancelled(), "the replacement was cancelled too");
+
+        // (2) A different source.
+        let other = scratch_source("cancel-supersede-other");
+        app.set_background_video(other.to_string_lossy().into_owned());
+        assert!(second.is_cancelled(), "the worker for the old video ran on");
+        let third = app.convert_worker.clone().expect("the new source converts");
+
+        // (3) The background switched off entirely.
+        app.clear_background_video();
+        assert!(third.is_cancelled(), "switching off left a worker running");
+        assert!(app.convert_worker.is_none());
     }
 
     /// Puts the TUNE cursor on the background-video row.
@@ -5286,7 +5342,7 @@ mod tests {
 
         assert_eq!(app.client_prefs.background_video, source.to_string_lossy());
         assert_eq!(store.load().background_video, source.to_string_lossy());
-        assert!(app.convert_rx.is_some(), "status was {}", app.status);
+        assert!(app.convert_worker.is_some(), "status was {}", app.status);
         wait_for_background(&mut app);
         assert!(app.background.is_some(), "status was {}", app.status);
         let _ = std::fs::remove_file(prefs_path);
@@ -5302,7 +5358,10 @@ mod tests {
         let mut app = App::new_inert();
         app.client_prefs.background_video = source.to_string_lossy().into_owned();
         app.start_background_conversion();
-        let running = app.convert_rx.clone().expect("a conversion is in flight");
+        let running = app
+            .convert_worker
+            .clone()
+            .expect("a conversion is in flight");
 
         focus_video_row(&mut app);
         let dialog = arm_picker(&mut app);
@@ -5315,7 +5374,7 @@ mod tests {
         assert_eq!(app.status, "Converting background…");
         assert!(!app.status_is_error);
         assert!(
-            app.convert_rx.as_ref().unwrap().same_channel(&running),
+            app.convert_worker.as_ref().unwrap().same_channel(&running),
             "the running conversion was replaced"
         );
 
@@ -5451,7 +5510,7 @@ mod tests {
             assert!(app.client_prefs.background_video.is_empty(), "{key:?}");
             assert!(store.load().background_video.is_empty(), "{key:?}");
             assert!(app.background.is_none(), "{key:?}");
-            assert!(app.convert_rx.is_none(), "{key:?}");
+            assert!(app.convert_worker.is_none(), "{key:?}");
             assert_eq!(
                 app.setting_value(SettingField::ClientBackgroundVideo),
                 "off"
@@ -5549,7 +5608,7 @@ mod tests {
         let background = app.background.as_ref().expect("cached clip loads directly");
         assert_eq!(background.effective_fps(), 12);
         assert!(
-            app.convert_rx.is_none(),
+            app.convert_worker.is_none(),
             "a cached clip converts nothing: {}",
             app.status
         );
@@ -5697,7 +5756,7 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(app.client_prefs.background_video, source.to_string_lossy());
         assert_eq!(store.load().background_video, source.to_string_lossy());
-        assert!(app.convert_rx.is_some(), "conversion started");
+        assert!(app.convert_worker.is_some(), "conversion started");
         assert!(matches!(app.mode, InputMode::Normal));
 
         wait_for_background(&mut app);
@@ -5742,7 +5801,10 @@ mod tests {
         let mut app = App::new_inert();
         app.client_prefs.background_video = path.clone();
         app.start_background_conversion();
-        let first = app.convert_rx.clone().expect("a conversion is in flight");
+        let first = app
+            .convert_worker
+            .clone()
+            .expect("a conversion is in flight");
 
         // Committing the same path again must not spawn a rival worker: it
         // would find the first one's half-written cache file, call it done,
@@ -5753,7 +5815,7 @@ mod tests {
         };
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(
-            app.convert_rx
+            app.convert_worker
                 .as_ref()
                 .expect("the conversion is still running")
                 .same_channel(&first),
@@ -5768,7 +5830,7 @@ mod tests {
             typed: other.to_string_lossy().into_owned(),
         };
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        assert!(!app.convert_rx.as_ref().unwrap().same_channel(&first));
+        assert!(!app.convert_worker.as_ref().unwrap().same_channel(&first));
     }
 
     #[test]
@@ -5779,11 +5841,11 @@ mod tests {
         // cache file exists but is not a readable clip yet. Held here with
         // a channel of our own so no real worker can race the assertion.
         std::fs::write(&cache, b"").unwrap();
-        let (_convert_tx, convert_rx) = bounded::<ConvertEvent>(1);
+        let (_convert_tx, convert_events) = bounded::<ConvertEvent>(1);
         let mut app = App::new_inert();
         app.client_prefs.background_video = source.to_string_lossy().into_owned();
         app.converting = Some((source.to_string_lossy().into_owned(), DEFAULT_CAP));
-        app.convert_rx = Some(convert_rx);
+        app.convert_worker = Some(ConvertHandle::stub(convert_events));
 
         app.mode = InputMode::EditSetting {
             field: SettingField::ClientBackgroundFps,
@@ -5794,7 +5856,7 @@ mod tests {
         assert!(app.background.is_none(), "status was {}", app.status);
         assert!(!app.status_is_error, "status was {}", app.status);
         assert!(
-            app.convert_rx.is_some(),
+            app.convert_worker.is_some(),
             "the conversion still owns the file"
         );
         let _ = std::fs::remove_file(cache);
@@ -5817,7 +5879,7 @@ mod tests {
 
         assert!(app.background.is_none());
         assert!(
-            app.convert_rx.is_some(),
+            app.convert_worker.is_some(),
             "no reconversion started: {}",
             app.status
         );
@@ -5837,7 +5899,7 @@ mod tests {
         wait_for_background(&mut app);
         assert!(app.status_is_error, "status was {}", app.status);
         assert!(app.background.is_none());
-        assert!(app.convert_rx.is_none(), "the receiver is dropped");
+        assert!(app.convert_worker.is_none(), "the receiver is dropped");
     }
 
     /// An app whose cached clip is loaded and whose refresh preference is

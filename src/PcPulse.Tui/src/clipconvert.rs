@@ -12,6 +12,28 @@
 //! vector (never through a shell) and runs with `CREATE_NO_WINDOW` so no
 //! console flashes up behind the TUI.
 //!
+//! ## Stopping one
+//!
+//! A conversion outlives the interest in it all the time: the person picks a
+//! different video, cycles the quality preset, or turns the background off
+//! while frames are still streaming. Each of those wants a *different* clip
+//! out of a different cache file, so the worker already running is producing
+//! something nobody will load — and left alone it would burn a core and
+//! hundreds of megabytes of disk doing it, with a preset cycled three times
+//! stacking three ffmpegs. Every worker therefore carries a cancellation
+//! flag ([`ConvertHandle`]), checked between frame reads; raising it kills
+//! ffmpeg, drops the half-written clip, and stops the worker **silently** —
+//! `Done` and `Failed` are for a receiver somebody still holds.
+//!
+//! Two deliberate non-cancellations. The probe (the first, short-lived
+//! ffmpeg) is uncancellable: it decodes nothing, exits in tens of
+//! milliseconds, and the check that would interrupt it lands at the top of
+//! the frame loop a moment later anyway. And the TUI exiting needs no
+//! cancellation at all — the worker is detached, so it dies with the
+//! process, and every handle it held closes with it. ffmpeg's stdout is a
+//! pipe whose read end this process owns (see [`convert`]), so closing it
+//! fails ffmpeg's next write and ffmpeg exits on its own.
+//!
 //! ## What a cache file costs
 //!
 //! Capture size follows the source and the chosen quality preset (see
@@ -46,6 +68,8 @@ use std::io::Read;
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
 /// How finely a background video is converted, as the person chooses it on
@@ -461,23 +485,77 @@ fn parse_hms(text: &str) -> Option<f32> {
     Some(hours * 3_600.0 + minutes * 60.0 + seconds)
 }
 
-/// Spawns the detached conversion worker and returns the channel it reports
-/// progress on. If `cache_path(&source, cap)` already exists, the worker
-/// sends `Done` immediately without touching ffmpeg at all — which is what
-/// makes this the cheap "load what we already have" path as well.
-pub fn spawn_convert(source: PathBuf, cap: (u16, u16)) -> Receiver<ConvertEvent> {
-    let (tx, rx) = bounded(16);
-    let _ = thread::Builder::new()
-        .name("pcpulse-clip-convert".into())
-        .spawn(move || run_convert(&source, cap, &tx));
-    rx
+/// A running conversion: the channel its worker reports on, and the flag
+/// that stops it. The two are one value on purpose — a cancellation token
+/// that could be separated from its receiver is a worker somebody can walk
+/// away from without stopping.
+///
+/// Cloning shares the one worker: every clone reads the same channel and
+/// raises the same flag, so whoever holds one can stop the conversion.
+#[derive(Clone)]
+pub struct ConvertHandle {
+    /// Progress, and the single terminal `Done`/`Failed` — unless the
+    /// conversion is cancelled, which is silent.
+    pub events: Receiver<ConvertEvent>,
+    cancel: Arc<AtomicBool>,
 }
 
-fn run_convert(source: &Path, cap: (u16, u16), tx: &Sender<ConvertEvent>) {
+impl ConvertHandle {
+    /// Tell the worker to stop. It notices between frames, kills its ffmpeg,
+    /// throws away the partial clip, and exits without reporting anything.
+    /// Cheap and idempotent: cancelling a worker that has already finished
+    /// does nothing at all.
+    pub fn cancel(&self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether this conversion has been told to stop.
+    pub fn is_cancelled(&self) -> bool {
+        self.cancel.load(Ordering::Relaxed)
+    }
+
+    /// Whether both handles are onto the same worker.
+    pub fn same_channel(&self, other: &Self) -> bool {
+        self.events.same_channel(&other.events)
+    }
+
+    /// A handle onto a channel a test drives by hand: its flag belongs to no
+    /// worker, so raising it stops nothing. The real one comes only from
+    /// [`spawn_convert`].
+    #[cfg(test)]
+    pub(crate) fn stub(events: Receiver<ConvertEvent>) -> Self {
+        Self {
+            events,
+            cancel: Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
+
+/// Spawns the detached conversion worker and returns the handle it reports
+/// progress on and is stopped through. If `cache_path(&source, cap)` already
+/// exists, the worker sends `Done` immediately without touching ffmpeg at
+/// all — which is what makes this the cheap "load what we already have" path
+/// as well.
+pub fn spawn_convert(source: PathBuf, cap: (u16, u16)) -> ConvertHandle {
+    let (tx, rx) = bounded(16);
+    let cancel = Arc::new(AtomicBool::new(false));
+    let worker_cancel = Arc::clone(&cancel);
+    let _ = thread::Builder::new()
+        .name("pcpulse-clip-convert".into())
+        .spawn(move || run_convert(&source, cap, &tx, &worker_cancel));
+    ConvertHandle { events: rx, cancel }
+}
+
+fn run_convert(source: &Path, cap: (u16, u16), tx: &Sender<ConvertEvent>, cancel: &AtomicBool) {
+    // Superseded before the worker got its first turn on a core. Nothing has
+    // been spawned or written yet, so there is nothing to unwind either.
+    if cancel.load(Ordering::Relaxed) {
+        return;
+    }
     let cache = match cache_path(source, cap) {
         Ok(cache) => cache,
         Err(error) => {
-            let _ = tx.send(ConvertEvent::Failed(format!("{error:#}")));
+            report(tx, cancel, ConvertEvent::Failed(format!("{error:#}")));
             return;
         }
     };
@@ -488,13 +566,26 @@ fn run_convert(source: &Path, cap: (u16, u16), tx: &Sender<ConvertEvent>) {
     // no way out from the UI. Delete it and convert again instead.
     if cache.exists() {
         if ClipReader::open(&cache).is_ok() {
-            let _ = tx.send(ConvertEvent::Done(cache));
+            report(tx, cancel, ConvertEvent::Done(cache));
             return;
         }
         let _ = fs::remove_file(&cache);
     }
-    if let Err(error) = convert(source, &cache, cap, tx) {
-        let _ = tx.send(ConvertEvent::Failed(format!("{error:#}")));
+    if let Err(error) = convert(source, &cache, cap, tx, cancel) {
+        report(tx, cancel, ConvertEvent::Failed(format!("{error:#}")));
+    }
+}
+
+/// Sends `event` unless the conversion has been cancelled.
+///
+/// A cancelled worker is silent by contract: whoever cancelled it has
+/// already let go of the receiver, so a `Done` would name a cache file that
+/// is being deleted and a `Failed` would report the stop the person asked
+/// for as an error. The check also covers the errors cancelling *causes* —
+/// killing ffmpeg mid-stream fails the read that was in flight.
+fn report(tx: &Sender<ConvertEvent>, cancel: &AtomicBool, event: ConvertEvent) {
+    if !cancel.load(Ordering::Relaxed) {
+        let _ = tx.send(event);
     }
 }
 
@@ -502,7 +593,18 @@ fn run_convert(source: &Path, cap: (u16, u16), tx: &Sender<ConvertEvent>) {
 /// `ClipWriter`. A failure anywhere in here leaves `cache` untouched: the
 /// writer streams into a temp sibling and only moves it into place once
 /// `finish()` has written a complete file.
-fn convert(source: &Path, cache: &Path, cap: (u16, u16), tx: &Sender<ConvertEvent>) -> Result<()> {
+///
+/// The probe runs before the first cancellation check and cannot itself be
+/// interrupted. That is deliberate: it decodes nothing, exits in tens of
+/// milliseconds, and interrupting it would only bring the check that opens
+/// the frame loop a moment forward.
+fn convert(
+    source: &Path,
+    cache: &Path,
+    cap: (u16, u16),
+    tx: &Sender<ConvertEvent>,
+    cancel: &AtomicBool,
+) -> Result<()> {
     let banner = probe(source)?;
     let Probe {
         fps: capture_fps,
@@ -515,6 +617,10 @@ fn convert(source: &Path, cache: &Path, cap: (u16, u16), tx: &Sender<ConvertEven
     let dims = capture_dims(source_dims, cap);
 
     let args = ffmpeg_args(source, capture_fps, dims);
+    // stdout is a pipe whose read end this process owns, which is also what
+    // makes a TUI exit tidy without any cancellation: the worker is
+    // detached, so it dies with the process, the pipe closes with the last
+    // handle, and ffmpeg's next write into it fails and takes ffmpeg down.
     let mut child = ffmpeg_command()
         .args(&args)
         .stdin(Stdio::null())
@@ -528,28 +634,33 @@ fn convert(source: &Path, cache: &Path, cap: (u16, u16), tx: &Sender<ConvertEven
         .context("ffmpeg produced no stdout pipe")?;
 
     let mut writer = ClipWriter::create(cache, dims.0, dims.1, capture_fps)?;
-    let mut buffer = vec![0u8; frame_len(dims)];
-    let mut frames_read: u64 = 0;
     // Guards the progress denominator when the probe couldn't determine a
     // duration: every frame still reports forward progress, just capped
     // below 100% until the stream actually ends.
     let expected_frames = (f64::from(duration_secs) * f64::from(capture_fps)).max(1.0);
-    let mut last_percent: u8 = 0;
 
-    // A frame that ends short is the one way a size disagreement with ffmpeg
-    // can show itself, so the expected size travels with the error.
-    while read_frame(&mut stdout, &mut buffer)
-        .with_context(|| format!("reading {}x{} frames from ffmpeg", dims.0, dims.1))?
-    {
-        mute(&mut buffer);
-        writer.push_frame(&buffer)?;
-        frames_read += 1;
-        let percent = ((frames_read as f64 / expected_frames) * 100.0).clamp(0.0, 99.0) as u8;
-        if percent > last_percent {
-            last_percent = percent;
-            let _ = tx.send(ConvertEvent::Progress(percent));
-        }
-    }
+    let frames_read =
+        match stream_frames(&mut stdout, &mut writer, dims, expected_frames, cancel, tx) {
+            Ok(Stream::Ended(frames_read)) => frames_read,
+            // Superseded mid-stream. Kill ffmpeg rather than leave it decoding
+            // for a clip nobody will load, and let the writer go — dropping it
+            // unfinished takes the `.pulseclip.tmp` with it. There is no partial
+            // *final* file to delete: nothing is written to `cache` before
+            // `finish()`, which is past this point.
+            Ok(Stream::Cancelled) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                drop(writer);
+                // Silence is `report`'s doing: with the flag raised, no `Done`
+                // and no `Failed` can leave this worker whatever it returns.
+                return Ok(());
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error);
+            }
+        };
 
     let status = child.wait().context("waiting for ffmpeg to exit")?;
     if !status.success() {
@@ -559,8 +670,62 @@ fn convert(source: &Path, cache: &Path, cap: (u16, u16), tx: &Sender<ConvertEven
         bail!("ffmpeg produced no frames");
     }
     writer.finish()?;
-    let _ = tx.send(ConvertEvent::Done(cache.to_path_buf()));
+    report(tx, cancel, ConvertEvent::Done(cache.to_path_buf()));
     Ok(())
+}
+
+/// How the frame stream ended: cleanly at end of input, with the frame count,
+/// or because the conversion was cancelled.
+enum Stream {
+    Ended(u64),
+    Cancelled,
+}
+
+/// Pumps raw frames from `frames` into `writer`, reporting progress against
+/// `expected_frames` and stopping the moment `cancel` is raised.
+///
+/// Split out of [`convert`] so the cancellation path is testable without
+/// ffmpeg: a stub reader stands in for the stream, which is what an
+/// unbounded conversion looks like from in here.
+///
+/// The flag is read once per frame, so a cancellation waits at most one
+/// frame read — milliseconds, since a stalled ffmpeg is not the case being
+/// stopped. Checking mid-frame would mean interrupting a blocking read on a
+/// pipe, which needs the read to be abandonable; the frame boundary is the
+/// cheap, exact place where nothing is half-consumed.
+fn stream_frames<R: Read>(
+    frames: &mut R,
+    writer: &mut ClipWriter,
+    dims: (u16, u16),
+    expected_frames: f64,
+    cancel: &AtomicBool,
+    tx: &Sender<ConvertEvent>,
+) -> Result<Stream> {
+    let mut buffer = vec![0u8; frame_len(dims)];
+    let mut frames_read: u64 = 0;
+    let mut last_percent: u8 = 0;
+
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            return Ok(Stream::Cancelled);
+        }
+        // A frame that ends short is the one way a size disagreement with
+        // ffmpeg can show itself, so the expected size travels with the
+        // error.
+        if !read_frame(frames, &mut buffer)
+            .with_context(|| format!("reading {}x{} frames from ffmpeg", dims.0, dims.1))?
+        {
+            return Ok(Stream::Ended(frames_read));
+        }
+        mute(&mut buffer);
+        writer.push_frame(&buffer)?;
+        frames_read += 1;
+        let percent = ((frames_read as f64 / expected_frames) * 100.0).clamp(0.0, 99.0) as u8;
+        if percent > last_percent {
+            last_percent = percent;
+            let _ = tx.send(ConvertEvent::Progress(percent));
+        }
+    }
 }
 
 /// Runs `ffmpeg -i <source>` with no output file purely to capture the
@@ -710,6 +875,128 @@ mod tests {
         sweep_superseded(Path::new("x.pulseclip"));
     }
 
+    /// A stdout that never ends: every read hands back a slice of a frame
+    /// after a short pause, the way a real ffmpeg trickles one out. It is the
+    /// stand-in for a multi-minute source — a conversion that would run for
+    /// as long as the test cared to wait.
+    struct EndlessFrames;
+
+    impl Read for EndlessFrames {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            thread::sleep(std::time::Duration::from_millis(2));
+            let filled = buf.len().min(64);
+            buf[..filled].fill(0x40);
+            Ok(filled)
+        }
+    }
+
+    /// The `.tmp` sibling `ClipWriter` streams into, derived here the way
+    /// `pulseclip` derives it, so the test asserts against the real path.
+    fn temp_sibling(cache: &Path) -> PathBuf {
+        let mut name = cache.file_name().unwrap().to_os_string();
+        name.push(".tmp");
+        cache.with_file_name(name)
+    }
+
+    #[test]
+    fn a_cancelled_conversion_stops_promptly_and_leaves_no_temp_file() {
+        // Superseding a conversion used to just drop the receiver: the worker
+        // kept ffmpeg running to completion for a clip nobody would load.
+        let source = scratch_source("cancel-midstream");
+        let cache = cache_path(&source, HIGH).unwrap();
+        let temp = temp_sibling(&cache);
+        let dims = (4u16, 2u16);
+        let mut writer = ClipWriter::create(&cache, dims.0, dims.1, 30.0).unwrap();
+        assert!(temp.exists(), "the writer owns a temp file to clean up");
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let raiser = Arc::clone(&cancel);
+        thread::spawn(move || {
+            thread::sleep(std::time::Duration::from_millis(20));
+            raiser.store(true, Ordering::Relaxed);
+        });
+
+        let (tx, rx) = bounded(1_024);
+        let started = std::time::Instant::now();
+        let outcome = stream_frames(
+            &mut EndlessFrames,
+            &mut writer,
+            dims,
+            1_000_000.0,
+            &cancel,
+            &tx,
+        )
+        .unwrap();
+        let elapsed = started.elapsed();
+
+        assert!(matches!(outcome, Stream::Cancelled), "the worker ran on");
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "cancellation took {elapsed:?}"
+        );
+        // What the worker does on cancel: let the writer go, which takes the
+        // temp file with it. Nothing was ever written to the final path.
+        drop(writer);
+        assert!(
+            !temp.exists(),
+            "a cancelled conversion left its .tmp behind"
+        );
+        assert!(
+            !cache.exists(),
+            "a cancelled conversion left a partial clip"
+        );
+
+        // Nobody is listening to a cancelled conversion, so it never reports
+        // an outcome — no `Done` to load a half-clip, no `Failed` to shout
+        // about a stop the person asked for.
+        drop(tx);
+        assert!(
+            rx.iter()
+                .all(|event| matches!(event, ConvertEvent::Progress(_))),
+            "a cancelled conversion reported an outcome"
+        );
+        let _ = fs::remove_file(&source);
+    }
+
+    #[test]
+    fn a_worker_cancelled_before_it_starts_never_reaches_ffmpeg() {
+        // The window between `spawn_convert` and the worker's first frame is
+        // small but real: a preset cycled twice in a second lands in it.
+        let source = scratch_source("cancel-early");
+        let cancel = Arc::new(AtomicBool::new(true));
+        let (tx, rx) = bounded(16);
+
+        let started = std::time::Instant::now();
+        run_convert(&source, HIGH, &tx, &cancel);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "an already-cancelled worker still probed the source"
+        );
+
+        drop(tx);
+        assert_eq!(rx.iter().count(), 0, "a cancelled worker spoke");
+        let _ = fs::remove_file(&source);
+    }
+
+    #[test]
+    fn a_handle_shares_one_token_with_every_clone_of_itself() {
+        // `App` keeps a handle and hands clones to whoever asks; cancelling
+        // through any of them has to stop the one worker behind them all.
+        let (tx, rx) = bounded(1);
+        drop(tx);
+        let handle = ConvertHandle::stub(rx);
+        let clone = handle.clone();
+        assert!(!handle.is_cancelled() && !clone.is_cancelled());
+        assert!(handle.same_channel(&clone));
+
+        clone.cancel();
+
+        assert!(
+            handle.is_cancelled(),
+            "the clone cancelled a different flag"
+        );
+    }
+
     #[test]
     fn a_corrupt_cache_file_is_thrown_away_instead_of_reported_done() {
         let source = scratch_source("corrupt");
@@ -720,7 +1007,7 @@ mod tests {
         fs::write(&cache, b"").unwrap();
 
         let (tx, rx) = bounded(16);
-        run_convert(&source, HIGH, &tx);
+        run_convert(&source, HIGH, &tx, &AtomicBool::new(false));
         drop(tx);
         let events: Vec<ConvertEvent> = rx.iter().collect();
 
@@ -964,7 +1251,7 @@ mod tests {
         let dims = capture_dims(parsed.source_dims, cap);
         let started = std::time::Instant::now();
         let (tx, rx) = bounded(1024);
-        run_convert(&source, cap, &tx);
+        run_convert(&source, cap, &tx, &AtomicBool::new(false));
         drop(tx);
         let failure = rx.iter().find_map(|event| match event {
             ConvertEvent::Failed(message) => Some(message),
