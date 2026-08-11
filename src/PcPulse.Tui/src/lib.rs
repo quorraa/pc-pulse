@@ -2,6 +2,7 @@
 
 pub mod analyzer;
 pub mod app;
+pub mod background;
 pub mod bootstrap;
 pub mod chat_history;
 pub mod client;
