@@ -24,6 +24,13 @@
 //! header, seek table, and buffered frame data in a single sequential pass.
 //! This lets frames be pushed one at a time without knowing `frame_count` in
 //! advance, at the cost of buffering compressed output until `finish()`.
+//!
+//! Writing is atomic, the same way `PrefsStore::save` is: everything goes to
+//! a `.tmp` sibling and only `finish()` moves it onto the real path. A
+//! conversion that is interrupted — the TUI quits and takes its detached
+//! worker with it, the machine loses power — therefore leaves no file at the
+//! cache path at all, rather than a truncated one the player would refuse
+//! forever.
 
 use anyhow::{Context, Result, bail};
 use flate2::Compression;
@@ -31,7 +38,7 @@ use flate2::read::DeflateDecoder;
 use flate2::write::DeflateEncoder;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 const MAGIC: &[u8; 6] = b"PCLIP1";
 /// Byte length of the fixed-size header: magic + grid_w + grid_h + capture_fps + frame_count.
@@ -63,8 +70,18 @@ impl ClipHeader {
 /// one frame's raw pixels at a time) and appends the resulting bytes to an
 /// in-memory buffer; `finish()` then writes the real header, seek table,
 /// and buffered frame data in a single sequential pass.
+///
+/// Nothing is ever written to `path` itself until that final pass succeeds:
+/// the writer owns a `.tmp` sibling, and a writer dropped without `finish()`
+/// takes the temp file with it.
 pub struct ClipWriter {
-    file: File,
+    /// `None` once `finish()` has taken the handle — also the marker that
+    /// the temp file is no longer this writer's to delete.
+    file: Option<File>,
+    /// Where the finished clip is committed.
+    path: PathBuf,
+    /// Where bytes actually land until `finish()` renames it onto `path`.
+    temp: PathBuf,
     grid_w: u16,
     grid_h: u16,
     capture_fps: f32,
@@ -73,13 +90,17 @@ pub struct ClipWriter {
 }
 
 impl ClipWriter {
-    /// Creates `path` for writing. The header is written lazily by
-    /// `finish()`, once the real frame count is known.
+    /// Opens a `.tmp` sibling of `path` for writing; `path` itself is not
+    /// touched until `finish()`. The header is written lazily by `finish()`,
+    /// once the real frame count is known.
     pub fn create(path: &Path, grid_w: u16, grid_h: u16, capture_fps: f32) -> Result<Self> {
-        let file = File::create(path)
-            .with_context(|| format!("creating pulseclip file at {}", path.display()))?;
+        let temp = temp_sibling(path);
+        let file = File::create(&temp)
+            .with_context(|| format!("creating pulseclip file at {}", temp.display()))?;
         Ok(Self {
-            file,
+            file: Some(file),
+            path: path.to_path_buf(),
+            temp,
             grid_w,
             grid_h,
             capture_fps,
@@ -117,12 +138,17 @@ impl ClipWriter {
     }
 
     /// Writes the real header, seek table, and buffered frame data in one
-    /// sequential pass now that the frame count is known.
-    pub fn finish(self) -> Result<()> {
+    /// sequential pass now that the frame count is known, then commits the
+    /// temp file onto the final path.
+    pub fn finish(mut self) -> Result<()> {
+        let handle = self
+            .file
+            .take()
+            .context("pulseclip writer has already been finished")?;
         let frame_count = u32::try_from(self.offsets.len())
             .context("pulseclip has too many frames for u32 frame_count")?;
 
-        let mut file = BufWriter::new(self.file);
+        let mut file = BufWriter::new(handle);
         file.write_all(MAGIC)?;
         file.write_all(&self.grid_w.to_le_bytes())?;
         file.write_all(&self.grid_h.to_le_bytes())?;
@@ -137,8 +163,29 @@ impl ClipWriter {
         file.write_all(&self.frames)?;
 
         file.flush().context("flushing pulseclip file")?;
-        Ok(())
+        // The handle has to be closed before the file can be moved.
+        drop(file);
+        crate::prefs::atomic_replace(&self.temp, &self.path)
     }
+}
+
+impl Drop for ClipWriter {
+    /// A writer that never reached `finish()` — the conversion failed, or
+    /// the process died mid-stream — leaves nothing behind but certainly
+    /// nothing at the final path, which a later run would trust.
+    fn drop(&mut self) {
+        if self.file.take().is_some() {
+            let _ = std::fs::remove_file(&self.temp);
+        }
+    }
+}
+
+/// The scratch path a clip is streamed into: `clip.pulseclip.tmp` beside
+/// `clip.pulseclip`, mirroring the `.json.tmp` the prefs store uses.
+fn temp_sibling(path: &Path) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".tmp");
+    path.with_file_name(name)
 }
 
 /// Random-access reader for a `.pulseclip` file, backed by its seek table.
@@ -396,6 +443,41 @@ mod tests {
             dequantize(&quantize(f), &mut expected);
             assert_eq!(reader.frame(i as u32).unwrap(), &expected[..]);
         }
+    }
+
+    #[test]
+    fn a_writer_dropped_without_finish_leaves_no_file_at_the_final_path() {
+        let dir = std::env::temp_dir().join("pulseclip-interrupted");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("clip.pulseclip");
+        let _ = std::fs::remove_file(&path);
+
+        let mut writer = ClipWriter::create(&path, 4, 2, 24.0).unwrap();
+        writer.push_frame(&synthetic_frame(4, 2, 1)).unwrap();
+        assert!(
+            !path.exists(),
+            "the final path must stay empty until finish()"
+        );
+
+        // The TUI quitting mid-conversion, a crash, a failed ffmpeg run: the
+        // writer goes away without finishing. What it must not do is leave a
+        // truncated clip at the cache path for the next launch to trust.
+        drop(writer);
+        assert!(
+            !path.exists(),
+            "an interrupted conversion poisoned the cache"
+        );
+        assert!(
+            !temp_sibling(&path).exists(),
+            "the scratch file was left behind"
+        );
+
+        // The same path still converts cleanly afterwards.
+        let mut writer = ClipWriter::create(&path, 4, 2, 24.0).unwrap();
+        writer.push_frame(&synthetic_frame(4, 2, 1)).unwrap();
+        writer.finish().unwrap();
+        assert_eq!(ClipReader::open(&path).unwrap().header().frame_count, 1);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

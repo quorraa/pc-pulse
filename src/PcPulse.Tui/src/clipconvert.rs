@@ -9,9 +9,9 @@
 //! `crossbeam_channel::Receiver` and polls it from the UI loop instead of
 //! blocking on ffmpeg. Every ffmpeg invocation passes its arguments as a
 //! vector (never through a shell) and runs with `CREATE_NO_WINDOW` so no
-//! console flashes up behind the TUI, matching `update.rs`'s curl spawns.
+//! console flashes up behind the TUI.
 
-use crate::pulseclip::{ClipWriter, mute};
+use crate::pulseclip::{ClipReader, ClipWriter, mute};
 use anyhow::{Context, Result, anyhow, bail};
 use crossbeam_channel::{Receiver, Sender, bounded};
 use std::env;
@@ -41,12 +41,39 @@ pub enum ConvertEvent {
     Progress(u8),
     /// The `.pulseclip` cache file is ready to load.
     Done(PathBuf),
-    /// Conversion could not complete; the partial cache file has already
-    /// been removed.
+    /// Conversion could not complete; nothing was left at the cache path.
     Failed(String),
 }
 
-/// The deterministic cache path for `source`: `%LOCALAPPDATA%\PcPulse\backgrounds\{hash}.pulseclip`,
+/// Environment override for the cache root. Set it to redirect every
+/// `.pulseclip` this process writes somewhere other than the user profile;
+/// the test build redirects itself (see `backgrounds_dir`) so a test run
+/// can never deposit cache files in the real `%LOCALAPPDATA%`.
+pub const BACKGROUNDS_DIR_ENV: &str = "PCPULSE_BACKGROUNDS_DIR";
+
+/// The single choke point for where converted clips live:
+/// `$PCPULSE_BACKGROUNDS_DIR` when set, otherwise
+/// `%LOCALAPPDATA%\PcPulse\backgrounds` — and, under `cfg(test)`, a
+/// per-process scratch directory under `%TEMP%` instead of the profile.
+pub fn backgrounds_dir() -> Result<PathBuf> {
+    if let Some(dir) = env::var_os(BACKGROUNDS_DIR_ENV).filter(|dir| !dir.is_empty()) {
+        return Ok(PathBuf::from(dir));
+    }
+    #[cfg(test)]
+    {
+        Ok(tests::scratch_backgrounds_dir())
+    }
+    #[cfg(not(test))]
+    {
+        let local_app_data =
+            env::var_os("LOCALAPPDATA").ok_or_else(|| anyhow!("LOCALAPPDATA is not set"))?;
+        Ok(PathBuf::from(local_app_data)
+            .join("PcPulse")
+            .join("backgrounds"))
+    }
+}
+
+/// The deterministic cache path for `source`: `{backgrounds_dir}\{hash}.pulseclip`,
 /// keyed on the source path, its mtime, and the capture grid so a changed
 /// file (or a grid-size change in a future release) reconverts instead of
 /// serving a stale cache.
@@ -68,11 +95,7 @@ pub fn cache_path(source: &Path) -> Result<PathBuf> {
     key.extend_from_slice(&GRID_H.to_le_bytes());
     let hash = fnv1a64(&key);
 
-    let local_app_data =
-        env::var_os("LOCALAPPDATA").ok_or_else(|| anyhow!("LOCALAPPDATA is not set"))?;
-    let dir = PathBuf::from(local_app_data)
-        .join("PcPulse")
-        .join("backgrounds");
+    let dir = backgrounds_dir()?;
     fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     Ok(dir.join(format!("{hash:016x}.pulseclip")))
 }
@@ -185,19 +208,27 @@ fn run_convert(source: &Path, tx: &Sender<ConvertEvent>) {
             return;
         }
     };
+    // An existing cache is only trusted if it still opens. A file left by
+    // an interrupted conversion (an older build wrote straight to the final
+    // path) or by disk corruption would otherwise short-circuit to `Done`
+    // forever, and the player would fail to load it every single time with
+    // no way out from the UI. Delete it and convert again instead.
     if cache.exists() {
-        let _ = tx.send(ConvertEvent::Done(cache));
-        return;
+        if ClipReader::open(&cache).is_ok() {
+            let _ = tx.send(ConvertEvent::Done(cache));
+            return;
+        }
+        let _ = fs::remove_file(&cache);
     }
     if let Err(error) = convert(source, &cache, tx) {
-        let _ = fs::remove_file(&cache);
         let _ = tx.send(ConvertEvent::Failed(format!("{error:#}")));
     }
 }
 
 /// Runs the two ffmpeg invocations (probe, then frame stream) and drives
-/// `ClipWriter`. Any failure here leaves cleanup of the partial cache file
-/// to the caller.
+/// `ClipWriter`. A failure anywhere in here leaves `cache` untouched: the
+/// writer streams into a temp sibling and only moves it into place once
+/// `finish()` has written a complete file.
 fn convert(source: &Path, cache: &Path, tx: &Sender<ConvertEvent>) -> Result<()> {
     let banner = probe(source)?;
     let (capture_fps, duration_secs) = parse_probe(&banner);
@@ -309,6 +340,69 @@ fn classify_spawn_error(error: std::io::Error) -> anyhow::Error {
 mod tests {
     use super::*;
 
+    /// The cache root for the whole test binary: a per-process directory
+    /// under `%TEMP%`, never `%LOCALAPPDATA%\PcPulse\backgrounds`.
+    /// `backgrounds_dir` routes here for every test, so no test can forget
+    /// to opt in and quietly litter the real user profile.
+    pub(super) fn scratch_backgrounds_dir() -> PathBuf {
+        std::env::temp_dir().join(format!("pcpulse-test-backgrounds-{}", std::process::id()))
+    }
+
+    /// A scratch file standing in for a source video.
+    fn scratch_source(tag: &str) -> PathBuf {
+        let source = std::env::temp_dir().join(format!(
+            "pcpulse-clipconvert-{tag}-{}.mp4",
+            std::process::id()
+        ));
+        fs::write(&source, b"stands in for a video file").unwrap();
+        source
+    }
+
+    #[test]
+    fn the_cache_root_is_redirectable_and_never_the_real_profile_in_tests() {
+        let source = scratch_source("root");
+        let cache = cache_path(&source).unwrap();
+        assert_eq!(cache.parent().unwrap(), scratch_backgrounds_dir());
+        if let Some(local_app_data) = env::var_os("LOCALAPPDATA") {
+            assert!(
+                !cache.starts_with(PathBuf::from(local_app_data).join("PcPulse")),
+                "a test run must never write into the real profile: {}",
+                cache.display()
+            );
+        }
+        let _ = fs::remove_file(&source);
+    }
+
+    #[test]
+    fn a_corrupt_cache_file_is_thrown_away_instead_of_reported_done() {
+        let source = scratch_source("corrupt");
+        let cache = cache_path(&source).unwrap();
+        // The 0-byte file an interrupted conversion used to leave at the
+        // final path. Trusting `cache.exists()` here reported `Done`
+        // instantly and the player failed on it forever.
+        fs::write(&cache, b"").unwrap();
+
+        let (tx, rx) = bounded(16);
+        run_convert(&source, &tx);
+        drop(tx);
+        let events: Vec<ConvertEvent> = rx.iter().collect();
+
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, ConvertEvent::Done(_))),
+            "an unreadable cache file was reported as ready"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, ConvertEvent::Failed(_))),
+            "the reconversion attempt reported nothing"
+        );
+        assert!(!cache.exists(), "the unreadable cache file survived");
+        let _ = fs::remove_file(&source);
+    }
+
     #[test]
     fn ffmpeg_args_pass_the_path_as_a_single_vector_item() {
         let args = ffmpeg_args(Path::new(r"C:\videos\my clip (1).mp4"), 48.0);
@@ -356,5 +450,7 @@ mod tests {
         let second = cache_path(&src).unwrap();
         assert_ne!(first, second);
         assert!(first.extension().unwrap() == "pulseclip");
+        let _ = std::fs::remove_file(&src);
+        let _ = std::fs::remove_dir(&dir);
     }
 }

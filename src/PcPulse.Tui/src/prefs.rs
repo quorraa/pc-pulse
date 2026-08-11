@@ -184,7 +184,11 @@ impl PrefsStore {
     }
 }
 
-fn atomic_replace(source: &Path, destination: &Path) -> Result<()> {
+/// Commit `source` onto `destination` in one step, replacing whatever was
+/// there. This is the crate's write-then-replace primitive: `ClipWriter`
+/// commits a converted background the same way this store commits prefs, so
+/// an interrupted write can never be observed as a half-written file.
+pub(crate) fn atomic_replace(source: &Path, destination: &Path) -> Result<()> {
     let source_wide: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
     let destination_wide: Vec<u16> = destination
         .as_os_str()

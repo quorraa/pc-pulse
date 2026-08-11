@@ -1519,13 +1519,21 @@ impl App {
         if self.converting.as_deref() == Some(source.as_str()) {
             return;
         }
-        match clipconvert::cache_path(&PathBuf::from(source)) {
-            Ok(cache) if cache.exists() => {
-                self.load_background(&cache);
+        let cache = match clipconvert::cache_path(&PathBuf::from(source)) {
+            Ok(cache) => cache,
+            Err(error) => {
+                self.set_error(format!("Background video unavailable: {error:#}"));
+                return;
             }
-            Ok(_) => self.start_background_conversion(),
-            Err(error) => self.set_error(format!("Background video unavailable: {error:#}")),
+        };
+        // A cache that exists but no longer opens is not a dead end: the
+        // converter checks it too, throws it away, and reconverts. Reporting
+        // the load failure and stopping here would strand the user with a
+        // background that can never come back.
+        if cache.exists() && self.load_background(&cache) {
+            return;
         }
+        self.start_background_conversion();
     }
 
     /// A completed launch-time release check. The completion time is
@@ -4780,31 +4788,68 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    /// A scratch source video, plus any `.pulseclip` planted for it, that
+    /// deletes itself when the test ends. Under `cfg(test)` the cache root
+    /// is a `%TEMP%` directory rather than `%LOCALAPPDATA%\PcPulse\
+    /// backgrounds` (see `clipconvert::backgrounds_dir`), so a test run
+    /// never touches the real profile — and with this guard it leaves
+    /// nothing behind in `%TEMP%` either.
+    struct Scratch {
+        source: std::path::PathBuf,
+        cache: Option<std::path::PathBuf>,
+    }
+
+    impl std::ops::Deref for Scratch {
+        type Target = std::path::Path;
+
+        fn deref(&self) -> &std::path::Path {
+            &self.source
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.source);
+            if let Some(cache) = &self.cache {
+                let _ = std::fs::remove_file(cache);
+                // Best effort, and only ever succeeds for the last test out:
+                // an empty scratch cache root is worth removing too.
+                if let Some(parent) = cache.parent() {
+                    let _ = std::fs::remove_dir(parent);
+                }
+            }
+        }
+    }
+
     /// A scratch file standing in for a source video. Nothing is cached for
     /// it, so a conversion started against it stays in flight.
-    fn scratch_source(tag: &str) -> std::path::PathBuf {
+    fn scratch_source(tag: &str) -> Scratch {
         let source = std::env::temp_dir().join(format!(
             "pcpulse-app-bg-{tag}-{}-{}.mp4",
             std::process::id(),
             Utc::now().timestamp_millis()
         ));
         std::fs::write(&source, b"stands in for a video file").unwrap();
-        source
+        Scratch {
+            source,
+            cache: None,
+        }
     }
 
     /// A real `.pulseclip` planted at the cache path of a scratch source
     /// file. This is what lets the background rows be tested end to end
     /// without ffmpeg: `spawn_convert` short-circuits straight to `Done`
-    /// when the cache for a source already exists.
-    fn scratch_background(tag: &str, capture_fps: f32) -> std::path::PathBuf {
-        let source = scratch_source(tag);
-        let cache = crate::clipconvert::cache_path(&source).unwrap();
+    /// when the cache for a source already exists and opens.
+    fn scratch_background(tag: &str, capture_fps: f32) -> Scratch {
+        let mut scratch = scratch_source(tag);
+        let cache = crate::clipconvert::cache_path(&scratch).unwrap();
         let mut writer = crate::pulseclip::ClipWriter::create(&cache, 4, 2, capture_fps).unwrap();
         for frame in 0..4u32 {
             writer.push_frame(&[(frame * 50) as u8; 4 * 2 * 3]).unwrap();
         }
         writer.finish().unwrap();
-        source
+        scratch.cache = Some(cache);
+        scratch
     }
 
     /// Pump `drain_events` until the conversion worker's message lands.
@@ -4918,7 +4963,6 @@ mod tests {
             "a cached clip converts nothing: {}",
             app.status
         );
-        let _ = std::fs::remove_file(source);
     }
 
     #[test]
@@ -4985,7 +5029,6 @@ mod tests {
         };
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(app.client_prefs.background_fps, 0);
-        let _ = std::fs::remove_file(source);
     }
 
     #[test]
@@ -5048,7 +5091,6 @@ mod tests {
             app.setting_value(SettingField::ClientBackgroundVideo),
             "off"
         );
-        let _ = std::fs::remove_file(source);
         let _ = std::fs::remove_file(prefs_path);
     }
 
@@ -5086,8 +5128,6 @@ mod tests {
         };
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(!app.convert_rx.as_ref().unwrap().same_channel(&first));
-        let _ = std::fs::remove_file(source);
-        let _ = std::fs::remove_file(other);
     }
 
     #[test]
@@ -5117,7 +5157,35 @@ mod tests {
             "the conversion still owns the file"
         );
         let _ = std::fs::remove_file(cache);
-        let _ = std::fs::remove_file(source);
+    }
+
+    #[test]
+    fn a_corrupt_cache_file_reconverts_instead_of_stranding_the_background() {
+        let source = scratch_source("corrupt-cache");
+        let cache = crate::clipconvert::cache_path(&source).unwrap();
+        // What an interrupted conversion used to leave behind: a file at the
+        // final cache path that no reader can open. Restoring used to report
+        // a load error and stop, and every later commit of the same path
+        // short-circuited to the same broken file — unrecoverable from the
+        // UI. It has to fall through to a fresh conversion instead.
+        std::fs::write(&cache, b"not a clip").unwrap();
+        let mut app = App::new_inert();
+        app.client_prefs.background_video = source.to_string_lossy().into_owned();
+
+        app.restore_background();
+
+        assert!(app.background.is_none());
+        assert!(
+            app.convert_rx.is_some(),
+            "no reconversion started: {}",
+            app.status
+        );
+        assert!(!app.status_is_error, "status was {}", app.status);
+
+        // Let the worker run out (there is no real video behind the path, so
+        // it fails) and confirm it threw the unreadable file away.
+        wait_for_background(&mut app);
+        assert!(!cache.exists(), "the corrupt cache file survived");
     }
 
     #[test]
@@ -5133,7 +5201,7 @@ mod tests {
 
     /// An app whose cached clip is loaded and whose refresh preference is
     /// the top tier, so the frame governor has somewhere to fall.
-    fn app_with_background_and_smooth(tag: &str) -> (App, std::path::PathBuf) {
+    fn app_with_background_and_smooth(tag: &str) -> (App, Scratch) {
         let source = scratch_background(tag, 60.0);
         let mut app = App::new_inert();
         app.adopt_client_prefs(
@@ -5150,7 +5218,7 @@ mod tests {
 
     #[test]
     fn budget_overruns_downshift_the_background_before_the_ui_tier() {
-        let (mut app, source) = app_with_background_and_smooth("guardrail");
+        let (mut app, _source) = app_with_background_and_smooth("guardrail");
         assert_eq!(app.effective_refresh_fps(), 60);
         assert_eq!(app.background.as_ref().unwrap().effective_fps(), 60);
 
@@ -5193,12 +5261,11 @@ mod tests {
             app.status,
             "Refresh reduced to 30 fps — frame budget exceeded"
         );
-        let _ = std::fs::remove_file(source);
     }
 
     #[test]
     fn a_hidden_background_does_not_absorb_the_budget_trip() {
-        let (mut app, source) = app_with_background_and_smooth("guardrail-hidden");
+        let (mut app, _source) = app_with_background_and_smooth("guardrail-hidden");
         app.client_prefs.background_enabled = false;
         let over = Duration::from_millis(50);
         let budget = Duration::from_millis(16);
@@ -5209,7 +5276,6 @@ mod tests {
         // the trip has to reach the UI tier.
         assert_eq!(app.background.as_ref().unwrap().effective_fps(), 60);
         assert_eq!(app.effective_refresh_fps(), 30);
-        let _ = std::fs::remove_file(source);
     }
 
     #[test]
