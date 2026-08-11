@@ -32,6 +32,7 @@ Release binaries are currently unsigned; Windows may show an unknown-publisher w
 - Redacted warning/error/critical Application and System events, classified and fingerprinted (hardware, storage, graphics, crashes, hangs, resource exhaustion, power, services, networking, agent runtimes).
 - Discovers kernel and application crash dumps, triages the bugcheck natively, and — with the Debugging Tools installed — runs WinDbg's full analysis on demand.
 - Active and resolved finding history with responsible process where attribution is defensible, supporting evidence, explanation, and safe next actions.
+- An optional ambient video background behind every page — any video file, muted, dimmed, and desaturated toward the active theme so severity colors and text stay readable; converted once locally with ffmpeg, and the collector and network are never involved.
 
 If policy denies ETW session creation, the collector continues with PDH and Win32, marks ETW degraded, and retries every minute. See [detector details](docs/detectors.md) for every finding's ownership, evidence, and thresholds, and the [named-pipe protocol](docs/protocol.md) for the IPC contract.
 
@@ -116,6 +117,12 @@ For automation, `PcPulse.exe analyze 1` produces a one-shot plan, and `agent-con
 ## Updates
 
 The TUI checks this repository's GitHub releases for a newer version once per launch, at most every 20 hours, using Windows' bundled `curl.exe` — a client-side courtesy; the collector service never touches the network. When a newer release exists, the chrome shows a quiet `⇡ v1.16.3 available · u` badge: the first `u` downloads the MSI and `SHA256SUMS.txt` to your Downloads folder and verifies the SHA-256 (a file that fails verification is deleted), and the second `u` launches the installer — never silently, never automatically. The "Update checks" row in Settings' CLIENT section switches the check off entirely; when off, no update-related network request is ever made.
+
+## Video background
+
+Any video file — mp4, mkv, webm, gif, whatever — can play as a muted, ambient background behind every page. Frames are rendered as half-block cell pixels, desaturated and dimmed toward the active theme so severity chips, selection bars, and text stay readable. The first time a clip is set, PC Pulse converts it once with `ffmpeg.exe` on PATH (`winget install ffmpeg`, or Chocolatey) into a compact cache at `%LOCALAPPDATA%\PcPulse\backgrounds\*.pulseclip` — roughly 1 MB per 4 seconds of 60 fps video, so a 3-minute clip lands around 40-60 MB. After that one-time conversion, playback costs almost nothing: no decode process at runtime, just two frames held in memory. The collector service is never involved and nothing touches the network.
+
+Four CLIENT rows on the Settings page control it: "Background video" (the path; Enter edits, an empty value turns it off), "Background" (on/off), "Background dim" (10-60%, how far the clip is darkened toward the theme), and "Background fps" (auto follows the clip's own rate, or 1-60 — the frame-budget guardrail lowers the background's rate before it ever touches UI refresh, shown as e.g. `60 → 30 (auto)`). The background needs at least a 72x20 terminal; below that it stays hidden.
 
 ## Build and test
 
