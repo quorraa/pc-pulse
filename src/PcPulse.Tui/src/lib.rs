@@ -10,6 +10,7 @@ pub mod effects;
 pub mod format;
 pub mod notifier;
 pub mod prefs;
+pub mod pulseclip;
 pub mod theme;
 pub mod treemap;
 pub mod tween;
