@@ -579,10 +579,12 @@ fn run_convert(source: &Path, cap: (u16, u16), tx: &Sender<ConvertEvent>, cancel
 /// Sends `event` unless the conversion has been cancelled.
 ///
 /// A cancelled worker is silent by contract: whoever cancelled it has
-/// already let go of the receiver, so a `Done` would name a cache file that
-/// is being deleted and a `Failed` would report the stop the person asked
-/// for as an error. The check also covers the errors cancelling *causes* —
-/// killing ffmpeg mid-stream fails the read that was in flight.
+/// already let go of the receiver, so a `Done` would name a clip that was
+/// thrown away and a `Failed` would report the stop the person asked for as
+/// an error. The check also catches a cancellation that lands *after* a
+/// genuine failure — the flag is raised while the error is on its way up
+/// through `run_convert` — which would otherwise put an error on screen for
+/// a conversion nobody is waiting for any more.
 fn report(tx: &Sender<ConvertEvent>, cancel: &AtomicBool, event: ConvertEvent) {
     if !cancel.load(Ordering::Relaxed) {
         let _ = tx.send(event);
@@ -642,11 +644,15 @@ fn convert(
     let frames_read =
         match stream_frames(&mut stdout, &mut writer, dims, expected_frames, cancel, tx) {
             Ok(Stream::Ended(frames_read)) => frames_read,
-            // Superseded mid-stream. Kill ffmpeg rather than leave it decoding
-            // for a clip nobody will load, and let the writer go — dropping it
-            // unfinished takes the `.pulseclip.tmp` with it. There is no partial
-            // *final* file to delete: nothing is written to `cache` before
-            // `finish()`, which is past this point.
+            // Superseded mid-stream. Kill ffmpeg rather than leave it
+            // decoding for a clip nobody will load, and let the writer go —
+            // dropping it unfinished takes its own scratch file with it, and
+            // only its own: the successor converting the same source at the
+            // same ceiling shares this final path and must not have its file
+            // deleted out from under it (see `pulseclip::temp_sibling`).
+            // There is no partial *final* file to delete either, because
+            // nothing is written to `cache` before `finish()`, which is past
+            // this point.
             Ok(Stream::Cancelled) => {
                 let _ = child.kill();
                 let _ = child.wait();
@@ -864,6 +870,34 @@ mod tests {
     }
 
     #[test]
+    fn the_sweep_collects_the_scratch_file_of_a_worker_that_never_came_back() {
+        // Scratch files carry a per-worker tag so two conversions aimed at
+        // one cache file cannot delete each other's, and the sweep is the
+        // only thing that ever collects one whose worker died with the
+        // process. It recognizes them by their ending, so the tag must not
+        // put them out of its reach.
+        let dir = std::env::temp_dir().join(format!("pcpulse-sweep-tag-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let live = dir.join("aaaa000000000001.pulseclip");
+        fs::write(&live, b"x").unwrap();
+        let orphan = {
+            let writer =
+                ClipWriter::create(&dir.join("bbbb000000000002.pulseclip"), 4, 2, 30.0).unwrap();
+            let scratch = writer.temp_path().to_path_buf();
+            // The TUI quitting mid-conversion: no `Drop` ever runs.
+            std::mem::forget(writer);
+            scratch
+        };
+        assert!(orphan.exists(), "no scratch file to collect");
+
+        sweep_superseded(&live);
+
+        assert!(!orphan.exists(), "a tagged scratch file escaped the sweep");
+        assert!(live.exists(), "the clip now playing was deleted");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_sweep_of_a_directory_that_is_not_there_is_silent() {
         // Nothing to collect is not a failure, and neither is a cache root
         // that has not been created yet.
@@ -890,23 +924,15 @@ mod tests {
         }
     }
 
-    /// The `.tmp` sibling `ClipWriter` streams into, derived here the way
-    /// `pulseclip` derives it, so the test asserts against the real path.
-    fn temp_sibling(cache: &Path) -> PathBuf {
-        let mut name = cache.file_name().unwrap().to_os_string();
-        name.push(".tmp");
-        cache.with_file_name(name)
-    }
-
     #[test]
     fn a_cancelled_conversion_stops_promptly_and_leaves_no_temp_file() {
         // Superseding a conversion used to just drop the receiver: the worker
         // kept ffmpeg running to completion for a clip nobody would load.
         let source = scratch_source("cancel-midstream");
         let cache = cache_path(&source, HIGH).unwrap();
-        let temp = temp_sibling(&cache);
         let dims = (4u16, 2u16);
         let mut writer = ClipWriter::create(&cache, dims.0, dims.1, 30.0).unwrap();
+        let temp = writer.temp_path().to_path_buf();
         assert!(temp.exists(), "the writer owns a temp file to clean up");
 
         let cancel = Arc::new(AtomicBool::new(false));

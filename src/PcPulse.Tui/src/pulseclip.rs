@@ -39,6 +39,7 @@ use flate2::write::DeflateEncoder;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 const MAGIC: &[u8; 6] = b"PCLIP1";
 /// Byte length of the fixed-size header: magic + grid_w + grid_h + capture_fps + frame_count.
@@ -72,8 +73,9 @@ impl ClipHeader {
 /// and buffered frame data in a single sequential pass.
 ///
 /// Nothing is ever written to `path` itself until that final pass succeeds:
-/// the writer owns a `.tmp` sibling, and a writer dropped without `finish()`
-/// takes the temp file with it.
+/// the writer owns a `.tmp` sibling of its own — one no other writer aimed
+/// at the same clip can be handed, see [`temp_sibling`] — and a writer
+/// dropped without `finish()` takes that file, and only that file, with it.
 pub struct ClipWriter {
     /// `None` once `finish()` has taken the handle — also the marker that
     /// the temp file is no longer this writer's to delete.
@@ -90,7 +92,8 @@ pub struct ClipWriter {
 }
 
 impl ClipWriter {
-    /// Opens a `.tmp` sibling of `path` for writing; `path` itself is not
+    /// Opens a scratch `.tmp` sibling of `path` for writing, one belonging
+    /// to this writer alone ([`temp_sibling`]); `path` itself is not
     /// touched until `finish()`. The header is written lazily by `finish()`,
     /// once the real frame count is known.
     pub fn create(path: &Path, grid_w: u16, grid_h: u16, capture_fps: f32) -> Result<Self> {
@@ -107,6 +110,15 @@ impl ClipWriter {
             offsets: Vec::new(),
             frames: Vec::new(),
         })
+    }
+
+    /// The scratch file this writer owns until `finish()` commits it — its
+    /// own, never one it shares with another writer aimed at the same clip
+    /// (see [`temp_sibling`]). Exposed so a caller cleaning up after an
+    /// interrupted conversion, and the tests that pin that behaviour, name
+    /// the file this writer is actually holding rather than guessing at it.
+    pub fn temp_path(&self) -> &Path {
+        &self.temp
     }
 
     /// Quantizes, compresses, and appends one frame. `rgb.len()` must equal
@@ -180,10 +192,41 @@ impl Drop for ClipWriter {
     }
 }
 
-/// The scratch path a clip is streamed into: `clip.pulseclip.tmp` beside
-/// `clip.pulseclip`, mirroring the `.json.tmp` the prefs store uses.
+/// The scratch path a clip is streamed into: `clip.<worker>.pulseclip.tmp`
+/// beside `clip.pulseclip`, mirroring the `.json.tmp` the prefs store uses —
+/// with one addition the prefs store does not need.
+///
+/// `<worker>` is unique to this writer, because two writers really can be
+/// aimed at one final path: a conversion that was superseded and the one
+/// that replaced it derive the same cache filename from the same source and
+/// ceiling. A shared scratch file there is a live hazard rather than a
+/// theoretical one — Rust opens files with `FILE_SHARE_DELETE`, so the
+/// abandoned writer's cleanup *succeeds* in unlinking the file the successor
+/// still has open, the successor writes on into a handle with no directory
+/// entry none the wiser, and the damage only surfaces at its `finish()`,
+/// whose rename cannot find the path it is renaming. The conversion that
+/// fails is the one somebody is waiting for.
+///
+/// The tag goes *inside* the name so it still ends `.pulseclip.tmp`: that
+/// ending is how `clipconvert`'s cache sweep recognizes a scratch file left
+/// by a worker that died with its process, and a leftover the sweep could
+/// not see would sit in the cache directory forever.
 fn temp_sibling(path: &Path) -> PathBuf {
-    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    /// Distinguishes writers within one process; the process id
+    /// distinguishes them across two PC Pulse windows converting at once.
+    static NEXT_WRITER: AtomicU64 = AtomicU64::new(0);
+    let tag = format!(
+        "{:x}-{:x}",
+        std::process::id(),
+        NEXT_WRITER.fetch_add(1, Ordering::Relaxed)
+    );
+    let mut name = path.file_stem().unwrap_or_default().to_os_string();
+    name.push(".");
+    name.push(tag);
+    if let Some(extension) = path.extension() {
+        name.push(".");
+        name.push(extension);
+    }
     name.push(".tmp");
     path.with_file_name(name)
 }
@@ -462,21 +505,61 @@ mod tests {
         // The TUI quitting mid-conversion, a crash, a failed ffmpeg run: the
         // writer goes away without finishing. What it must not do is leave a
         // truncated clip at the cache path for the next launch to trust.
+        let scratch = writer.temp_path().to_path_buf();
         drop(writer);
         assert!(
             !path.exists(),
             "an interrupted conversion poisoned the cache"
         );
-        assert!(
-            !temp_sibling(&path).exists(),
-            "the scratch file was left behind"
-        );
+        assert!(!scratch.exists(), "the scratch file was left behind");
 
         // The same path still converts cleanly afterwards.
         let mut writer = ClipWriter::create(&path, 4, 2, 24.0).unwrap();
         writer.push_frame(&synthetic_frame(4, 2, 1)).unwrap();
         writer.finish().unwrap();
         assert_eq!(ClipReader::open(&path).unwrap().header().frame_count, 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn two_writers_aimed_at_one_clip_never_share_a_scratch_file() {
+        // Two conversions can be aimed at one cache path: a superseded
+        // worker and the one that replaced it produce the same filename from
+        // the same source and ceiling. If they shared a scratch file, the
+        // loser's cleanup would unlink the winner's file out from under its
+        // open handle — Windows opens with FILE_SHARE_DELETE, so the delete
+        // succeeds, the successor writes on into an unlinked handle none the
+        // wiser, and the failure only surfaces at `finish()`, whose rename
+        // cannot find the path it is renaming. The conversion the person is
+        // actually waiting for is the one that fails.
+        let dir = std::env::temp_dir().join("pulseclip-two-writers");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("clip.pulseclip");
+        let _ = std::fs::remove_file(&path);
+
+        let abandoned = ClipWriter::create(&path, 4, 2, 24.0).unwrap();
+        let mut successor = ClipWriter::create(&path, 4, 2, 24.0).unwrap();
+        assert_ne!(
+            abandoned.temp_path(),
+            successor.temp_path(),
+            "two writers were handed the same scratch file"
+        );
+        let kept = successor.temp_path().to_path_buf();
+
+        // The cancelled worker cleaning up after itself.
+        drop(abandoned);
+
+        assert!(kept.exists(), "the survivor's scratch file was unlinked");
+        successor.push_frame(&synthetic_frame(4, 2, 1)).unwrap();
+        successor.finish().unwrap();
+        assert_eq!(ClipReader::open(&path).unwrap().header().frame_count, 1);
+        // Whatever the tag, the name still ends the way the cache sweep
+        // recognizes its own leftovers by.
+        assert!(
+            kept.to_string_lossy().ends_with(".pulseclip.tmp"),
+            "{}",
+            kept.display()
+        );
         let _ = std::fs::remove_file(&path);
     }
 
