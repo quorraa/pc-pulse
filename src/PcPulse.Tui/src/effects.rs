@@ -18,10 +18,19 @@
 //!   profile's `ok` color; the hot-swapped palette washes over every populated cell.
 //!
 //! Contracts preserved: all effects are finite (no `repeating`/`never_complete`),
-//! color/shift transforms use `CellFilter::NonEmpty` so no cue erases content, the
-//! idle clock resets on `queue()`, delayed frames clamp to 50 ms, one cleanup frame
-//! restores exact styles after the last effect, each channel replaces via
-//! `add_unique_effect`, and every randomized effect carries a seeded `SimpleRng`.
+//! color/shift transforms use `CellFilter::NonEmpty` so a cue transforms cells that
+//! hold something rather than blank space, the idle clock resets on `queue()`,
+//! delayed frames clamp to 50 ms, one cleanup frame restores exact styles after the
+//! last effect, each channel replaces via `add_unique_effect`, and every randomized
+//! effect carries a seeded `SimpleRng`.
+//!
+//! With a video background on, that `NonEmpty` filter selects almost the whole
+//! buffer: `ui::restore_background_bg` fills every otherwise-blank cell with a
+//! half-block glyph, so there is no blank space left to skip and these cues sweep the
+//! video layer along with the text. That is an accepted consequence, argued under
+//! "Effects interaction" on `ui::restore_background_bg` and pinned by
+//! `ui::tests::motion_cues_leave_the_video_layer_exactly_as_drawn`; the cues stay
+//! finite and the cleanup frame still restores the exact drawn styles.
 
 use crate::{
     app::{App, InputMode, Page},

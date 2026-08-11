@@ -347,7 +347,9 @@ fn normalized_clamps_background_dim_and_fps() {
 - [ ] **Step 4: Run, verify pass.**
 - [ ] **Step 5: Gate + commit** — `git commit -m "Add background video preferences"`
 
----### Task 5: Renderer passes in `ui.rs`
+---
+
+### Task 5: Renderer passes in `ui.rs`
 
 **Files:**
 - Modify: `src/PcPulse.Tui/src/ui.rs` (`pub fn draw` at `ui.rs:856`; new private helpers + tests at the end of the file)

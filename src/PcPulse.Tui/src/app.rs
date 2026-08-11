@@ -1,7 +1,10 @@
 use crate::{
     analyzer::{ChatMessage, ChatResponse, ChatRole},
+    background::Background,
     chat_history::{ChatHistoryStore, ChatSession},
     client::PipeClient,
+    clipconvert::{self, ConvertEvent},
+    filepicker::{self, PickEvent},
     prefs::{self, PrefsStore, UiPrefs},
     theme,
     update::{self, UpdateInfo},
@@ -53,6 +56,15 @@ const LIVE_MAX_HZ: u32 = 8;
 /// Two left clicks on the same finding row within this window count as a
 /// double-click and open an investigation.
 const DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(400);
+/// The status line a running background conversion owns, and the prefix the
+/// worker's per-percent updates extend. Shared so that "is a conversion
+/// already speaking?" is a check against the real string rather than a
+/// second copy of it that could drift.
+const CONVERTING_STATUS: &str = "Converting background…";
+/// The status line the Explorer file dialog owns while it is on screen.
+/// Shared for the same reason, and because it is the *only* line a
+/// redundant conversion request is allowed to replace.
+const CHOOSING_STATUS: &str = "Choosing a video…";
 static CHAT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 fn new_conversation_id() -> String {
@@ -292,6 +304,11 @@ pub enum SettingField {
     ClientRefresh,
     ClientTimeout,
     ClientUpdates,
+    ClientBackgroundVideo,
+    ClientBackgroundQuality,
+    ClientBackgroundEnabled,
+    ClientBackgroundDim,
+    ClientBackgroundFps,
     SampleInterval,
     Retention,
     Sustained,
@@ -316,12 +333,17 @@ pub enum SettingField {
 impl SettingField {
     /// Local terminal preferences: stored per user in `ui-prefs.json` and
     /// never sent to (or validated by) the collector service.
-    pub const CLIENT: [Self; 5] = [
+    pub const CLIENT: [Self; 10] = [
         Self::ClientTheme,
         Self::ClientEffects,
         Self::ClientRefresh,
         Self::ClientTimeout,
         Self::ClientUpdates,
+        Self::ClientBackgroundVideo,
+        Self::ClientBackgroundQuality,
+        Self::ClientBackgroundEnabled,
+        Self::ClientBackgroundDim,
+        Self::ClientBackgroundFps,
     ];
 
     /// Service-validated detector settings, saved through the pipe with `s`.
@@ -347,12 +369,17 @@ impl SettingField {
         Self::AgentPatterns,
     ];
 
-    pub const ALL: [Self; 24] = [
+    pub const ALL: [Self; 29] = [
         Self::ClientTheme,
         Self::ClientEffects,
         Self::ClientRefresh,
         Self::ClientTimeout,
         Self::ClientUpdates,
+        Self::ClientBackgroundVideo,
+        Self::ClientBackgroundQuality,
+        Self::ClientBackgroundEnabled,
+        Self::ClientBackgroundDim,
+        Self::ClientBackgroundFps,
         Self::SampleInterval,
         Self::Retention,
         Self::Sustained,
@@ -382,6 +409,11 @@ impl SettingField {
                 | Self::ClientRefresh
                 | Self::ClientTimeout
                 | Self::ClientUpdates
+                | Self::ClientBackgroundVideo
+                | Self::ClientBackgroundQuality
+                | Self::ClientBackgroundEnabled
+                | Self::ClientBackgroundDim
+                | Self::ClientBackgroundFps
         )
     }
 
@@ -392,6 +424,11 @@ impl SettingField {
             Self::ClientRefresh => "Refresh rate",
             Self::ClientTimeout => "Oracle time budget",
             Self::ClientUpdates => "Update checks",
+            Self::ClientBackgroundVideo => "Background video",
+            Self::ClientBackgroundQuality => "Background quality",
+            Self::ClientBackgroundEnabled => "Background",
+            Self::ClientBackgroundDim => "Background dim",
+            Self::ClientBackgroundFps => "Background fps",
             Self::SampleInterval => "Sample interval",
             Self::Retention => "History retention",
             Self::Sustained => "Sustained samples",
@@ -416,10 +453,16 @@ impl SettingField {
 
     pub const fn unit(self) -> &'static str {
         match self {
-            Self::ClientTheme | Self::ClientEffects | Self::ClientRefresh | Self::ClientUpdates => {
-                "local"
-            }
+            Self::ClientTheme
+            | Self::ClientEffects
+            | Self::ClientRefresh
+            | Self::ClientUpdates
+            | Self::ClientBackgroundVideo
+            | Self::ClientBackgroundQuality
+            | Self::ClientBackgroundEnabled => "local",
             Self::ClientTimeout => "seconds",
+            Self::ClientBackgroundDim => "%",
+            Self::ClientBackgroundFps => "fps",
             Self::SampleInterval | Self::SlowLaunch => "ms",
             Self::Retention => "days",
             Self::BaselineSigma => "sigma",
@@ -461,6 +504,30 @@ impl SettingField {
                 "Whether PC Pulse asks GitHub for a newer release once per launch (at most \
                  every 20 hours). Enter toggles; off means no update-related network \
                  request is ever made."
+            }
+            Self::ClientBackgroundVideo => {
+                "A video file to play, muted and dimmed, behind every page. Enter opens a file \
+                 picker; Delete or Backspace turns it off. First use converts the clip once \
+                 with ffmpeg (winget install ffmpeg); afterwards it costs almost nothing."
+            }
+            Self::ClientBackgroundQuality => {
+                "How much detail the background video keeps: low, medium, high (the default), \
+                 or ultra. Sharper looks better and costs more disk for the converted clip and \
+                 more CPU while it plays. Enter cycles; only the quality in use is kept on disk, \
+                 so switching converts the video again — including switching back."
+            }
+            Self::ClientBackgroundEnabled => {
+                "Whether the converted background video is drawn. Enter toggles; off keeps the \
+                 clip and its conversion, it just stops painting it."
+            }
+            Self::ClientBackgroundDim => {
+                "How far the background video is darkened toward the theme, as a percent from \
+                 10 to 60. Higher keeps text easy to read; lower shows more of the clip. Enter \
+                 edits."
+            }
+            Self::ClientBackgroundFps => {
+                "How many times a second the background advances, from 1 to 60. Empty or auto \
+                 follows the clip's own rate; lower it to spend less on the video. Enter edits."
             }
             Self::SampleInterval => {
                 "How often PC Pulse measures the whole machine, in milliseconds. Shorter \
@@ -550,7 +617,12 @@ impl SettingField {
             | Self::ClientEffects
             | Self::ClientRefresh
             | Self::ClientTimeout
-            | Self::ClientUpdates => String::new(),
+            | Self::ClientUpdates
+            | Self::ClientBackgroundVideo
+            | Self::ClientBackgroundQuality
+            | Self::ClientBackgroundEnabled
+            | Self::ClientBackgroundDim
+            | Self::ClientBackgroundFps => String::new(),
             Self::SampleInterval => settings.sample_interval_ms.to_string(),
             Self::Retention => settings.retention_days.to_string(),
             Self::Sustained => settings.sustained_samples.to_string(),
@@ -584,7 +656,12 @@ impl SettingField {
             | Self::ClientEffects
             | Self::ClientRefresh
             | Self::ClientTimeout
-            | Self::ClientUpdates => {
+            | Self::ClientUpdates
+            | Self::ClientBackgroundVideo
+            | Self::ClientBackgroundQuality
+            | Self::ClientBackgroundEnabled
+            | Self::ClientBackgroundDim
+            | Self::ClientBackgroundFps => {
                 return Err("local client preference — edited through its own handler".into());
             }
             Self::SampleInterval => {
@@ -1072,6 +1149,40 @@ pub struct App {
     /// The client preferences in force for this run (CLI flags already
     /// folded in). `t` / `m` / TUNE edits update and persist them.
     pub client_prefs: UiPrefs,
+    /// The video clip painted behind the UI, once one has been loaded.
+    /// `None` — the default, and what every headless test uses — means the
+    /// renderer's background passes are skipped entirely.
+    pub background: Option<crate::background::Background>,
+    /// The renderer's memo of the video frame resampled onto the current
+    /// terminal geometry. It lives here rather than inside `Background`
+    /// because it is keyed on the *terminal*, not the clip: the player knows
+    /// nothing of `Rect`s, and a cache the player owned would have to be
+    /// invalidated by every resize from the outside anyway. Keyed on the
+    /// player's generation, so replacing `background` above retires it with
+    /// no bookkeeping here.
+    pub background_resample: crate::ui::VideoResample,
+    /// The live one-time ffmpeg conversion, while one is running. `drain_events`
+    /// polls it and drops it the moment the worker reports `Done` or `Failed`,
+    /// so `is_some()` is exactly "a conversion is in flight".
+    pub convert_rx: Option<Receiver<ConvertEvent>>,
+    /// The source path *and resolution cap* [`Self::convert_rx`] is
+    /// converting. Kept beside the receiver so a repeated commit of the same
+    /// path can recognize its own conversion instead of starting a rival one
+    /// over the same cache file — and the cap belongs in that key as much as
+    /// the path does: a quality change while the same video is converting
+    /// wants a *different* clip out of a different cache file, and a guard
+    /// that looked only at the path would wave it through as already running.
+    converting: Option<(String, (u16, u16))>,
+    /// The Explorer file dialog, while one is open. `is_some()` is exactly
+    /// "a dialog is up", which is both the guard against opening a second
+    /// one and the reason the status line says so.
+    pick_rx: Option<Receiver<PickEvent>>,
+    /// Collects the cache files a freshly loaded clip supersedes. The real
+    /// path is [`clipconvert::sweep_superseded`]; the inert test app
+    /// substitutes a no-op, because every test in this binary shares one
+    /// scratch cache root and a sweep there would delete the fixtures the
+    /// other tests are still using.
+    pub(crate) sweep_superseded: fn(&std::path::Path),
     pub prefs_store: Option<PrefsStore>,
     /// Smooth-refresh tween state: previous displayed sample, frame clock,
     /// and the session frame governor. Inert while `refresh_fps` is 0.
@@ -1184,6 +1295,12 @@ impl App {
             mode: InputMode::Normal,
             help_overlay: None,
             client_prefs: UiPrefs::default(),
+            background: None,
+            background_resample: crate::ui::VideoResample::default(),
+            convert_rx: None,
+            converting: None,
+            pick_rx: None,
+            sweep_superseded: clipconvert::sweep_superseded,
             prefs_store: None,
             smooth: crate::tween::SmoothState::default(),
             needs_terminal_clear: false,
@@ -1210,14 +1327,20 @@ impl App {
         let (event_source, events) = bounded(1);
         drop(command_sink);
         drop(event_source);
-        Self::with_worker(
+        let mut app = Self::with_worker(
             Worker {
                 commands,
                 events,
                 handle: None,
             },
             false,
-        )
+        );
+        // Every test in this binary shares one scratch cache root, so a
+        // real sweep here would collect the clips other tests planted for
+        // themselves. The two tests that exercise the sweep install the
+        // real one and point it at a directory of their own.
+        app.sweep_superseded = |_| {};
+        app
     }
 
     pub fn drain_events(&mut self) -> bool {
@@ -1349,7 +1472,232 @@ impl App {
                 WorkerEvent::UpdateDownload(result) => self.finish_update_download(result),
             }
         }
+        changed |= self.drain_conversion();
+        changed |= self.drain_file_pick();
         changed
+    }
+
+    /// Pump the Explorer file dialog. It answers exactly once, so the
+    /// receiver is let go the moment anything arrives — including a
+    /// disconnect, which is a dialog thread that died without speaking and
+    /// must not leave the row believing a dialog is still on screen.
+    fn drain_file_pick(&mut self) -> bool {
+        let event = match &self.pick_rx {
+            Some(receiver) => match receiver.try_recv() {
+                Ok(event) => event,
+                Err(crossbeam_channel::TryRecvError::Empty) => return false,
+                Err(crossbeam_channel::TryRecvError::Disconnected) => PickEvent::Cancelled,
+            },
+            None => return false,
+        };
+        self.pick_rx = None;
+        match event {
+            PickEvent::Picked(path) => {
+                let path = path.to_string_lossy().into_owned();
+                // The dialog was told the file must exist, so this is a
+                // formality — but the answer is a path from outside this
+                // process and is checked like the typed one.
+                if std::path::Path::new(&path).is_file() {
+                    self.set_background_video(path);
+                } else {
+                    self.set_error(format!("No video file at {path}"));
+                }
+            }
+            // Dismissed: nothing changes, and the "Choosing a video…" line
+            // goes quietly rather than announcing the non-event.
+            PickEvent::Cancelled => {
+                self.status.clear();
+                self.status_is_error = false;
+            }
+            // No dialog could be shown, so the row falls back to what it
+            // was before there was one. It must never be a dead end.
+            PickEvent::Unavailable => {
+                self.status.clear();
+                self.status_is_error = false;
+                self.mode = InputMode::EditSetting {
+                    field: SettingField::ClientBackgroundVideo,
+                    typed: self.client_prefs.background_video.clone(),
+                };
+            }
+        }
+        true
+    }
+
+    /// Open the Explorer dialog for the background-video row, unless one is
+    /// already up: a second Enter while the dialog has focus would spawn a
+    /// second thread whose answer would overwrite the first's.
+    fn open_background_picker(&mut self) {
+        if self.pick_rx.is_some() {
+            return;
+        }
+        let start = filepicker::start_dir(&self.client_prefs.background_video);
+        self.adopt_file_pick(filepicker::spawn_pick(start));
+    }
+
+    /// Take ownership of a dialog's answer channel. Split from
+    /// [`Self::open_background_picker`] because the dialog itself cannot run
+    /// in a test: everything downstream of this call is driven by a channel
+    /// the test makes itself.
+    pub(crate) fn adopt_file_pick(&mut self, receiver: Receiver<PickEvent>) {
+        self.pick_rx = Some(receiver);
+        self.status = CHOOSING_STATUS.into();
+        self.status_is_error = false;
+    }
+
+    /// Turn the background off: forget the path, drop the player, and stop
+    /// any conversion working toward it.
+    fn clear_background_video(&mut self) {
+        self.client_prefs.background_video.clear();
+        self.background = None;
+        self.forget_conversion();
+        self.status = "Background video off · saved for your user".into();
+        self.status_is_error = false;
+        self.persist_client_prefs();
+    }
+
+    /// Adopt a chosen video: persist the path and convert it (or load what
+    /// is already converted for it). Shared by the Explorer dialog and the
+    /// typed-path fallback, which must not diverge.
+    fn set_background_video(&mut self, path: String) {
+        self.client_prefs.background_video = path;
+        self.persist_client_prefs();
+        self.start_background_conversion();
+    }
+
+    /// Pump the background-video conversion worker. Collected before it is
+    /// handled because every outcome touches `self`, and a finished
+    /// conversion (either way) drops the receiver.
+    fn drain_conversion(&mut self) -> bool {
+        let events: Vec<ConvertEvent> = match &self.convert_rx {
+            Some(receiver) => receiver.try_iter().collect(),
+            None => return false,
+        };
+        let mut changed = false;
+        for event in events {
+            changed = true;
+            match event {
+                ConvertEvent::Progress(percent) => {
+                    self.status = format!("{CONVERTING_STATUS} {percent}%");
+                    self.status_is_error = false;
+                }
+                ConvertEvent::Failed(message) => {
+                    self.forget_conversion();
+                    self.set_error(format!("Background video conversion failed: {message}"));
+                }
+                ConvertEvent::Done(cache) => {
+                    self.forget_conversion();
+                    if self.load_background(&cache) {
+                        self.status = "Background ready".into();
+                        self.status_is_error = false;
+                    }
+                }
+            }
+        }
+        changed
+    }
+
+    /// Start (or restart) the one-time conversion of the configured video.
+    /// The worker short-circuits to `Done` when the clip is already cached,
+    /// so this is also the cheap "load what we have" path.
+    pub fn start_background_conversion(&mut self) {
+        let source = self.client_prefs.background_video.trim().to_string();
+        if source.is_empty() {
+            self.forget_conversion();
+            return;
+        }
+        let cap = self.client_prefs.background_quality.cap();
+        // A conversion already running for this exact source *at this exact
+        // cap* is left alone. A second worker would find the first one's
+        // half-written cache file, report `Done` against it immediately, and
+        // hand back a clip that cannot be opened — while the real worker's
+        // later `Done` landed on a receiver this call had already replaced.
+        // A different cap is a different cache file, so it is a genuinely
+        // new conversion and gets its own worker.
+        if self.converting.as_ref() == Some(&(source.clone(), cap)) {
+            // Nothing starts, so nothing has happened worth announcing —
+            // with one exception. The file dialog's own line is put up by a
+            // picker and taken down by whatever the answer causes; an
+            // answer that lands here causes nothing, so it would sit there
+            // until something unrelated spoke. Replace exactly that line
+            // and nothing else: an error the person is still reading, an
+            // update notice, or a percentage the running worker already
+            // reported are all none of this call's business.
+            if self.status == CHOOSING_STATUS {
+                self.status = CONVERTING_STATUS.into();
+                self.status_is_error = false;
+            }
+            return;
+        }
+        self.converting = Some((source.clone(), cap));
+        self.convert_rx = Some(clipconvert::spawn_convert(PathBuf::from(source), cap));
+        self.status = CONVERTING_STATUS.into();
+        self.status_is_error = false;
+    }
+
+    /// Let go of the conversion worker: the receiver and the source it was
+    /// converting always travel together.
+    fn forget_conversion(&mut self) {
+        self.convert_rx = None;
+        self.converting = None;
+    }
+
+    /// Open a converted clip and hand it the stored playback rate. Returns
+    /// whether it loaded; a failure clears the player and speaks once
+    /// through the status line rather than taking the TUI down.
+    ///
+    /// This is the single place a background becomes live — startup restore,
+    /// a finished conversion, a changed path or quality all arrive here — so
+    /// it is also where the caches this one supersedes are collected.
+    fn load_background(&mut self, cache: &std::path::Path) -> bool {
+        match Background::load(cache) {
+            Ok(mut background) => {
+                if self.client_prefs.background_fps != 0 {
+                    background.set_playback_fps(self.client_prefs.background_fps);
+                }
+                self.background = Some(background);
+                (self.sweep_superseded)(cache);
+                true
+            }
+            Err(error) => {
+                self.background = None;
+                self.set_error(format!("Background video could not be played: {error:#}"));
+                false
+            }
+        }
+    }
+
+    /// Put the configured video on screen: a clip that is already cached
+    /// loads straight away, anything else is converted first. Called at
+    /// startup and whenever the path changes.
+    fn restore_background(&mut self) {
+        let source = self.client_prefs.background_video.trim().to_string();
+        if source.is_empty() {
+            self.background = None;
+            self.forget_conversion();
+            return;
+        }
+        let cap = self.client_prefs.background_quality.cap();
+        // The running conversion owns the cache file until it reports
+        // `Done`: reading it now would open a half-written clip, so leave
+        // the worker to finish and load from its own event.
+        if self.converting.as_ref() == Some(&(source.clone(), cap)) {
+            return;
+        }
+        let cache = match clipconvert::cache_path(&PathBuf::from(source), cap) {
+            Ok(cache) => cache,
+            Err(error) => {
+                self.set_error(format!("Background video unavailable: {error:#}"));
+                return;
+            }
+        };
+        // A cache that exists but no longer opens is not a dead end: the
+        // converter checks it too, throws it away, and reconverts. Reporting
+        // the load failure and stopping here would strand the user with a
+        // background that can never come back.
+        if cache.exists() && self.load_background(&cache) {
+            return;
+        }
+        self.start_background_conversion();
     }
 
     /// A completed launch-time release check. The completion time is
@@ -1619,6 +1967,16 @@ impl App {
             KeyCode::Char(']') if self.page == Page::Analyzer && !self.analyzer_running => {
                 self.analyzer_window_hours = (self.analyzer_window_hours * 2).min(24);
             }
+            // Enter on the video row opens a dialog rather than a text
+            // box, so there is no longer an "empty it and commit" gesture:
+            // Delete and Backspace are it. Every other TUNE row ignores
+            // both keys.
+            KeyCode::Delete | KeyCode::Backspace
+                if self.page == Page::Settings
+                    && self.focused_setting() == Some(SettingField::ClientBackgroundVideo) =>
+            {
+                self.clear_background_video();
+            }
             KeyCode::Enter | KeyCode::Char('e') if self.page == Page::Settings => {
                 self.begin_setting_edit();
             }
@@ -1853,6 +2211,92 @@ impl App {
                     }
                 }
             }
+            KeyCode::Enter if field == SettingField::ClientBackgroundVideo => {
+                // Terminals hand back drag-and-dropped paths quoted; a
+                // pasted path should not have to be de-quoted by hand.
+                let path = typed.trim().trim_matches('"').trim().to_string();
+                if path.is_empty() {
+                    self.mode = InputMode::Normal;
+                    self.clear_background_video();
+                } else if !std::path::Path::new(&path).is_file() {
+                    self.set_error(format!("No video file at {path}"));
+                    self.mode = InputMode::EditSetting { field, typed };
+                } else {
+                    self.mode = InputMode::Normal;
+                    self.set_background_video(path);
+                }
+            }
+            KeyCode::Enter if field == SettingField::ClientBackgroundDim => {
+                // Out-of-range dim is clamped rather than rejected: every
+                // value in between is legible, so the nearest legal one is
+                // what the person meant.
+                match typed.trim().parse::<u32>() {
+                    Ok(percent) => {
+                        let dim = percent.clamp(
+                            u32::from(prefs::MIN_BACKGROUND_DIM),
+                            u32::from(prefs::MAX_BACKGROUND_DIM),
+                        ) as u8;
+                        self.client_prefs.background_dim = dim;
+                        self.mode = InputMode::Normal;
+                        self.status = format!("Background dim: {dim}% · saved for your user");
+                        self.status_is_error = false;
+                        self.persist_client_prefs();
+                    }
+                    Err(_) => {
+                        self.set_error(format!(
+                            "enter a number from {} to {}",
+                            prefs::MIN_BACKGROUND_DIM,
+                            prefs::MAX_BACKGROUND_DIM
+                        ));
+                        self.mode = InputMode::EditSetting { field, typed };
+                    }
+                }
+            }
+            KeyCode::Enter if field == SettingField::ClientBackgroundFps => {
+                let input = typed.trim();
+                // `0` is the stored "match the clip" sentinel, so it is the
+                // one number that escapes the 1–60 clamp — typing it means
+                // the same as leaving the box empty or writing `auto`.
+                let requested = if input.is_empty() || input.eq_ignore_ascii_case("auto") {
+                    Some(0)
+                } else {
+                    input.parse::<u32>().ok().map(|fps| match fps {
+                        0 => 0,
+                        fps => fps.clamp(prefs::MIN_BACKGROUND_FPS, prefs::MAX_BACKGROUND_FPS),
+                    })
+                };
+                match requested {
+                    Some(fps) => {
+                        self.client_prefs.background_fps = fps;
+                        self.mode = InputMode::Normal;
+                        self.status = match fps {
+                            0 => "Background fps: auto · saved for your user".to_string(),
+                            fps => format!("Background fps: {fps} · saved for your user"),
+                        };
+                        self.status_is_error = false;
+                        self.persist_client_prefs();
+                        match fps {
+                            // Auto has no number to hand the player: reopen
+                            // the cached clip, which starts at its own
+                            // capture rate with no downshift applied.
+                            0 => self.restore_background(),
+                            fps => {
+                                if let Some(background) = &mut self.background {
+                                    background.set_playback_fps(fps);
+                                }
+                            }
+                        }
+                    }
+                    None => {
+                        self.set_error(format!(
+                            "enter a number from {} to {}, or auto",
+                            prefs::MIN_BACKGROUND_FPS,
+                            prefs::MAX_BACKGROUND_FPS
+                        ));
+                        self.mode = InputMode::EditSetting { field, typed };
+                    }
+                }
+            }
             KeyCode::Enter => match field.assign(&mut self.settings, &typed) {
                 Ok(()) => {
                     self.settings_dirty = true;
@@ -1960,9 +2404,14 @@ impl App {
         self.status_is_error = false;
     }
 
-    pub(crate) fn begin_setting_edit(&mut self) {
+    /// The TUNE row the cursor is on, if the page has any rows at all.
+    pub(crate) fn focused_setting(&self) -> Option<SettingField> {
         let index = self.setting_state.selected().unwrap_or(0);
-        let Some(field) = self.visible_setting_fields().get(index).copied() else {
+        self.visible_setting_fields().get(index).copied()
+    }
+
+    pub(crate) fn begin_setting_edit(&mut self) {
+        let Some(field) = self.focused_setting() else {
             return;
         };
         match field {
@@ -2024,6 +2473,59 @@ impl App {
                 self.status_is_error = false;
                 self.persist_client_prefs();
             }
+            // The quality row is a four-position switch: Enter walks the
+            // ladder and persists immediately.
+            SettingField::ClientBackgroundQuality => {
+                let next = self.client_prefs.background_quality.next();
+                self.client_prefs.background_quality = next;
+                let (width, height) = next.cap();
+                self.status = format!(
+                    "Background quality: {} ({width}x{height}) · saved for your user",
+                    next.name()
+                );
+                self.status_is_error = false;
+                self.persist_client_prefs();
+                // A clip converted at the old ceiling is the wrong clip now,
+                // and the cache it came from is keyed on that ceiling — so
+                // drop it and convert at the new one, the same way a changed
+                // path does. The worker short-circuits to `Done` if this
+                // quality has been converted before.
+                if !self.client_prefs.background_video.trim().is_empty() {
+                    self.background = None;
+                    self.start_background_conversion();
+                }
+            }
+            // The background switch is a two-position switch like effects;
+            // the clip and its conversion survive being switched off.
+            SettingField::ClientBackgroundEnabled => {
+                self.client_prefs.background_enabled = !self.client_prefs.background_enabled;
+                self.status = format!(
+                    "Background video {} · saved for your user",
+                    if self.client_prefs.background_enabled {
+                        "shown"
+                    } else {
+                        "hidden"
+                    }
+                );
+                self.status_is_error = false;
+                self.persist_client_prefs();
+            }
+            // The one setting whose value lives out in the filesystem gets
+            // the dialog every other Windows program opens, rather than
+            // asking the person to know the path by heart. The typed editor
+            // is still there behind it, for a dialog that cannot be shown.
+            SettingField::ClientBackgroundVideo => self.open_background_picker(),
+            // This prefills with what the person would type, not with the
+            // display value: a bare number rather than "auto (matches clip)".
+            SettingField::ClientBackgroundFps => {
+                self.mode = InputMode::EditSetting {
+                    field,
+                    typed: match self.client_prefs.background_fps {
+                        0 => String::new(),
+                        fps => fps.to_string(),
+                    },
+                };
+            }
             _ => {
                 self.mode = InputMode::EditSetting {
                     field,
@@ -2054,6 +2556,44 @@ impl App {
                 "off"
             }
             .into(),
+            SettingField::ClientBackgroundVideo => {
+                match self.client_prefs.background_video.trim() {
+                    "" => "off".into(),
+                    path => path.to_string(),
+                }
+            }
+            // Name *and* size: "high" alone says nothing about what it
+            // costs, and the size is the whole difference between the rungs.
+            SettingField::ClientBackgroundQuality => {
+                let quality = self.client_prefs.background_quality;
+                let (width, height) = quality.cap();
+                format!("{} · {width}x{height}", quality.name())
+            }
+            SettingField::ClientBackgroundEnabled => if self.client_prefs.background_enabled {
+                "on"
+            } else {
+                "off"
+            }
+            .into(),
+            SettingField::ClientBackgroundDim => self.client_prefs.background_dim.to_string(),
+            // An auto-downshifted player is reported as `asked → playing
+            // (auto)`, so a rate the person did not choose never looks like
+            // one they did.
+            SettingField::ClientBackgroundFps => {
+                let downshifted = self
+                    .background
+                    .as_ref()
+                    .filter(|background| background.is_downshifted())
+                    .map(Background::effective_fps);
+                match (self.client_prefs.background_fps, downshifted) {
+                    (0, None) => "auto (matches clip)".into(),
+                    // Already an automatic rate: the arrow says it moved,
+                    // a second "(auto)" would only repeat the "auto".
+                    (0, Some(playing)) => format!("auto → {playing}"),
+                    (asked, None) => asked.to_string(),
+                    (asked, Some(playing)) => format!("{asked} → {playing} (auto)"),
+                }
+            }
             _ => field.value(&self.settings),
         }
     }
@@ -2066,6 +2606,9 @@ impl App {
         // A stored 30/60 fps preference arms the worker's live poller from
         // the first frame; at 0 fps nothing is sent.
         self.sync_live_polling();
+        // A configured background comes back from the cache if it is already
+        // converted, and converts itself in the worker if it is not.
+        self.restore_background();
         // The once-per-launch release check, gated by the preference and
         // the 20-hour cadence.
         self.request_update_check(Utc::now().timestamp_millis());
@@ -2113,25 +2656,38 @@ impl App {
     }
 
     /// Record one smooth frame's cost against its budget. On the third
-    /// consecutive overrun the session drops a tier (60 → 30 → off) and the
-    /// footer says so; returns `true` so the loop can repaint the message.
+    /// consecutive overrun something has to give, and the cheapest thing to
+    /// give up goes first: a *shown* video background halves its playback
+    /// rate, and only once it is at its 2 fps floor — or absent, or hidden,
+    /// in which case it costs nothing to draw and slowing it would relieve
+    /// nothing — does the session drop a refresh tier (60 → 30 → off).
+    /// Either way the footer says so and `true` comes back so the loop can
+    /// repaint the message.
     pub fn note_smooth_frame(&mut self, cost: Duration, budget: Duration) -> bool {
         let current = self.effective_refresh_fps();
         if current == 0 {
             return false;
         }
-        match self.smooth.note_frame(cost, budget, current) {
-            Some(next) => {
-                self.sync_live_polling();
-                self.status = format!(
-                    "Refresh reduced to {} — frame budget exceeded",
-                    refresh_label(next)
-                );
-                self.status_is_error = false;
-                true
-            }
-            None => false,
+        if !self.smooth.note_frame(cost, budget) {
+            return false;
         }
+        if self.client_prefs.background_enabled
+            && let Some(background) = self.background.as_mut()
+            && background.downshift()
+        {
+            let fps = background.effective_fps();
+            self.status = format!("background rate lowered to {fps} fps (frame budget)");
+            self.status_is_error = false;
+            return true;
+        }
+        let next = self.smooth.drop_tier(current);
+        self.sync_live_polling();
+        self.status = format!(
+            "Refresh reduced to {} — frame budget exceeded",
+            refresh_label(next)
+        );
+        self.status_is_error = false;
+        true
     }
 
     /// Eased tween progress for the current frame; exactly `1.0` whenever
@@ -4300,7 +4856,11 @@ mod tests {
         for sort in [SettingSort::Name, SettingSort::Value, SettingSort::Unit] {
             app.setting_sort = sort;
             let fields = app.visible_setting_fields();
-            assert_eq!(&fields[..5], &SettingField::CLIENT, "{sort:?}");
+            assert_eq!(
+                &fields[..SettingField::CLIENT.len()],
+                &SettingField::CLIENT,
+                "{sort:?}"
+            );
             assert_eq!(fields.len(), SettingField::ALL.len());
         }
         assert!(SettingField::ClientTheme.is_client());
@@ -4425,6 +4985,938 @@ mod tests {
         assert_eq!(app.effective_refresh_fps(), 0);
         assert_eq!(store.load().refresh_fps, 0);
         let _ = std::fs::remove_file(path);
+    }
+
+    /// The cap every background fixture is planted at: the default
+    /// quality, which is what a fresh `UiPrefs` asks for.
+    const DEFAULT_CAP: (u16, u16) = crate::clipconvert::BackgroundQuality::High.cap();
+
+    /// A scratch source video, plus any `.pulseclip` planted for it, that
+    /// deletes itself when the test ends. Under `cfg(test)` the cache root
+    /// is a `%TEMP%` directory rather than `%LOCALAPPDATA%\PcPulse\
+    /// backgrounds` (see `clipconvert::backgrounds_dir`), so a test run
+    /// never touches the real profile — and with this guard it leaves
+    /// nothing behind in `%TEMP%` either.
+    struct Scratch {
+        source: std::path::PathBuf,
+        cache: Option<std::path::PathBuf>,
+    }
+
+    impl std::ops::Deref for Scratch {
+        type Target = std::path::Path;
+
+        fn deref(&self) -> &std::path::Path {
+            &self.source
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.source);
+            if let Some(cache) = &self.cache {
+                let _ = std::fs::remove_file(cache);
+                // Best effort, and only ever succeeds for the last test out:
+                // an empty scratch cache root is worth removing too.
+                if let Some(parent) = cache.parent() {
+                    let _ = std::fs::remove_dir(parent);
+                }
+            }
+        }
+    }
+
+    /// A scratch file standing in for a source video. Nothing is cached for
+    /// it, so a conversion started against it stays in flight.
+    fn scratch_source(tag: &str) -> Scratch {
+        let source = std::env::temp_dir().join(format!(
+            "pcpulse-app-bg-{tag}-{}-{}.mp4",
+            std::process::id(),
+            Utc::now().timestamp_millis()
+        ));
+        std::fs::write(&source, b"stands in for a video file").unwrap();
+        Scratch {
+            source,
+            cache: None,
+        }
+    }
+
+    /// A real `.pulseclip` planted at the cache path of a scratch source
+    /// file. This is what lets the background rows be tested end to end
+    /// without ffmpeg: `spawn_convert` short-circuits straight to `Done`
+    /// when the cache for a source already exists and opens.
+    fn scratch_background(tag: &str, capture_fps: f32) -> Scratch {
+        let mut scratch = scratch_source(tag);
+        let cache = crate::clipconvert::cache_path(&scratch, DEFAULT_CAP).unwrap();
+        let mut writer = crate::pulseclip::ClipWriter::create(&cache, 4, 2, capture_fps).unwrap();
+        for frame in 0..4u32 {
+            writer.push_frame(&[(frame * 50) as u8; 4 * 2 * 3]).unwrap();
+        }
+        writer.finish().unwrap();
+        scratch.cache = Some(cache);
+        scratch
+    }
+
+    /// Pump `drain_events` until the conversion worker's message lands.
+    fn wait_for_background(app: &mut App) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.convert_rx.is_some() && Instant::now() < deadline {
+            app.drain_events();
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn background_rows_are_client_rows_and_stay_pinned() {
+        let app = App::new_inert();
+        let fields = app.visible_setting_fields();
+        for field in [
+            SettingField::ClientBackgroundVideo,
+            SettingField::ClientBackgroundQuality,
+            SettingField::ClientBackgroundEnabled,
+            SettingField::ClientBackgroundDim,
+            SettingField::ClientBackgroundFps,
+        ] {
+            assert!(field.is_client(), "{field:?}");
+            assert!(SettingField::CLIENT.contains(&field), "{field:?}");
+            assert!(SettingField::ALL.contains(&field), "{field:?}");
+            assert!(!field.label().is_empty() && !field.description().is_empty());
+            let position = fields.iter().position(|row| *row == field).unwrap();
+            assert!(position < SettingField::CLIENT.len(), "{field:?} unpinned");
+        }
+        assert_eq!(SettingField::CLIENT.len(), 10);
+        assert_eq!(SettingField::ALL.len(), 29);
+        // The quality row sits between the path and the on/off switch, so
+        // the three rows that describe *the clip* read top to bottom.
+        let row = |field| fields.iter().position(|other| *other == field).unwrap();
+        assert_eq!(
+            row(SettingField::ClientBackgroundQuality),
+            row(SettingField::ClientBackgroundVideo) + 1
+        );
+        assert_eq!(
+            row(SettingField::ClientBackgroundEnabled),
+            row(SettingField::ClientBackgroundQuality) + 1
+        );
+    }
+
+    #[test]
+    fn enter_on_the_background_row_toggles_and_persists() {
+        let (store, path) = scratch_prefs_store("background-enabled");
+        let mut app = App::new_inert();
+        app.adopt_client_prefs(UiPrefs::default(), Some(store.clone()));
+        app.page = Page::Settings;
+        app.setting_state.select(Some(7));
+        assert!(app.client_prefs.background_enabled);
+        assert_eq!(
+            app.setting_value(SettingField::ClientBackgroundEnabled),
+            "on"
+        );
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(!app.client_prefs.background_enabled);
+        assert_eq!(
+            app.setting_value(SettingField::ClientBackgroundEnabled),
+            "off"
+        );
+        assert!(!store.load().background_enabled);
+        assert!(matches!(app.mode, InputMode::Normal), "no typed edit opens");
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Puts the TUNE cursor on the quality row and presses Enter.
+    fn cycle_quality(app: &mut App) {
+        app.page = Page::Settings;
+        let row = app
+            .visible_setting_fields()
+            .iter()
+            .position(|field| *field == SettingField::ClientBackgroundQuality)
+            .unwrap();
+        app.setting_state.select(Some(row));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    }
+
+    #[test]
+    fn enter_on_the_quality_row_walks_the_ladder_and_persists() {
+        let (store, path) = scratch_prefs_store("background-quality");
+        let mut app = App::new_inert();
+        app.adopt_client_prefs(UiPrefs::default(), Some(store.clone()));
+        // The default is the size every clip converted before the preset
+        // existed was captured at, and the row shows the size, not just the
+        // name — "high" alone says nothing about what it costs.
+        assert_eq!(
+            app.setting_value(SettingField::ClientBackgroundQuality),
+            "high · 832x464"
+        );
+
+        for expected in [
+            "ultra · 1248x702",
+            "low · 208x116",
+            "medium · 416x232",
+            "high · 832x464",
+        ] {
+            cycle_quality(&mut app);
+            assert_eq!(
+                app.setting_value(SettingField::ClientBackgroundQuality),
+                expected
+            );
+            assert_eq!(
+                store.load().background_quality,
+                app.client_prefs.background_quality
+            );
+            assert!(matches!(app.mode, InputMode::Normal), "no typed edit opens");
+        }
+        // Four presses is a full lap.
+        assert_eq!(
+            app.client_prefs.background_quality,
+            crate::clipconvert::BackgroundQuality::High
+        );
+        assert!(app.status.contains("Background quality: high (832x464)"));
+        assert!(!app.status_is_error);
+        // With no video set there is nothing to reconvert.
+        assert!(app.convert_rx.is_none(), "status was {}", app.status);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_quality_change_drops_the_clip_and_converts_at_the_new_ceiling() {
+        let source = scratch_background("quality-change", 20.0);
+        let mut app = App::new_inert();
+        app.adopt_client_prefs(
+            UiPrefs {
+                background_video: source.to_string_lossy().into_owned(),
+                ..UiPrefs::default()
+            },
+            None,
+        );
+        assert!(app.background.is_some(), "status was {}", app.status);
+
+        cycle_quality(&mut app);
+
+        // The clip on screen was converted at the old ceiling, so it is the
+        // wrong clip now — and the cache it came from is keyed on that
+        // ceiling, so it cannot simply be reopened.
+        assert!(app.background.is_none(), "the old-ceiling clip stayed up");
+        assert!(app.convert_rx.is_some(), "status was {}", app.status);
+        assert_eq!(
+            app.converting.as_ref().map(|(_, cap)| *cap),
+            Some(crate::clipconvert::BackgroundQuality::Ultra.cap()),
+            "the conversion was started at the wrong ceiling"
+        );
+    }
+
+    #[test]
+    fn a_quality_change_mid_conversion_is_not_mistaken_for_the_one_running() {
+        // The in-flight guard used to key on the source path alone. With a
+        // cap in play that is wrong twice over: the running worker is
+        // producing a clip at the *old* ceiling into a *different* cache
+        // file, so waving the change through as "already converting" would
+        // leave the person on a quality they did not ask for, with no way
+        // to ask again short of changing the video.
+        let source = scratch_source("quality-in-flight");
+        let path = source.to_string_lossy().into_owned();
+        let mut app = App::new_inert();
+        app.client_prefs.background_video = path.clone();
+        app.start_background_conversion();
+        let first = app.convert_rx.clone().expect("a conversion is in flight");
+        assert_eq!(
+            app.converting,
+            Some((
+                path.clone(),
+                crate::clipconvert::BackgroundQuality::High.cap()
+            ))
+        );
+
+        cycle_quality(&mut app);
+
+        assert!(
+            !app.convert_rx.as_ref().unwrap().same_channel(&first),
+            "the quality change was swallowed by the running conversion"
+        );
+        assert_eq!(
+            app.converting,
+            Some((path, crate::clipconvert::BackgroundQuality::Ultra.cap()))
+        );
+
+        // ...while the *same* quality re-requested against the same source
+        // still recognizes its own worker and leaves it alone.
+        let running = app.convert_rx.clone().unwrap();
+        app.start_background_conversion();
+        assert!(app.convert_rx.as_ref().unwrap().same_channel(&running));
+    }
+
+    /// Puts the TUNE cursor on the background-video row.
+    fn focus_video_row(app: &mut App) {
+        app.page = Page::Settings;
+        let row = app
+            .visible_setting_fields()
+            .iter()
+            .position(|field| *field == SettingField::ClientBackgroundVideo)
+            .unwrap();
+        app.setting_state.select(Some(row));
+    }
+
+    /// Arms the app with a dialog channel a test drives by hand. The real
+    /// dialog is modal COM and cannot run headless, so every test goes in
+    /// through here — and pressing Enter on the row with one already armed
+    /// is exactly the double-open case, which must not reach the shell.
+    fn arm_picker(app: &mut App) -> crossbeam_channel::Sender<PickEvent> {
+        let (tx, rx) = bounded::<PickEvent>(1);
+        app.adopt_file_pick(rx);
+        tx
+    }
+
+    #[test]
+    fn choosing_a_file_commits_it_exactly_as_a_typed_path_would() {
+        let (store, prefs_path) = scratch_prefs_store("picker-commit");
+        let source = scratch_background("picker", 20.0);
+        let mut app = App::new_inert();
+        app.adopt_client_prefs(UiPrefs::default(), Some(store.clone()));
+        focus_video_row(&mut app);
+
+        let dialog = arm_picker(&mut app);
+        assert_eq!(app.status, "Choosing a video…");
+        assert!(!app.status_is_error);
+        // Nothing has happened yet: a dialog on screen is not a change.
+        assert!(!app.drain_events());
+        assert!(app.client_prefs.background_video.is_empty());
+
+        dialog
+            .send(PickEvent::Picked(source.to_path_buf()))
+            .unwrap();
+        assert!(app.drain_events());
+
+        assert_eq!(app.client_prefs.background_video, source.to_string_lossy());
+        assert_eq!(store.load().background_video, source.to_string_lossy());
+        assert!(app.convert_rx.is_some(), "status was {}", app.status);
+        wait_for_background(&mut app);
+        assert!(app.background.is_some(), "status was {}", app.status);
+        let _ = std::fs::remove_file(prefs_path);
+    }
+
+    #[test]
+    fn choosing_the_file_already_converting_does_not_strand_the_dialog_status() {
+        // The commit is a no-op — that same source is already converting at
+        // that same cap — but "Choosing a video…" was put up by the dialog
+        // and only a *starting* conversion would ever have replaced it. It
+        // used to sit there until something unrelated spoke.
+        let source = scratch_source("picker-already-converting");
+        let mut app = App::new_inert();
+        app.client_prefs.background_video = source.to_string_lossy().into_owned();
+        app.start_background_conversion();
+        let running = app.convert_rx.clone().expect("a conversion is in flight");
+
+        focus_video_row(&mut app);
+        let dialog = arm_picker(&mut app);
+        assert_eq!(app.status, "Choosing a video…");
+        dialog
+            .send(PickEvent::Picked(source.to_path_buf()))
+            .unwrap();
+        app.drain_events();
+
+        assert_eq!(app.status, "Converting background…");
+        assert!(!app.status_is_error);
+        assert!(
+            app.convert_rx.as_ref().unwrap().same_channel(&running),
+            "the running conversion was replaced"
+        );
+
+        // A percentage the worker has already reported is not stepped on by
+        // a later no-op commit.
+        app.status = "Converting background… 47%".into();
+        app.start_background_conversion();
+        assert_eq!(app.status, "Converting background… 47%");
+
+        // Nor is anything else. A redundant request replaces the dialog's
+        // own line, because only it is stranded by the no-op — an error the
+        // person is still reading is not this call's to discard.
+        app.set_error("Failed to copy the answer to the clipboard".into());
+        app.start_background_conversion();
+        assert_eq!(app.status, "Failed to copy the answer to the clipboard");
+        assert!(app.status_is_error, "an error was silently downgraded");
+
+        app.status = "PC Pulse v9.9.9 is available — press u to download".into();
+        app.status_is_error = false;
+        app.start_background_conversion();
+        assert_eq!(
+            app.status,
+            "PC Pulse v9.9.9 is available — press u to download"
+        );
+    }
+
+    #[test]
+    fn a_dismissed_dialog_changes_nothing_and_says_nothing() {
+        let source = scratch_background("picker-cancel", 20.0);
+        let mut app = App::new_inert();
+        app.adopt_client_prefs(
+            UiPrefs {
+                background_video: source.to_string_lossy().into_owned(),
+                ..UiPrefs::default()
+            },
+            None,
+        );
+        assert!(app.background.is_some(), "status was {}", app.status);
+        focus_video_row(&mut app);
+
+        let dialog = arm_picker(&mut app);
+        dialog.send(PickEvent::Cancelled).unwrap();
+        app.drain_events();
+
+        // The clip that was playing is still playing, the path is untouched,
+        // and the "Choosing a video…" line goes quietly rather than
+        // announcing a non-event.
+        assert_eq!(app.client_prefs.background_video, source.to_string_lossy());
+        assert!(app.background.is_some());
+        assert_eq!(app.status, "");
+        assert!(!app.status_is_error);
+        assert!(matches!(app.mode, InputMode::Normal));
+        // ...and the row is ready to open a dialog again.
+        assert!(app.pick_rx.is_none());
+    }
+
+    #[test]
+    fn a_dialog_thread_that_dies_without_answering_releases_the_row() {
+        // Otherwise the row believes a dialog is still on screen forever
+        // and Enter does nothing for the rest of the session.
+        let mut app = App::new_inert();
+        let dialog = arm_picker(&mut app);
+        drop(dialog);
+
+        app.drain_events();
+
+        assert!(app.pick_rx.is_none());
+        assert_eq!(app.status, "");
+    }
+
+    #[test]
+    fn a_dialog_that_cannot_be_shown_falls_back_to_the_typed_path_editor() {
+        // A machine whose shell will not give us a dialog must still be
+        // able to set a background; the row can never be a dead end.
+        let mut app = App::new_inert();
+        app.client_prefs.background_video = r"C:\clips\current.mp4".into();
+        focus_video_row(&mut app);
+
+        let dialog = arm_picker(&mut app);
+        dialog.send(PickEvent::Unavailable).unwrap();
+        app.drain_events();
+
+        assert!(matches!(
+            app.mode,
+            InputMode::EditSetting { field: SettingField::ClientBackgroundVideo, ref typed }
+                if typed == r"C:\clips\current.mp4"
+        ));
+        assert!(!app.status_is_error, "status was {}", app.status);
+        assert!(app.pick_rx.is_none());
+    }
+
+    #[test]
+    fn enter_while_a_dialog_is_up_does_not_open_a_second_one() {
+        // A second dialog would be a second thread whose answer overwrites
+        // the first's — and this is also what keeps this whole test module
+        // from ever reaching the real, modal shell dialog.
+        let mut app = App::new_inert();
+        focus_video_row(&mut app);
+        let dialog = arm_picker(&mut app);
+        let armed = app.pick_rx.clone().unwrap();
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(
+            app.pick_rx.as_ref().unwrap().same_channel(&armed),
+            "a second dialog replaced the one already on screen"
+        );
+        assert!(matches!(app.mode, InputMode::Normal), "no typed edit opens");
+        // The dialog already up still lands normally.
+        dialog.send(PickEvent::Cancelled).unwrap();
+        app.drain_events();
+        assert!(app.pick_rx.is_none());
+    }
+
+    #[test]
+    fn delete_or_backspace_on_the_video_row_turns_the_background_off() {
+        for key in [KeyCode::Delete, KeyCode::Backspace] {
+            let (store, prefs_path) = scratch_prefs_store("picker-clear");
+            let source = scratch_background("picker-clear", 20.0);
+            let mut app = App::new_inert();
+            app.adopt_client_prefs(
+                UiPrefs {
+                    background_video: source.to_string_lossy().into_owned(),
+                    ..UiPrefs::default()
+                },
+                Some(store.clone()),
+            );
+            assert!(app.background.is_some(), "status was {}", app.status);
+            focus_video_row(&mut app);
+
+            app.handle_key(KeyEvent::new(key, KeyModifiers::NONE));
+
+            assert!(app.client_prefs.background_video.is_empty(), "{key:?}");
+            assert!(store.load().background_video.is_empty(), "{key:?}");
+            assert!(app.background.is_none(), "{key:?}");
+            assert!(app.convert_rx.is_none(), "{key:?}");
+            assert_eq!(
+                app.setting_value(SettingField::ClientBackgroundVideo),
+                "off"
+            );
+            assert!(!app.status_is_error);
+            let _ = std::fs::remove_file(prefs_path);
+        }
+    }
+
+    #[test]
+    fn delete_leaves_every_other_tune_row_alone() {
+        // The clear gesture belongs to one row; it must not become a way to
+        // blank the theme or the dim percentage by leaning on a key.
+        let source = scratch_background("picker-other-row", 20.0);
+        let mut app = App::new_inert();
+        app.adopt_client_prefs(
+            UiPrefs {
+                background_video: source.to_string_lossy().into_owned(),
+                ..UiPrefs::default()
+            },
+            None,
+        );
+        app.page = Page::Settings;
+        for field in [
+            SettingField::ClientBackgroundQuality,
+            SettingField::ClientBackgroundDim,
+            SettingField::ClientTheme,
+            SettingField::Sustained,
+        ] {
+            let row = app
+                .visible_setting_fields()
+                .iter()
+                .position(|other| *other == field)
+                .unwrap();
+            app.setting_state.select(Some(row));
+            app.handle_key(KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE));
+            app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+            assert_eq!(
+                app.client_prefs.background_video,
+                source.to_string_lossy(),
+                "{field:?} cleared the video row"
+            );
+        }
+    }
+
+    #[test]
+    fn committing_a_dim_edit_clamps_and_persists() {
+        let (store, path) = scratch_prefs_store("background-dim");
+        let mut app = App::new_inert();
+        app.adopt_client_prefs(UiPrefs::default(), Some(store.clone()));
+
+        app.mode = InputMode::EditSetting {
+            field: SettingField::ClientBackgroundDim,
+            typed: "85".into(),
+        };
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.client_prefs.background_dim, 60);
+        assert_eq!(store.load().background_dim, 60);
+        assert!(matches!(app.mode, InputMode::Normal));
+
+        app.mode = InputMode::EditSetting {
+            field: SettingField::ClientBackgroundDim,
+            typed: "5".into(),
+        };
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.client_prefs.background_dim, 10);
+        assert_eq!(store.load().background_dim, 10);
+        assert_eq!(app.setting_value(SettingField::ClientBackgroundDim), "10");
+
+        // Nonsense re-arms the edit with an error instead of committing.
+        app.mode = InputMode::EditSetting {
+            field: SettingField::ClientBackgroundDim,
+            typed: "dark".into(),
+        };
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.status_is_error);
+        assert!(matches!(app.mode, InputMode::EditSetting { .. }));
+        assert_eq!(app.client_prefs.background_dim, 10);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_cached_background_loads_at_startup_with_the_stored_fps() {
+        let source = scratch_background("startup", 20.0);
+        let mut app = App::new_inert();
+        app.adopt_client_prefs(
+            UiPrefs {
+                background_video: source.to_string_lossy().into_owned(),
+                background_fps: 12,
+                ..UiPrefs::default()
+            },
+            None,
+        );
+
+        let background = app.background.as_ref().expect("cached clip loads directly");
+        assert_eq!(background.effective_fps(), 12);
+        assert!(
+            app.convert_rx.is_none(),
+            "a cached clip converts nothing: {}",
+            app.status
+        );
+    }
+
+    #[test]
+    fn loading_a_background_collects_the_caches_it_supersedes() {
+        // A cache root of this test's own, because the scratch root is
+        // shared by every test in this binary and a sweep there would
+        // delete fixtures the others are still using. `load_background`
+        // sweeps the directory the clip it loaded lives in, so a real clip
+        // planted here is loaded and swept exactly as one in the real
+        // `%LOCALAPPDATA%\PcPulse\backgrounds` would be.
+        let dir = std::env::temp_dir().join(format!(
+            "pcpulse-app-sweep-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_millis()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let live = dir.join("0000000000000001.pulseclip");
+        let mut writer = crate::pulseclip::ClipWriter::create(&live, 4, 2, 20.0).unwrap();
+        writer.push_frame(&[7u8; 4 * 2 * 3]).unwrap();
+        writer.finish().unwrap();
+        let superseded = dir.join("0000000000000002.pulseclip");
+        let abandoned = dir.join("0000000000000003.pulseclip.tmp");
+        std::fs::write(&superseded, b"a clip from a video that is no longer set").unwrap();
+        std::fs::write(&abandoned, b"an interrupted conversion").unwrap();
+
+        let mut app = App::new_inert();
+        app.sweep_superseded = crate::clipconvert::sweep_superseded;
+        assert!(app.load_background(&live), "status was {}", app.status);
+
+        assert!(live.exists(), "the clip now playing was collected");
+        assert!(!superseded.exists(), "a superseded cache survived the load");
+        assert!(!abandoned.exists(), "an abandoned temp file survived");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failed_load_collects_nothing() {
+        // The sweep's whole premise is that the survivor opens. A file that
+        // does not is no reason to throw away the clips beside it.
+        let dir = std::env::temp_dir().join(format!(
+            "pcpulse-app-nosweep-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_millis()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let broken = dir.join("0000000000000001.pulseclip");
+        let other = dir.join("0000000000000002.pulseclip");
+        std::fs::write(&broken, b"not a clip").unwrap();
+        std::fs::write(&other, b"still wanted").unwrap();
+
+        let mut app = App::new_inert();
+        app.sweep_superseded = crate::clipconvert::sweep_superseded;
+        assert!(!app.load_background(&broken));
+
+        assert!(other.exists(), "a failed load swept the directory anyway");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fps_row_reports_the_auto_downshift_and_commits_a_fixed_rate() {
+        let source = scratch_background("fps", 20.0);
+        let mut app = App::new_inert();
+        app.adopt_client_prefs(
+            UiPrefs {
+                background_video: source.to_string_lossy().into_owned(),
+                ..UiPrefs::default()
+            },
+            None,
+        );
+        assert_eq!(
+            app.setting_value(SettingField::ClientBackgroundFps),
+            "auto (matches clip)"
+        );
+
+        // An automatic rate lowered automatically needs no second "(auto)".
+        app.background.as_mut().unwrap().downshift();
+        assert_eq!(
+            app.setting_value(SettingField::ClientBackgroundFps),
+            "auto → 10"
+        );
+
+        // An explicit rate clamps, reaches the player, and clears the auto state.
+        app.mode = InputMode::EditSetting {
+            field: SettingField::ClientBackgroundFps,
+            typed: "90".into(),
+        };
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.client_prefs.background_fps, 60);
+        assert_eq!(app.background.as_ref().unwrap().effective_fps(), 60);
+        assert!(!app.background.as_ref().unwrap().is_downshifted());
+        assert_eq!(app.setting_value(SettingField::ClientBackgroundFps), "60");
+
+        // A chosen rate the guardrail then lowers reads as `asked → playing (auto)`.
+        app.background.as_mut().unwrap().downshift();
+        assert_eq!(
+            app.setting_value(SettingField::ClientBackgroundFps),
+            "60 → 30 (auto)"
+        );
+
+        // Back to auto: the player returns to the clip's own capture rate.
+        // A typed `0` is the sentinel, not a rate to clamp up to 1.
+        app.mode = InputMode::EditSetting {
+            field: SettingField::ClientBackgroundFps,
+            typed: "0".into(),
+        };
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.client_prefs.background_fps, 0);
+        assert_eq!(app.background.as_ref().unwrap().effective_fps(), 20);
+        assert!(!app.background.as_ref().unwrap().is_downshifted());
+        assert_eq!(
+            app.setting_value(SettingField::ClientBackgroundFps),
+            "auto (matches clip)"
+        );
+
+        // `auto` in words reaches the same sentinel.
+        app.client_prefs.background_fps = 30;
+        app.mode = InputMode::EditSetting {
+            field: SettingField::ClientBackgroundFps,
+            typed: "auto".into(),
+        };
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.client_prefs.background_fps, 0);
+    }
+
+    #[test]
+    fn committing_a_background_path_converts_it_then_an_empty_one_turns_it_off() {
+        // The typed editor is the fallback behind the Explorer dialog — it
+        // is what a machine whose shell will not give us a dialog gets, so
+        // it has to keep working exactly as it did.
+        let (store, prefs_path) = scratch_prefs_store("background-video");
+        let source = scratch_background("commit", 20.0);
+        let mut app = App::new_inert();
+        app.adopt_client_prefs(UiPrefs::default(), Some(store.clone()));
+        app.page = Page::Settings;
+        app.setting_state.select(Some(5));
+
+        // A pasted, quoted Windows path commits and starts the conversion.
+        app.mode = InputMode::EditSetting {
+            field: SettingField::ClientBackgroundVideo,
+            typed: format!("\"{}\"", source.display()),
+        };
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.client_prefs.background_video, source.to_string_lossy());
+        assert_eq!(store.load().background_video, source.to_string_lossy());
+        assert!(app.convert_rx.is_some(), "conversion started");
+        assert!(matches!(app.mode, InputMode::Normal));
+
+        wait_for_background(&mut app);
+        assert!(app.background.is_some(), "status was {}", app.status);
+        assert!(app.status.contains("Background ready"), "{}", app.status);
+        assert!(!app.status_is_error);
+        assert_eq!(
+            app.setting_value(SettingField::ClientBackgroundVideo),
+            source.to_string_lossy()
+        );
+
+        // A path that names nothing re-arms the edit rather than committing.
+        app.mode = InputMode::EditSetting {
+            field: SettingField::ClientBackgroundVideo,
+            typed: r"C:\nope\missing.mp4".into(),
+        };
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.status_is_error);
+        assert!(matches!(app.mode, InputMode::EditSetting { .. }));
+        assert_eq!(app.client_prefs.background_video, source.to_string_lossy());
+
+        // An empty commit turns the background off and drops the player.
+        app.mode = InputMode::EditSetting {
+            field: SettingField::ClientBackgroundVideo,
+            typed: String::new(),
+        };
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.client_prefs.background_video.is_empty());
+        assert!(store.load().background_video.is_empty());
+        assert!(app.background.is_none());
+        assert_eq!(
+            app.setting_value(SettingField::ClientBackgroundVideo),
+            "off"
+        );
+        let _ = std::fs::remove_file(prefs_path);
+    }
+
+    #[test]
+    fn a_re_commit_of_the_same_path_leaves_the_running_conversion_alone() {
+        let source = scratch_source("in-flight");
+        let path = source.to_string_lossy().into_owned();
+        let mut app = App::new_inert();
+        app.client_prefs.background_video = path.clone();
+        app.start_background_conversion();
+        let first = app.convert_rx.clone().expect("a conversion is in flight");
+
+        // Committing the same path again must not spawn a rival worker: it
+        // would find the first one's half-written cache file, call it done,
+        // and leave the real worker reporting into a discarded receiver.
+        app.mode = InputMode::EditSetting {
+            field: SettingField::ClientBackgroundVideo,
+            typed: path.clone(),
+        };
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(
+            app.convert_rx
+                .as_ref()
+                .expect("the conversion is still running")
+                .same_channel(&first),
+            "the receiver was replaced"
+        );
+        assert!(app.background.is_none());
+
+        // A genuinely different path does start its own conversion.
+        let other = scratch_source("in-flight-other");
+        app.mode = InputMode::EditSetting {
+            field: SettingField::ClientBackgroundVideo,
+            typed: other.to_string_lossy().into_owned(),
+        };
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(!app.convert_rx.as_ref().unwrap().same_channel(&first));
+    }
+
+    #[test]
+    fn auto_fps_mid_conversion_never_opens_the_half_written_cache() {
+        let source = scratch_source("in-flight-cache");
+        let cache = crate::clipconvert::cache_path(&source, DEFAULT_CAP).unwrap();
+        // Exactly the state the worker leaves while it streams frames: the
+        // cache file exists but is not a readable clip yet. Held here with
+        // a channel of our own so no real worker can race the assertion.
+        std::fs::write(&cache, b"").unwrap();
+        let (_convert_tx, convert_rx) = bounded::<ConvertEvent>(1);
+        let mut app = App::new_inert();
+        app.client_prefs.background_video = source.to_string_lossy().into_owned();
+        app.converting = Some((source.to_string_lossy().into_owned(), DEFAULT_CAP));
+        app.convert_rx = Some(convert_rx);
+
+        app.mode = InputMode::EditSetting {
+            field: SettingField::ClientBackgroundFps,
+            typed: "auto".into(),
+        };
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(app.background.is_none(), "status was {}", app.status);
+        assert!(!app.status_is_error, "status was {}", app.status);
+        assert!(
+            app.convert_rx.is_some(),
+            "the conversion still owns the file"
+        );
+        let _ = std::fs::remove_file(cache);
+    }
+
+    #[test]
+    fn a_corrupt_cache_file_reconverts_instead_of_stranding_the_background() {
+        let source = scratch_source("corrupt-cache");
+        let cache = crate::clipconvert::cache_path(&source, DEFAULT_CAP).unwrap();
+        // What an interrupted conversion used to leave behind: a file at the
+        // final cache path that no reader can open. Restoring used to report
+        // a load error and stop, and every later commit of the same path
+        // short-circuited to the same broken file — unrecoverable from the
+        // UI. It has to fall through to a fresh conversion instead.
+        std::fs::write(&cache, b"not a clip").unwrap();
+        let mut app = App::new_inert();
+        app.client_prefs.background_video = source.to_string_lossy().into_owned();
+
+        app.restore_background();
+
+        assert!(app.background.is_none());
+        assert!(
+            app.convert_rx.is_some(),
+            "no reconversion started: {}",
+            app.status
+        );
+        assert!(!app.status_is_error, "status was {}", app.status);
+
+        // Let the worker run out (there is no real video behind the path, so
+        // it fails) and confirm it threw the unreadable file away.
+        wait_for_background(&mut app);
+        assert!(!cache.exists(), "the corrupt cache file survived");
+    }
+
+    #[test]
+    fn a_failed_conversion_reports_an_error_instead_of_crashing() {
+        let mut app = App::new_inert();
+        app.client_prefs.background_video = r"C:\nope\missing.mp4".into();
+        app.start_background_conversion();
+        wait_for_background(&mut app);
+        assert!(app.status_is_error, "status was {}", app.status);
+        assert!(app.background.is_none());
+        assert!(app.convert_rx.is_none(), "the receiver is dropped");
+    }
+
+    /// An app whose cached clip is loaded and whose refresh preference is
+    /// the top tier, so the frame governor has somewhere to fall.
+    fn app_with_background_and_smooth(tag: &str) -> (App, Scratch) {
+        let source = scratch_background(tag, 60.0);
+        let mut app = App::new_inert();
+        app.adopt_client_prefs(
+            UiPrefs {
+                background_video: source.to_string_lossy().into_owned(),
+                refresh_fps: 60,
+                ..UiPrefs::default()
+            },
+            None,
+        );
+        assert!(app.background.is_some(), "status was {}", app.status);
+        (app, source)
+    }
+
+    #[test]
+    fn budget_overruns_downshift_the_background_before_the_ui_tier() {
+        let (mut app, _source) = app_with_background_and_smooth("guardrail");
+        assert_eq!(app.effective_refresh_fps(), 60);
+        assert_eq!(app.background.as_ref().unwrap().effective_fps(), 60);
+
+        let over = Duration::from_millis(50);
+        let budget = Duration::from_millis(16);
+        // Three consecutive overruns is exactly one governor trip; the
+        // counter rearms itself on firing.
+        for _ in 0..3 {
+            app.note_smooth_frame(over, budget);
+        }
+        assert_eq!(
+            app.effective_refresh_fps(),
+            60,
+            "UI tier must survive the first trip"
+        );
+        assert_eq!(app.background.as_ref().unwrap().effective_fps(), 30);
+        assert_eq!(
+            app.status,
+            "background rate lowered to 30 fps (frame budget)"
+        );
+        assert!(!app.status_is_error);
+
+        // Drive the background to its floor; the UI tier is untouched the
+        // whole way down.
+        while app.background.as_ref().unwrap().effective_fps() > 2 {
+            for _ in 0..3 {
+                app.note_smooth_frame(over, budget);
+            }
+            assert_eq!(app.effective_refresh_fps(), 60);
+        }
+
+        // At the floor the background has nothing left to give, so the next
+        // trip drops the UI tier with the existing message.
+        for _ in 0..3 {
+            app.note_smooth_frame(over, budget);
+        }
+        assert_eq!(app.effective_refresh_fps(), 30);
+        assert_eq!(app.background.as_ref().unwrap().effective_fps(), 2);
+        assert_eq!(
+            app.status,
+            "Refresh reduced to 30 fps — frame budget exceeded"
+        );
+    }
+
+    #[test]
+    fn a_hidden_background_does_not_absorb_the_budget_trip() {
+        let (mut app, _source) = app_with_background_and_smooth("guardrail-hidden");
+        app.client_prefs.background_enabled = false;
+        let over = Duration::from_millis(50);
+        let budget = Duration::from_millis(16);
+        for _ in 0..3 {
+            app.note_smooth_frame(over, budget);
+        }
+        // Nothing is drawing the clip, so slowing it would relieve nothing:
+        // the trip has to reach the UI tier.
+        assert_eq!(app.background.as_ref().unwrap().effective_fps(), 60);
+        assert_eq!(app.effective_refresh_fps(), 30);
     }
 
     #[test]

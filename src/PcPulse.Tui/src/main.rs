@@ -253,6 +253,7 @@ fn run_loop(
     healed: Option<String>,
 ) -> Result<()> {
     let mut app = App::new();
+    let effects = effective.effects;
     app.adopt_client_prefs(effective, store);
     // Surface a launch-time heal once, before the first draw; the next
     // worker event replaces it like any other status line.
@@ -260,10 +261,10 @@ fn run_loop(
         app.status = message;
         app.status_is_error = false;
     }
-    let mut motion = MotionSystem::new(&app, effective.effects);
+    let mut motion = MotionSystem::new(&app, effects);
     // MotionSystem does not expose its enabled state; mirror it so TUNE
     // toggles can be reconciled through `toggle()`.
-    let mut motion_enabled = effective.effects;
+    let mut motion_enabled = effects;
     let mut dirty = true;
     let mut last_frame = Instant::now();
     let mut terminal_area = Rect::default();
@@ -273,6 +274,15 @@ fn run_loop(
     loop {
         if app.drain_events() {
             motion.observe(&app);
+            dirty = true;
+        }
+        // The renderer only reads whichever frame the player says is
+        // current; this is the one clock that moves it on. Without this
+        // tick the clip would sit on frame 0 forever.
+        if app.client_prefs.background_enabled
+            && let Some(background) = app.background.as_mut()
+            && background.advance_if_due(Instant::now())
+        {
             dirty = true;
         }
         let fps = app.effective_refresh_fps();
@@ -293,9 +303,24 @@ fn run_loop(
             })?;
             last_frame = Instant::now();
             dirty = motion.take_cleanup_frame();
+            // A decode failure surfaced by the draw retires the player
+            // rather than repeating itself every frame: one status line,
+            // then the UI carries on without a background.
+            let failure = app
+                .background
+                .as_ref()
+                .and_then(|background| background.failed())
+                .map(str::to_owned);
+            if let Some(message) = failure {
+                app.background = None;
+                app.status = format!("Background video stopped: {message}");
+                app.status_is_error = true;
+                dirty = true;
+            }
             if fps > 0 {
-                // Guardrail: three consecutive budget overruns drop the
-                // session a tier so the TUI never consumes a core silently.
+                // Guardrail: three consecutive budget overruns cost the
+                // session either half the background's playback rate or a
+                // refresh tier, so the TUI never consumes a core silently.
                 if app.note_smooth_frame(frame_started.elapsed(), frame_budget) {
                     dirty = true;
                     motion.observe(&app);
@@ -309,12 +334,23 @@ fn run_loop(
         }
         // Event-driven mode polls on the motion system's cadence; smooth
         // mode caps the wait at the remaining frame budget (take the min).
-        let poll_timeout = match next_smooth_frame {
+        let mut poll_timeout = match next_smooth_frame {
             Some(deadline) if app.effective_refresh_fps() > 0 => motion
                 .poll_interval()
                 .min(deadline.saturating_duration_since(Instant::now())),
             _ => motion.poll_interval(),
         };
+        // A playing background is a third cadence to wake for, on exactly
+        // the same terms: never sleep past its next tick.
+        if app.client_prefs.background_enabled
+            && let Some(background) = app.background.as_ref()
+        {
+            poll_timeout = poll_timeout.min(
+                background
+                    .next_deadline()
+                    .saturating_duration_since(Instant::now()),
+            );
+        }
         if event::poll(poll_timeout)? {
             match event::read()? {
                 Event::Key(key) => {
