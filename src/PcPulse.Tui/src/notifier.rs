@@ -3,8 +3,6 @@ use anyhow::{Context, Result, bail};
 use pcpulse_service::models::{Alert, Severity};
 use std::{
     collections::HashSet,
-    os::windows::process::CommandExt,
-    process::Command,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -15,7 +13,7 @@ use std::{
 use windows::{
     Win32::{
         Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM},
-        System::{LibraryLoader::GetModuleHandleW, Threading::CREATE_NEW_CONSOLE},
+        System::LibraryLoader::GetModuleHandleW,
         UI::{
             Shell::{
                 NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_ERROR, NIIF_INFO, NIIF_WARNING,
@@ -294,9 +292,22 @@ fn open_tui() {
         return;
     };
     path.set_file_name("PcPulse.exe");
-    let _ = Command::new(path)
-        .creation_flags(CREATE_NEW_CONSOLE.0)
-        .spawn();
+    // ShellExecuteW, not Command::spawn: this helper is a GUI process with
+    // no console, and std::process hands its (invalid) stdio handles to the
+    // child — the TUI then draws into nothing while its fresh console sits
+    // blank. An Explorer-style launch gives the console app clean handles.
+    let wide_path = wide(&path.to_string_lossy());
+    unsafe {
+        use windows::Win32::UI::{Shell::ShellExecuteW, WindowsAndMessaging::SW_SHOWNORMAL};
+        ShellExecuteW(
+            None,
+            PCWSTR::null(),
+            PCWSTR(wide_path.as_ptr()),
+            PCWSTR::null(),
+            PCWSTR::null(),
+            SW_SHOWNORMAL,
+        );
+    }
 }
 
 pub fn show_fatal_error(message: &str) -> Result<()> {
