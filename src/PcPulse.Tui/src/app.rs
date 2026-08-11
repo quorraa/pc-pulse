@@ -1133,6 +1133,10 @@ pub struct App {
     /// polls it and drops it the moment the worker reports `Done` or `Failed`,
     /// so `is_some()` is exactly "a conversion is in flight".
     pub convert_rx: Option<Receiver<ConvertEvent>>,
+    /// The source path [`Self::convert_rx`] is converting. Kept beside the
+    /// receiver so a repeated commit of the same path can recognize its own
+    /// conversion instead of starting a rival one over the same cache file.
+    converting: Option<String>,
     pub prefs_store: Option<PrefsStore>,
     /// Smooth-refresh tween state: previous displayed sample, frame clock,
     /// and the session frame governor. Inert while `refresh_fps` is 0.
@@ -1247,6 +1251,7 @@ impl App {
             client_prefs: UiPrefs::default(),
             background: None,
             convert_rx: None,
+            converting: None,
             prefs_store: None,
             smooth: crate::tween::SmoothState::default(),
             needs_terminal_clear: false,
@@ -1433,11 +1438,11 @@ impl App {
                     self.status_is_error = false;
                 }
                 ConvertEvent::Failed(message) => {
-                    self.convert_rx = None;
+                    self.forget_conversion();
                     self.set_error(format!("Background video conversion failed: {message}"));
                 }
                 ConvertEvent::Done(cache) => {
-                    self.convert_rx = None;
+                    self.forget_conversion();
                     if self.load_background(&cache) {
                         self.status = "Background ready".into();
                         self.status_is_error = false;
@@ -1454,12 +1459,28 @@ impl App {
     pub fn start_background_conversion(&mut self) {
         let source = self.client_prefs.background_video.trim().to_string();
         if source.is_empty() {
-            self.convert_rx = None;
+            self.forget_conversion();
             return;
         }
+        // A conversion already running for this exact source is left alone.
+        // A second worker would find the first one's half-written cache
+        // file, report `Done` against it immediately, and hand back a clip
+        // that cannot be opened — while the real worker's later `Done`
+        // landed on a receiver this call had already replaced.
+        if self.converting.as_deref() == Some(source.as_str()) {
+            return;
+        }
+        self.converting = Some(source.clone());
         self.convert_rx = Some(clipconvert::spawn_convert(PathBuf::from(source)));
         self.status = "Converting background…".into();
         self.status_is_error = false;
+    }
+
+    /// Let go of the conversion worker: the receiver and the source it was
+    /// converting always travel together.
+    fn forget_conversion(&mut self) {
+        self.convert_rx = None;
+        self.converting = None;
     }
 
     /// Open a converted clip and hand it the stored playback rate. Returns
@@ -1486,10 +1507,16 @@ impl App {
     /// loads straight away, anything else is converted first. Called at
     /// startup and whenever the path changes.
     fn restore_background(&mut self) {
-        let source = self.client_prefs.background_video.trim();
+        let source = self.client_prefs.background_video.trim().to_string();
         if source.is_empty() {
             self.background = None;
-            self.convert_rx = None;
+            self.forget_conversion();
+            return;
+        }
+        // The running conversion owns the cache file until it reports
+        // `Done`: reading it now would open a half-written clip, so leave
+        // the worker to finish and load from its own event.
+        if self.converting.as_deref() == Some(source.as_str()) {
             return;
         }
         match clipconvert::cache_path(&PathBuf::from(source)) {
@@ -2009,7 +2036,7 @@ impl App {
                 if path.is_empty() {
                     self.client_prefs.background_video.clear();
                     self.background = None;
-                    self.convert_rx = None;
+                    self.forget_conversion();
                     self.mode = InputMode::Normal;
                     self.status = "Background video off · saved for your user".into();
                     self.status_is_error = false;
@@ -2052,13 +2079,16 @@ impl App {
             }
             KeyCode::Enter if field == SettingField::ClientBackgroundFps => {
                 let input = typed.trim();
+                // `0` is the stored "match the clip" sentinel, so it is the
+                // one number that escapes the 1–60 clamp — typing it means
+                // the same as leaving the box empty or writing `auto`.
                 let requested = if input.is_empty() || input.eq_ignore_ascii_case("auto") {
                     Some(0)
                 } else {
-                    input
-                        .parse::<u32>()
-                        .ok()
-                        .map(|fps| fps.clamp(prefs::MIN_BACKGROUND_FPS, prefs::MAX_BACKGROUND_FPS))
+                    input.parse::<u32>().ok().map(|fps| match fps {
+                        0 => 0,
+                        fps => fps.clamp(prefs::MIN_BACKGROUND_FPS, prefs::MAX_BACKGROUND_FPS),
+                    })
                 };
                 match requested {
                     Some(fps) => {
@@ -2350,7 +2380,9 @@ impl App {
                     .map(Background::effective_fps);
                 match (self.client_prefs.background_fps, downshifted) {
                     (0, None) => "auto (matches clip)".into(),
-                    (0, Some(playing)) => format!("auto → {playing} (auto)"),
+                    // Already an automatic rate: the arrow says it moved,
+                    // a second "(auto)" would only repeat the "auto".
+                    (0, Some(playing)) => format!("auto → {playing}"),
                     (asked, None) => asked.to_string(),
                     (asked, Some(playing)) => format!("{asked} → {playing} (auto)"),
                 }
@@ -4735,17 +4767,24 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
-    /// A real `.pulseclip` planted at the cache path of a scratch source
-    /// file. This is what lets the background rows be tested end to end
-    /// without ffmpeg: `spawn_convert` short-circuits straight to `Done`
-    /// when the cache for a source already exists.
-    fn scratch_background(tag: &str, capture_fps: f32) -> std::path::PathBuf {
+    /// A scratch file standing in for a source video. Nothing is cached for
+    /// it, so a conversion started against it stays in flight.
+    fn scratch_source(tag: &str) -> std::path::PathBuf {
         let source = std::env::temp_dir().join(format!(
             "pcpulse-app-bg-{tag}-{}-{}.mp4",
             std::process::id(),
             Utc::now().timestamp_millis()
         ));
         std::fs::write(&source, b"stands in for a video file").unwrap();
+        source
+    }
+
+    /// A real `.pulseclip` planted at the cache path of a scratch source
+    /// file. This is what lets the background rows be tested end to end
+    /// without ffmpeg: `spawn_convert` short-circuits straight to `Done`
+    /// when the cache for a source already exists.
+    fn scratch_background(tag: &str, capture_fps: f32) -> std::path::PathBuf {
+        let source = scratch_source(tag);
         let cache = crate::clipconvert::cache_path(&source).unwrap();
         let mut writer = crate::pulseclip::ClipWriter::create(&cache, 4, 2, capture_fps).unwrap();
         for frame in 0..4u32 {
@@ -4885,10 +4924,12 @@ mod tests {
             "auto (matches clip)"
         );
 
+        // An automatic rate lowered automatically needs no second "(auto)".
         app.background.as_mut().unwrap().downshift();
-        let value = app.setting_value(SettingField::ClientBackgroundFps);
-        assert!(value.contains("(auto)"), "value was {value}");
-        assert!(value.contains("10"), "value was {value}");
+        assert_eq!(
+            app.setting_value(SettingField::ClientBackgroundFps),
+            "auto → 10"
+        );
 
         // An explicit rate clamps, reaches the player, and clears the auto state.
         app.mode = InputMode::EditSetting {
@@ -4901,14 +4942,36 @@ mod tests {
         assert!(!app.background.as_ref().unwrap().is_downshifted());
         assert_eq!(app.setting_value(SettingField::ClientBackgroundFps), "60");
 
+        // A chosen rate the guardrail then lowers reads as `asked → playing (auto)`.
+        app.background.as_mut().unwrap().downshift();
+        assert_eq!(
+            app.setting_value(SettingField::ClientBackgroundFps),
+            "60 → 30 (auto)"
+        );
+
         // Back to auto: the player returns to the clip's own capture rate.
+        // A typed `0` is the sentinel, not a rate to clamp up to 1.
+        app.mode = InputMode::EditSetting {
+            field: SettingField::ClientBackgroundFps,
+            typed: "0".into(),
+        };
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.client_prefs.background_fps, 0);
+        assert_eq!(app.background.as_ref().unwrap().effective_fps(), 20);
+        assert!(!app.background.as_ref().unwrap().is_downshifted());
+        assert_eq!(
+            app.setting_value(SettingField::ClientBackgroundFps),
+            "auto (matches clip)"
+        );
+
+        // `auto` in words reaches the same sentinel.
+        app.client_prefs.background_fps = 30;
         app.mode = InputMode::EditSetting {
             field: SettingField::ClientBackgroundFps,
             typed: "auto".into(),
         };
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(app.client_prefs.background_fps, 0);
-        assert_eq!(app.background.as_ref().unwrap().effective_fps(), 20);
         let _ = std::fs::remove_file(source);
     }
 
@@ -4974,6 +5037,74 @@ mod tests {
         );
         let _ = std::fs::remove_file(source);
         let _ = std::fs::remove_file(prefs_path);
+    }
+
+    #[test]
+    fn a_re_commit_of_the_same_path_leaves_the_running_conversion_alone() {
+        let source = scratch_source("in-flight");
+        let path = source.to_string_lossy().into_owned();
+        let mut app = App::new_inert();
+        app.client_prefs.background_video = path.clone();
+        app.start_background_conversion();
+        let first = app.convert_rx.clone().expect("a conversion is in flight");
+
+        // Committing the same path again must not spawn a rival worker: it
+        // would find the first one's half-written cache file, call it done,
+        // and leave the real worker reporting into a discarded receiver.
+        app.mode = InputMode::EditSetting {
+            field: SettingField::ClientBackgroundVideo,
+            typed: path.clone(),
+        };
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(
+            app.convert_rx
+                .as_ref()
+                .expect("the conversion is still running")
+                .same_channel(&first),
+            "the receiver was replaced"
+        );
+        assert!(app.background.is_none());
+
+        // A genuinely different path does start its own conversion.
+        let other = scratch_source("in-flight-other");
+        app.mode = InputMode::EditSetting {
+            field: SettingField::ClientBackgroundVideo,
+            typed: other.to_string_lossy().into_owned(),
+        };
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(!app.convert_rx.as_ref().unwrap().same_channel(&first));
+        let _ = std::fs::remove_file(source);
+        let _ = std::fs::remove_file(other);
+    }
+
+    #[test]
+    fn auto_fps_mid_conversion_never_opens_the_half_written_cache() {
+        let source = scratch_source("in-flight-cache");
+        let cache = crate::clipconvert::cache_path(&source).unwrap();
+        // Exactly the state the worker leaves while it streams frames: the
+        // cache file exists but is not a readable clip yet. Held here with
+        // a channel of our own so no real worker can race the assertion.
+        std::fs::write(&cache, b"").unwrap();
+        let (_convert_tx, convert_rx) = bounded::<ConvertEvent>(1);
+        let mut app = App::new_inert();
+        app.client_prefs.background_video = source.to_string_lossy().into_owned();
+        app.converting = Some(source.to_string_lossy().into_owned());
+        app.convert_rx = Some(convert_rx);
+
+        app.mode = InputMode::EditSetting {
+            field: SettingField::ClientBackgroundFps,
+            typed: "auto".into(),
+        };
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(app.background.is_none(), "status was {}", app.status);
+        assert!(!app.status_is_error, "status was {}", app.status);
+        assert!(
+            app.convert_rx.is_some(),
+            "the conversion still owns the file"
+        );
+        let _ = std::fs::remove_file(cache);
+        let _ = std::fs::remove_file(source);
     }
 
     #[test]
