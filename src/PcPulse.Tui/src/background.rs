@@ -305,10 +305,23 @@ mod tests {
         out[0]
     }
 
+    /// A clip file of its own for every call.
+    ///
+    /// Naming the file after its arguments alone was a race: two tests
+    /// asking for the same shape wrote the same `.pulseclip.tmp`
+    /// concurrently, and whichever committed second found its temp file
+    /// already moved away — an intermittent "cannot find the file
+    /// specified" that had nothing to do with what either test was checking.
     fn test_clip(frames: u32, fps: f32) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static NONCE: AtomicU32 = AtomicU32::new(0);
         let dir = std::env::temp_dir().join("background-player");
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join(format!("clip-{frames}-{fps}.pulseclip"));
+        let path = dir.join(format!(
+            "clip-{frames}-{fps}-{}-{}.pulseclip",
+            std::process::id(),
+            NONCE.fetch_add(1, Ordering::Relaxed)
+        ));
         let mut w = crate::pulseclip::ClipWriter::create(&path, 4, 2, fps).unwrap();
         for s in 0..frames {
             w.push_frame(&[marker_for(s); 4 * 2 * 3]).unwrap();
@@ -449,7 +462,7 @@ mod tests {
     fn every_loaded_player_gets_its_own_generation() {
         // A render-side cache keyed on the frame index would otherwise serve
         // one clip's frame 7 for another's after a swap.
-        // Distinct clips: `test_clip` names its file after its arguments, and
+        // Distinct clips: every `test_clip` call writes its own file, and
         // the first player holds its own open.
         let first = Background::load(&test_clip(5, 4.0)).unwrap();
         let second = Background::load(&test_clip(6, 4.0)).unwrap();

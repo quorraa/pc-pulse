@@ -14,7 +14,8 @@
 //!
 //! ## What a cache file costs
 //!
-//! Capture size follows the source (see `capture_dims`), so cost does too.
+//! Capture size follows the source and the chosen quality preset (see
+//! `BackgroundQuality` and `capture_dims`), so cost does too.
 //! `pulseclip` quantizes each frame to one byte per pixel and deflates it,
 //! and what that compresses to depends almost entirely on the footage:
 //! measured through this pipeline, **0.05 bytes/pixel** for flat or
@@ -22,10 +23,12 @@
 //! per-pixel film grain — which deflate cannot do anything with — reaching
 //! 0.4.
 //!
-//! In frames, that is 12-39 KB at the 640x360 an SD source keeps and 20-66 KB
-//! at the 825x464 a 1080p source is fitted to. At 60 fps: **1-4 MB per second
-//! of video**, so a 3-minute 60 fps clip is a 200-700 MB cache file, and a
-//! 15 s 30 fps SD clip about 7 MB.
+//! In frames, at the default `High` preset, that is 12-39 KB at the 640x360
+//! an SD source keeps and 20-66 KB at the 825x464 a 1080p source is fitted
+//! to. At 60 fps: **1-4 MB per second of video**, so a 3-minute 60 fps clip
+//! is a 200-700 MB cache file, and a 15 s 30 fps SD clip about 7 MB. Each
+//! step down the preset ladder quarters the pixels and roughly quarters
+//! that; `Ultra` roughly quadruples it.
 //!
 //! Bytes/pixel falls as the capture gets finer — the same footage costs 0.164
 //! at 208x116 and 0.135 at 416x232 — because finer sampling gives deflate
@@ -45,18 +48,77 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
 
-/// The conversion ceiling, not the conversion size. A clip is captured at
-/// its *own* resolution shrunk to fit inside this box with its aspect ratio
-/// intact — never stretched, never magnified. The box is deliberately finer
-/// than any terminal (a full-screen 200x60 window is 200x120 half-cells), so
-/// the renderer always downsamples the clip and averages detail into tone
-/// rather than magnifying a coarse capture into blocks.
+/// How finely a background video is converted, as the person chooses it on
+/// the TUNE page. Each preset is a *ceiling*, not a size: the clip is
+/// captured at its own resolution shrunk to fit inside the box with its
+/// aspect ratio intact — never stretched, never magnified (see
+/// [`capture_dims`]).
 ///
-/// `CAP_H` is even, and so is every height derived from it: the renderer
-/// consumes two vertical pixels per cell, so an odd height would leave a
-/// half-cell row with nothing to sample.
-pub const CAP_W: u16 = 832;
-pub const CAP_H: u16 = 464;
+/// The ladder doubles each axis a step at a time, so each step up is about
+/// four times the pixels and, near enough, four times the disk. `High` is
+/// the default and the size every clip converted before this preset
+/// existed was captured at. Even the smallest preset is finer than most of
+/// the terminal it lands in (a full-screen 200x60 window is 200x120
+/// half-cells), so the renderer keeps averaging detail into tone rather
+/// than magnifying a coarse capture into blocks.
+///
+/// Every cap height is even, and so is every height derived from one: the
+/// renderer consumes two vertical pixels per cell, and an odd height would
+/// leave a half-cell row with nothing to sample.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BackgroundQuality {
+    Low,
+    Medium,
+    #[default]
+    High,
+    Ultra,
+}
+
+impl BackgroundQuality {
+    /// The resolution ceiling this preset converts to, `(width, height)`.
+    pub const fn cap(self) -> (u16, u16) {
+        match self {
+            Self::Low => (208, 116),
+            Self::Medium => (416, 232),
+            Self::High => (832, 464),
+            Self::Ultra => (1248, 702),
+        }
+    }
+
+    /// The stored and displayed name.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Ultra => "ultra",
+        }
+    }
+
+    /// The next preset the TUNE row's Enter lands on; the ladder wraps.
+    pub const fn next(self) -> Self {
+        match self {
+            Self::Low => Self::Medium,
+            Self::Medium => Self::High,
+            Self::High => Self::Ultra,
+            Self::Ultra => Self::Low,
+        }
+    }
+}
+
+impl std::str::FromStr for BackgroundQuality {
+    type Err = ();
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        match text.trim().to_ascii_lowercase().as_str() {
+            "low" => Ok(Self::Low),
+            "medium" => Ok(Self::Medium),
+            "high" => Ok(Self::High),
+            "ultra" => Ok(Self::Ultra),
+            _ => Err(()),
+        }
+    }
+}
 
 /// Windows' own flag: the spawned ffmpeg gets no console window, matching
 /// the `DETACHED_PROCESS`-style spawns elsewhere in this crate.
@@ -109,17 +171,18 @@ pub fn backgrounds_dir() -> Result<PathBuf> {
     }
 }
 
-/// The deterministic cache path for `source`: `{backgrounds_dir}\{hash}.pulseclip`,
-/// keyed on the source path, its mtime, and the resolution *cap* so a changed
-/// file (or a cap change in a future release) reconverts instead of serving a
-/// stale cache.
+/// The deterministic cache path for `source` at `cap`:
+/// `{backgrounds_dir}\{hash}.pulseclip`, keyed on the source path, its
+/// mtime, and the resolution cap in force — so a changed file, or a changed
+/// quality preset, reconverts instead of serving a cache captured at some
+/// other size.
 ///
 /// The cap, not the converted size: the converted size is a pure function of
 /// (source dimensions, cap), and the source's dimensions cannot change
 /// without its mtime changing — which is already in the key. Hashing the cap
 /// is also the only option available here, because callers ask for the cache
 /// path *before* anything has probed the source.
-pub fn cache_path(source: &Path) -> Result<PathBuf> {
+pub fn cache_path(source: &Path, cap: (u16, u16)) -> Result<PathBuf> {
     let metadata = fs::metadata(source)
         .with_context(|| format!("reading metadata for {}", source.display()))?;
     let modified = metadata
@@ -130,7 +193,7 @@ pub fn cache_path(source: &Path) -> Result<PathBuf> {
         .context("source mtime predates the Unix epoch")?
         .as_millis() as u64;
 
-    let hash = cache_key(source, mtime_ms, CAP_W, CAP_H);
+    let hash = cache_key(source, mtime_ms, cap.0, cap.1);
 
     let dir = backgrounds_dir()?;
     fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
@@ -186,9 +249,9 @@ fn is_cache_file(name: &std::ffi::OsStr) -> bool {
 }
 
 /// The cache filename's hash input, kept separate from `cache_path` so the
-/// cap's presence in the key is testable without a filesystem: a release
-/// that changes `CAP_W`/`CAP_H` must land on a different filename, or every
-/// existing cache would be served back at the wrong resolution.
+/// cap's presence in the key is testable without a filesystem: a move to a
+/// different quality preset must land on a different filename, or the cache
+/// written at the old one would be served back at the wrong resolution.
 fn cache_key(source: &Path, mtime_ms: u64, cap_w: u16, cap_h: u16) -> u64 {
     let mut key = Vec::new();
     key.extend_from_slice(source.to_string_lossy().as_bytes());
@@ -211,26 +274,27 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
     hash
 }
 
-/// The capture size for a source of `source_dims`: the source's own
-/// dimensions shrunk to fit inside `CAP_W` x `CAP_H` with the aspect ratio
+/// The capture size for a source of `source_dims` under `cap`: the source's
+/// own dimensions shrunk to fit inside the cap box with the aspect ratio
 /// preserved, **never** enlarged, and always an even height.
 ///
-/// So a 640x360 clip is captured at 640x360 — every pixel it has, no
-/// invented ones — while 1920x1080 is bound by the height and lands at
-/// 825x464. A source whose dimensions the banner didn't reveal falls back to
-/// the full box; that only happens for input ffmpeg is about to fail on
-/// anyway, and a deterministic size keeps the frame boundary well-defined.
+/// So at the `High` cap a 640x360 clip is captured at 640x360 — every pixel
+/// it has, no invented ones — while 1920x1080 is bound by the height and
+/// lands at 825x464. A source whose dimensions the banner didn't reveal
+/// falls back to the full box; that only happens for input ffmpeg is about
+/// to fail on anyway, and a deterministic size keeps the frame boundary
+/// well-defined.
 ///
 /// The height is rounded *down* to even rather than to the nearest, because
 /// rounding up would enlarge the source by a row — the one thing this is not
 /// allowed to do. The single degenerate exception is a source only one pixel
 /// tall, which is floored to zero and then lifted back to the two rows a
 /// half-block cell needs.
-pub fn capture_dims(source_dims: Option<(u32, u32)>) -> (u16, u16) {
-    let cap_w = u32::from(CAP_W);
-    let cap_h = u32::from(CAP_H);
+pub fn capture_dims(source_dims: Option<(u32, u32)>, cap: (u16, u16)) -> (u16, u16) {
+    let cap_w = u32::from(cap.0);
+    let cap_h = u32::from(cap.1);
     let Some((src_w, src_h)) = source_dims.filter(|(w, h)| *w > 0 && *h > 0) else {
-        return (CAP_W, CAP_H);
+        return cap;
     };
     let (width, height) = if src_w <= cap_w && src_h <= cap_h {
         // Already inside the box: keep every pixel the source has.
@@ -398,18 +462,19 @@ fn parse_hms(text: &str) -> Option<f32> {
 }
 
 /// Spawns the detached conversion worker and returns the channel it reports
-/// progress on. If `cache_path(&source)` already exists, the worker sends
-/// `Done` immediately without touching ffmpeg at all.
-pub fn spawn_convert(source: PathBuf) -> Receiver<ConvertEvent> {
+/// progress on. If `cache_path(&source, cap)` already exists, the worker
+/// sends `Done` immediately without touching ffmpeg at all — which is what
+/// makes this the cheap "load what we already have" path as well.
+pub fn spawn_convert(source: PathBuf, cap: (u16, u16)) -> Receiver<ConvertEvent> {
     let (tx, rx) = bounded(16);
     let _ = thread::Builder::new()
         .name("pcpulse-clip-convert".into())
-        .spawn(move || run_convert(&source, &tx));
+        .spawn(move || run_convert(&source, cap, &tx));
     rx
 }
 
-fn run_convert(source: &Path, tx: &Sender<ConvertEvent>) {
-    let cache = match cache_path(source) {
+fn run_convert(source: &Path, cap: (u16, u16), tx: &Sender<ConvertEvent>) {
+    let cache = match cache_path(source, cap) {
         Ok(cache) => cache,
         Err(error) => {
             let _ = tx.send(ConvertEvent::Failed(format!("{error:#}")));
@@ -428,7 +493,7 @@ fn run_convert(source: &Path, tx: &Sender<ConvertEvent>) {
         }
         let _ = fs::remove_file(&cache);
     }
-    if let Err(error) = convert(source, &cache, tx) {
+    if let Err(error) = convert(source, &cache, cap, tx) {
         let _ = tx.send(ConvertEvent::Failed(format!("{error:#}")));
     }
 }
@@ -437,7 +502,7 @@ fn run_convert(source: &Path, tx: &Sender<ConvertEvent>) {
 /// `ClipWriter`. A failure anywhere in here leaves `cache` untouched: the
 /// writer streams into a temp sibling and only moves it into place once
 /// `finish()` has written a complete file.
-fn convert(source: &Path, cache: &Path, tx: &Sender<ConvertEvent>) -> Result<()> {
+fn convert(source: &Path, cache: &Path, cap: (u16, u16), tx: &Sender<ConvertEvent>) -> Result<()> {
     let banner = probe(source)?;
     let Probe {
         fps: capture_fps,
@@ -447,7 +512,7 @@ fn convert(source: &Path, cache: &Path, tx: &Sender<ConvertEvent>) -> Result<()>
     // The capture size is settled here, before a single byte is read: the
     // scale filter, the clip header, and the frame boundary the read loop
     // trusts all come from this one value.
-    let dims = capture_dims(source_dims);
+    let dims = capture_dims(source_dims, cap);
 
     let args = ffmpeg_args(source, capture_fps, dims);
     let mut child = ffmpeg_command()
@@ -569,6 +634,10 @@ mod tests {
         std::env::temp_dir().join(format!("pcpulse-test-backgrounds-{}", std::process::id()))
     }
 
+    /// The default cap, which is what every test that is not about the
+    /// preset ladder itself works at.
+    const HIGH: (u16, u16) = BackgroundQuality::High.cap();
+
     /// A scratch file standing in for a source video.
     fn scratch_source(tag: &str) -> PathBuf {
         let source = std::env::temp_dir().join(format!(
@@ -582,7 +651,7 @@ mod tests {
     #[test]
     fn the_cache_root_is_redirectable_and_never_the_real_profile_in_tests() {
         let source = scratch_source("root");
-        let cache = cache_path(&source).unwrap();
+        let cache = cache_path(&source, HIGH).unwrap();
         assert_eq!(cache.parent().unwrap(), scratch_backgrounds_dir());
         if let Some(local_app_data) = env::var_os("LOCALAPPDATA") {
             assert!(
@@ -600,7 +669,7 @@ mod tests {
         // is keeping, which is only the cache root because `cache_path`
         // puts it there. Pin that.
         let source = scratch_source("parent");
-        let cache = cache_path(&source).unwrap();
+        let cache = cache_path(&source, HIGH).unwrap();
         assert_eq!(cache.parent().unwrap(), backgrounds_dir().unwrap());
         let _ = fs::remove_file(&source);
     }
@@ -644,14 +713,14 @@ mod tests {
     #[test]
     fn a_corrupt_cache_file_is_thrown_away_instead_of_reported_done() {
         let source = scratch_source("corrupt");
-        let cache = cache_path(&source).unwrap();
+        let cache = cache_path(&source, HIGH).unwrap();
         // The 0-byte file an interrupted conversion used to leave at the
         // final path. Trusting `cache.exists()` here reported `Done`
         // instantly and the player failed on it forever.
         fs::write(&cache, b"").unwrap();
 
         let (tx, rx) = bounded(16);
-        run_convert(&source, &tx);
+        run_convert(&source, HIGH, &tx);
         drop(tx);
         let events: Vec<ConvertEvent> = rx.iter().collect();
 
@@ -677,7 +746,7 @@ mod tests {
         ffmpeg_args(
             Path::new(r"C:\videos\my clip (1).mp4"),
             48.0,
-            capture_dims(source_dims),
+            capture_dims(source_dims, HIGH),
         )
         .iter()
         .map(|arg| arg.to_string_lossy().into_owned())
@@ -697,31 +766,31 @@ mod tests {
     fn a_source_inside_the_cap_is_captured_at_its_own_size() {
         // "More HD" must never mean "invented pixels": a 640x360 clip has
         // 640x360 of real detail and gets converted at exactly that.
-        assert_eq!(capture_dims(Some((640, 360))), (640, 360));
+        assert_eq!(capture_dims(Some((640, 360)), HIGH), (640, 360));
         assert!(rendered_args(Some((640, 360))).contains(&"scale=640:360".to_string()));
         // ...including a source that is small on both axes.
-        assert_eq!(capture_dims(Some((320, 180))), (320, 180));
+        assert_eq!(capture_dims(Some((320, 180)), HIGH), (320, 180));
         // ...and one that exactly fills the box.
         assert_eq!(
-            capture_dims(Some((CAP_W.into(), CAP_H.into()))),
-            (CAP_W, CAP_H)
+            capture_dims(Some((u32::from(HIGH.0), u32::from(HIGH.1))), HIGH),
+            HIGH
         );
     }
 
     #[test]
     fn a_1080p_source_is_fitted_inside_the_cap_with_its_aspect_intact() {
         // 1080p is bound by the height: 464/1080 of 1920 is 824.9, so 825.
-        let dims = capture_dims(Some((1920, 1080)));
-        assert_eq!(dims, (825, CAP_H));
+        let dims = capture_dims(Some((1920, 1080)), HIGH);
+        assert_eq!(dims, (825, HIGH.1));
         assert!(rendered_args(Some((1920, 1080))).contains(&"scale=825:464".to_string()));
         // Nothing left the box, and the aspect survived to within a pixel.
-        assert!(dims.0 <= CAP_W && dims.1 <= CAP_H);
+        assert!(dims.0 <= HIGH.0 && dims.1 <= HIGH.1);
         assert!((f64::from(dims.0) / f64::from(dims.1) - 16.0 / 9.0).abs() < 0.002);
 
         // An ultra-wide source binds on the *other* axis instead.
-        let wide = capture_dims(Some((3840, 1080)));
-        assert_eq!(wide, (CAP_W, 234));
-        assert!(wide.0 <= CAP_W && wide.1 <= CAP_H);
+        let wide = capture_dims(Some((3840, 1080)), HIGH);
+        assert_eq!(wide, (HIGH.0, 234));
+        assert!(wide.0 <= HIGH.0 && wide.1 <= HIGH.1);
     }
 
     #[test]
@@ -729,18 +798,18 @@ mod tests {
         // The renderer paints two stacked pixels per cell, so an odd height
         // leaves a half-cell row with nothing to sample. Rounding *down* is
         // the point: rounding up would magnify the source by a row.
-        assert_eq!(CAP_H % 2, 0, "the cap itself must be an even height");
-        assert_eq!(capture_dims(Some((640, 361))), (640, 360));
-        assert_eq!(capture_dims(Some((640, 359))), (640, 358));
+        assert_eq!(HIGH.1 % 2, 0, "the cap itself must be an even height");
+        assert_eq!(capture_dims(Some((640, 361)), HIGH), (640, 360));
+        assert_eq!(capture_dims(Some((640, 359)), HIGH), (640, 358));
         // A *fitted* source whose derived height lands odd: 1000x557 is
         // bound by the width, and 557 * 832/1000 is 463.4, which rounds to
         // the odd 463 and then floors to 462.
-        let dims = capture_dims(Some((1000, 557)));
-        assert_eq!(dims, (CAP_W, 462));
+        let dims = capture_dims(Some((1000, 557)), HIGH);
+        assert_eq!(dims, (HIGH.0, 462));
         assert_eq!(dims.1 % 2, 0);
         // Every derived height is even, whatever the source.
         for height in 1..=2_000_u32 {
-            let (_, out_h) = capture_dims(Some((1920, height)));
+            let (_, out_h) = capture_dims(Some((1920, height)), HIGH);
             assert_eq!(out_h % 2, 0, "odd capture height for source 1920x{height}");
         }
     }
@@ -749,9 +818,84 @@ mod tests {
     fn an_unreadable_source_size_falls_back_to_the_whole_box() {
         // Only reachable for input ffmpeg is about to fail on anyway; what
         // matters is that the frame boundary stays well-defined.
-        assert_eq!(capture_dims(None), (CAP_W, CAP_H));
-        assert_eq!(capture_dims(Some((0, 1080))), (CAP_W, CAP_H));
-        assert_eq!(capture_dims(Some((1920, 0))), (CAP_W, CAP_H));
+        assert_eq!(capture_dims(None, HIGH), HIGH);
+        assert_eq!(capture_dims(Some((0, 1080)), HIGH), HIGH);
+        assert_eq!(capture_dims(Some((1920, 0)), HIGH), HIGH);
+        // ...and it is the *active* cap it falls back to, not a constant.
+        let low = BackgroundQuality::Low.cap();
+        assert_eq!(capture_dims(None, low), low);
+    }
+
+    #[test]
+    fn the_quality_ladder_only_ever_shrinks_what_the_source_already_had() {
+        // Every preset is a ceiling, so a source smaller than the ceiling is
+        // captured whole whichever preset is chosen, and a source larger
+        // than it is fitted inside with the aspect intact.
+        for quality in [
+            BackgroundQuality::Low,
+            BackgroundQuality::Medium,
+            BackgroundQuality::High,
+            BackgroundQuality::Ultra,
+        ] {
+            let cap = quality.cap();
+            assert_eq!(cap.1 % 2, 0, "{} has an odd cap height", quality.name());
+            let fitted = capture_dims(Some((1920, 1080)), cap);
+            assert!(
+                fitted.0 <= cap.0 && fitted.1 <= cap.1,
+                "{} let 1080p out of its box: {fitted:?}",
+                quality.name()
+            );
+            assert_eq!(fitted.1 % 2, 0);
+            assert!((f64::from(fitted.0) / f64::from(fitted.1) - 16.0 / 9.0).abs() < 0.01);
+            // A 200x100 source is inside every cap on the ladder, so no
+            // preset invents a pixel it does not have.
+            assert_eq!(capture_dims(Some((200, 100)), cap), (200, 100));
+        }
+
+        // The named sizes, and the ladder's shape: each step doubles both
+        // axes, so each step is about four times the pixels.
+        assert_eq!(BackgroundQuality::Low.cap(), (208, 116));
+        assert_eq!(BackgroundQuality::Medium.cap(), (416, 232));
+        assert_eq!(BackgroundQuality::High.cap(), (832, 464));
+        assert_eq!(BackgroundQuality::Ultra.cap(), (1248, 702));
+        // `High` is the default, which is what every clip converted before
+        // the preset existed was captured at.
+        assert_eq!(BackgroundQuality::default(), BackgroundQuality::High);
+    }
+
+    #[test]
+    fn the_quality_ladder_cycles_and_round_trips_through_its_name() {
+        let mut quality = BackgroundQuality::Low;
+        let mut walked = Vec::new();
+        for _ in 0..4 {
+            walked.push(quality.name());
+            assert_eq!(quality.name().parse::<BackgroundQuality>(), Ok(quality));
+            quality = quality.next();
+        }
+        assert_eq!(walked, ["low", "medium", "high", "ultra"]);
+        assert_eq!(quality, BackgroundQuality::Low, "the ladder must wrap");
+        // A name from a hand-edited or newer prefs file is not a name here.
+        assert_eq!("cinematic".parse::<BackgroundQuality>(), Err(()));
+    }
+
+    #[test]
+    fn two_qualities_of_one_source_are_two_different_cache_files() {
+        // Nothing about the *file* changed, so only the cap can move the
+        // key — otherwise switching preset would serve back the clip
+        // converted at the previous one.
+        let source = scratch_source("quality-key");
+        let mut seen = Vec::new();
+        for quality in [
+            BackgroundQuality::Low,
+            BackgroundQuality::Medium,
+            BackgroundQuality::High,
+            BackgroundQuality::Ultra,
+        ] {
+            let path = cache_path(&source, quality.cap()).unwrap();
+            assert!(!seen.contains(&path), "{} reused a cache", quality.name());
+            seen.push(path);
+        }
+        let _ = fs::remove_file(&source);
     }
 
     #[test]
@@ -771,7 +915,7 @@ mod tests {
         let probe = parse_probe(banner);
         assert_eq!(probe.source_dims, Some((640, 360)));
         assert_eq!(probe.fps, 30.0);
-        assert_eq!(capture_dims(probe.source_dims), (640, 360));
+        assert_eq!(capture_dims(probe.source_dims, HIGH), (640, 360));
     }
 
     #[test]
@@ -791,7 +935,7 @@ mod tests {
         // without the mtime — already hashed — changing with them.
         let source = Path::new(r"C:\videos\clip.mp4");
         assert_ne!(
-            cache_key(source, 1_700_000_000_000, CAP_W, CAP_H),
+            cache_key(source, 1_700_000_000_000, HIGH.0, HIGH.1),
             cache_key(source, 1_700_000_000_000, 416, 232),
             "the 416x232 caches would have been served back under the new cap"
         );
@@ -804,17 +948,23 @@ mod tests {
             println!("set PCPULSE_CONVERT_SOURCE to a video file");
             return;
         };
+        // `PCPULSE_CONVERT_QUALITY` prices a preset other than the default.
+        let cap = env::var("PCPULSE_CONVERT_QUALITY")
+            .ok()
+            .and_then(|name| name.parse::<BackgroundQuality>().ok())
+            .unwrap_or_default()
+            .cap();
         // `backgrounds_dir` already routes the test binary to `%TEMP%`, so
         // this can never deposit anything in the real profile.
-        let cache = cache_path(&source).unwrap();
+        let cache = cache_path(&source, cap).unwrap();
         let _ = fs::remove_file(&cache);
 
         let banner = probe(&source).unwrap();
         let parsed = parse_probe(&banner);
-        let dims = capture_dims(parsed.source_dims);
+        let dims = capture_dims(parsed.source_dims, cap);
         let started = std::time::Instant::now();
         let (tx, rx) = bounded(1024);
-        run_convert(&source, &tx);
+        run_convert(&source, cap, &tx);
         drop(tx);
         let failure = rx.iter().find_map(|event| match event {
             ConvertEvent::Failed(message) => Some(message),
@@ -853,7 +1003,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let src = dir.join("v.mp4");
         std::fs::write(&src, b"a").unwrap();
-        let first = cache_path(&src).unwrap();
+        let first = cache_path(&src, HIGH).unwrap();
         // Push mtime forward well past filesystem timestamp granularity.
         let later = std::time::SystemTime::now() + std::time::Duration::from_secs(90);
         std::fs::File::options()
@@ -862,7 +1012,7 @@ mod tests {
             .unwrap()
             .set_modified(later)
             .unwrap();
-        let second = cache_path(&src).unwrap();
+        let second = cache_path(&src, HIGH).unwrap();
         assert_ne!(first, second);
         assert!(first.extension().unwrap() == "pulseclip");
         let _ = std::fs::remove_file(&src);

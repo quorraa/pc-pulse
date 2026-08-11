@@ -295,6 +295,7 @@ pub enum SettingField {
     ClientTimeout,
     ClientUpdates,
     ClientBackgroundVideo,
+    ClientBackgroundQuality,
     ClientBackgroundEnabled,
     ClientBackgroundDim,
     ClientBackgroundFps,
@@ -322,13 +323,14 @@ pub enum SettingField {
 impl SettingField {
     /// Local terminal preferences: stored per user in `ui-prefs.json` and
     /// never sent to (or validated by) the collector service.
-    pub const CLIENT: [Self; 9] = [
+    pub const CLIENT: [Self; 10] = [
         Self::ClientTheme,
         Self::ClientEffects,
         Self::ClientRefresh,
         Self::ClientTimeout,
         Self::ClientUpdates,
         Self::ClientBackgroundVideo,
+        Self::ClientBackgroundQuality,
         Self::ClientBackgroundEnabled,
         Self::ClientBackgroundDim,
         Self::ClientBackgroundFps,
@@ -357,13 +359,14 @@ impl SettingField {
         Self::AgentPatterns,
     ];
 
-    pub const ALL: [Self; 28] = [
+    pub const ALL: [Self; 29] = [
         Self::ClientTheme,
         Self::ClientEffects,
         Self::ClientRefresh,
         Self::ClientTimeout,
         Self::ClientUpdates,
         Self::ClientBackgroundVideo,
+        Self::ClientBackgroundQuality,
         Self::ClientBackgroundEnabled,
         Self::ClientBackgroundDim,
         Self::ClientBackgroundFps,
@@ -397,6 +400,7 @@ impl SettingField {
                 | Self::ClientTimeout
                 | Self::ClientUpdates
                 | Self::ClientBackgroundVideo
+                | Self::ClientBackgroundQuality
                 | Self::ClientBackgroundEnabled
                 | Self::ClientBackgroundDim
                 | Self::ClientBackgroundFps
@@ -411,6 +415,7 @@ impl SettingField {
             Self::ClientTimeout => "Oracle time budget",
             Self::ClientUpdates => "Update checks",
             Self::ClientBackgroundVideo => "Background video",
+            Self::ClientBackgroundQuality => "Background quality",
             Self::ClientBackgroundEnabled => "Background",
             Self::ClientBackgroundDim => "Background dim",
             Self::ClientBackgroundFps => "Background fps",
@@ -443,6 +448,7 @@ impl SettingField {
             | Self::ClientRefresh
             | Self::ClientUpdates
             | Self::ClientBackgroundVideo
+            | Self::ClientBackgroundQuality
             | Self::ClientBackgroundEnabled => "local",
             Self::ClientTimeout => "seconds",
             Self::ClientBackgroundDim => "%",
@@ -493,6 +499,9 @@ impl SettingField {
                 "Path to a video file to play, muted and dimmed, behind every page. First use \
                  converts it once with ffmpeg (winget install ffmpeg); afterwards it costs \
                  almost nothing. Enter edits; empty turns it off."
+            }
+            Self::ClientBackgroundQuality => {
+                "How much detail the background video keeps: low, medium, high (the default),                  or ultra. Sharper looks better and costs more disk for the converted clip and                  more CPU while it plays. Enter cycles; each quality is converted once, so                  changing this converts the video again at the new size."
             }
             Self::ClientBackgroundEnabled => {
                 "Whether the converted background video is drawn. Enter toggles; off keeps the \
@@ -597,6 +606,7 @@ impl SettingField {
             | Self::ClientTimeout
             | Self::ClientUpdates
             | Self::ClientBackgroundVideo
+            | Self::ClientBackgroundQuality
             | Self::ClientBackgroundEnabled
             | Self::ClientBackgroundDim
             | Self::ClientBackgroundFps => String::new(),
@@ -635,6 +645,7 @@ impl SettingField {
             | Self::ClientTimeout
             | Self::ClientUpdates
             | Self::ClientBackgroundVideo
+            | Self::ClientBackgroundQuality
             | Self::ClientBackgroundEnabled
             | Self::ClientBackgroundDim
             | Self::ClientBackgroundFps => {
@@ -1141,10 +1152,14 @@ pub struct App {
     /// polls it and drops it the moment the worker reports `Done` or `Failed`,
     /// so `is_some()` is exactly "a conversion is in flight".
     pub convert_rx: Option<Receiver<ConvertEvent>>,
-    /// The source path [`Self::convert_rx`] is converting. Kept beside the
-    /// receiver so a repeated commit of the same path can recognize its own
-    /// conversion instead of starting a rival one over the same cache file.
-    converting: Option<String>,
+    /// The source path *and resolution cap* [`Self::convert_rx`] is
+    /// converting. Kept beside the receiver so a repeated commit of the same
+    /// path can recognize its own conversion instead of starting a rival one
+    /// over the same cache file — and the cap belongs in that key as much as
+    /// the path does: a quality change while the same video is converting
+    /// wants a *different* clip out of a different cache file, and a guard
+    /// that looked only at the path would wave it through as already running.
+    converting: Option<(String, (u16, u16))>,
     /// Collects the cache files a freshly loaded clip supersedes. The real
     /// path is [`clipconvert::sweep_superseded`]; the inert test app
     /// substitutes a no-op, because every test in this binary shares one
@@ -1484,16 +1499,19 @@ impl App {
             self.forget_conversion();
             return;
         }
-        // A conversion already running for this exact source is left alone.
-        // A second worker would find the first one's half-written cache
-        // file, report `Done` against it immediately, and hand back a clip
-        // that cannot be opened — while the real worker's later `Done`
-        // landed on a receiver this call had already replaced.
-        if self.converting.as_deref() == Some(source.as_str()) {
+        let cap = self.client_prefs.background_quality.cap();
+        // A conversion already running for this exact source *at this exact
+        // cap* is left alone. A second worker would find the first one's
+        // half-written cache file, report `Done` against it immediately, and
+        // hand back a clip that cannot be opened — while the real worker's
+        // later `Done` landed on a receiver this call had already replaced.
+        // A different cap is a different cache file, so it is a genuinely
+        // new conversion and gets its own worker.
+        if self.converting.as_ref() == Some(&(source.clone(), cap)) {
             return;
         }
-        self.converting = Some(source.clone());
-        self.convert_rx = Some(clipconvert::spawn_convert(PathBuf::from(source)));
+        self.converting = Some((source.clone(), cap));
+        self.convert_rx = Some(clipconvert::spawn_convert(PathBuf::from(source), cap));
         self.status = "Converting background…".into();
         self.status_is_error = false;
     }
@@ -1540,13 +1558,14 @@ impl App {
             self.forget_conversion();
             return;
         }
+        let cap = self.client_prefs.background_quality.cap();
         // The running conversion owns the cache file until it reports
         // `Done`: reading it now would open a half-written clip, so leave
         // the worker to finish and load from its own event.
-        if self.converting.as_deref() == Some(source.as_str()) {
+        if self.converting.as_ref() == Some(&(source.clone(), cap)) {
             return;
         }
-        let cache = match clipconvert::cache_path(&PathBuf::from(source)) {
+        let cache = match clipconvert::cache_path(&PathBuf::from(source), cap) {
             Ok(cache) => cache,
             Err(error) => {
                 self.set_error(format!("Background video unavailable: {error:#}"));
@@ -2328,6 +2347,28 @@ impl App {
                 self.status_is_error = false;
                 self.persist_client_prefs();
             }
+            // The quality row is a four-position switch: Enter walks the
+            // ladder and persists immediately.
+            SettingField::ClientBackgroundQuality => {
+                let next = self.client_prefs.background_quality.next();
+                self.client_prefs.background_quality = next;
+                let (width, height) = next.cap();
+                self.status = format!(
+                    "Background quality: {} ({width}x{height}) · saved for your user",
+                    next.name()
+                );
+                self.status_is_error = false;
+                self.persist_client_prefs();
+                // A clip converted at the old ceiling is the wrong clip now,
+                // and the cache it came from is keyed on that ceiling — so
+                // drop it and convert at the new one, the same way a changed
+                // path does. The worker short-circuits to `Done` if this
+                // quality has been converted before.
+                if !self.client_prefs.background_video.trim().is_empty() {
+                    self.background = None;
+                    self.start_background_conversion();
+                }
+            }
             // The background switch is a two-position switch like effects;
             // the clip and its conversion survive being switched off.
             SettingField::ClientBackgroundEnabled => {
@@ -2396,6 +2437,13 @@ impl App {
                     "" => "off".into(),
                     path => path.to_string(),
                 }
+            }
+            // Name *and* size: "high" alone says nothing about what it
+            // costs, and the size is the whole difference between the rungs.
+            SettingField::ClientBackgroundQuality => {
+                let quality = self.client_prefs.background_quality;
+                let (width, height) = quality.cap();
+                format!("{} · {width}x{height}", quality.name())
             }
             SettingField::ClientBackgroundEnabled => if self.client_prefs.background_enabled {
                 "on"
@@ -4815,6 +4863,10 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    /// The cap every background fixture is planted at: the default
+    /// quality, which is what a fresh `UiPrefs` asks for.
+    const DEFAULT_CAP: (u16, u16) = crate::clipconvert::BackgroundQuality::High.cap();
+
     /// A scratch source video, plus any `.pulseclip` planted for it, that
     /// deletes itself when the test ends. Under `cfg(test)` the cache root
     /// is a `%TEMP%` directory rather than `%LOCALAPPDATA%\PcPulse\
@@ -4869,7 +4921,7 @@ mod tests {
     /// when the cache for a source already exists and opens.
     fn scratch_background(tag: &str, capture_fps: f32) -> Scratch {
         let mut scratch = scratch_source(tag);
-        let cache = crate::clipconvert::cache_path(&scratch).unwrap();
+        let cache = crate::clipconvert::cache_path(&scratch, DEFAULT_CAP).unwrap();
         let mut writer = crate::pulseclip::ClipWriter::create(&cache, 4, 2, capture_fps).unwrap();
         for frame in 0..4u32 {
             writer.push_frame(&[(frame * 50) as u8; 4 * 2 * 3]).unwrap();
@@ -4894,6 +4946,7 @@ mod tests {
         let fields = app.visible_setting_fields();
         for field in [
             SettingField::ClientBackgroundVideo,
+            SettingField::ClientBackgroundQuality,
             SettingField::ClientBackgroundEnabled,
             SettingField::ClientBackgroundDim,
             SettingField::ClientBackgroundFps,
@@ -4905,8 +4958,19 @@ mod tests {
             let position = fields.iter().position(|row| *row == field).unwrap();
             assert!(position < SettingField::CLIENT.len(), "{field:?} unpinned");
         }
-        assert_eq!(SettingField::CLIENT.len(), 9);
-        assert_eq!(SettingField::ALL.len(), 28);
+        assert_eq!(SettingField::CLIENT.len(), 10);
+        assert_eq!(SettingField::ALL.len(), 29);
+        // The quality row sits between the path and the on/off switch, so
+        // the three rows that describe *the clip* read top to bottom.
+        let row = |field| fields.iter().position(|other| *other == field).unwrap();
+        assert_eq!(
+            row(SettingField::ClientBackgroundQuality),
+            row(SettingField::ClientBackgroundVideo) + 1
+        );
+        assert_eq!(
+            row(SettingField::ClientBackgroundEnabled),
+            row(SettingField::ClientBackgroundQuality) + 1
+        );
     }
 
     #[test]
@@ -4915,7 +4979,7 @@ mod tests {
         let mut app = App::new_inert();
         app.adopt_client_prefs(UiPrefs::default(), Some(store.clone()));
         app.page = Page::Settings;
-        app.setting_state.select(Some(6));
+        app.setting_state.select(Some(7));
         assert!(app.client_prefs.background_enabled);
         assert_eq!(
             app.setting_value(SettingField::ClientBackgroundEnabled),
@@ -4932,6 +4996,127 @@ mod tests {
         assert!(!store.load().background_enabled);
         assert!(matches!(app.mode, InputMode::Normal), "no typed edit opens");
         let _ = std::fs::remove_file(path);
+    }
+
+    /// Puts the TUNE cursor on the quality row and presses Enter.
+    fn cycle_quality(app: &mut App) {
+        app.page = Page::Settings;
+        let row = app
+            .visible_setting_fields()
+            .iter()
+            .position(|field| *field == SettingField::ClientBackgroundQuality)
+            .unwrap();
+        app.setting_state.select(Some(row));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    }
+
+    #[test]
+    fn enter_on_the_quality_row_walks_the_ladder_and_persists() {
+        let (store, path) = scratch_prefs_store("background-quality");
+        let mut app = App::new_inert();
+        app.adopt_client_prefs(UiPrefs::default(), Some(store.clone()));
+        // The default is the size every clip converted before the preset
+        // existed was captured at, and the row shows the size, not just the
+        // name — "high" alone says nothing about what it costs.
+        assert_eq!(
+            app.setting_value(SettingField::ClientBackgroundQuality),
+            "high · 832x464"
+        );
+
+        for expected in [
+            "ultra · 1248x702",
+            "low · 208x116",
+            "medium · 416x232",
+            "high · 832x464",
+        ] {
+            cycle_quality(&mut app);
+            assert_eq!(
+                app.setting_value(SettingField::ClientBackgroundQuality),
+                expected
+            );
+            assert_eq!(
+                store.load().background_quality,
+                app.client_prefs.background_quality
+            );
+            assert!(matches!(app.mode, InputMode::Normal), "no typed edit opens");
+        }
+        // Four presses is a full lap.
+        assert_eq!(
+            app.client_prefs.background_quality,
+            crate::clipconvert::BackgroundQuality::High
+        );
+        assert!(app.status.contains("Background quality: high (832x464)"));
+        assert!(!app.status_is_error);
+        // With no video set there is nothing to reconvert.
+        assert!(app.convert_rx.is_none(), "status was {}", app.status);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_quality_change_drops_the_clip_and_converts_at_the_new_ceiling() {
+        let source = scratch_background("quality-change", 20.0);
+        let mut app = App::new_inert();
+        app.adopt_client_prefs(
+            UiPrefs {
+                background_video: source.to_string_lossy().into_owned(),
+                ..UiPrefs::default()
+            },
+            None,
+        );
+        assert!(app.background.is_some(), "status was {}", app.status);
+
+        cycle_quality(&mut app);
+
+        // The clip on screen was converted at the old ceiling, so it is the
+        // wrong clip now — and the cache it came from is keyed on that
+        // ceiling, so it cannot simply be reopened.
+        assert!(app.background.is_none(), "the old-ceiling clip stayed up");
+        assert!(app.convert_rx.is_some(), "status was {}", app.status);
+        assert_eq!(
+            app.converting.as_ref().map(|(_, cap)| *cap),
+            Some(crate::clipconvert::BackgroundQuality::Ultra.cap()),
+            "the conversion was started at the wrong ceiling"
+        );
+    }
+
+    #[test]
+    fn a_quality_change_mid_conversion_is_not_mistaken_for_the_one_running() {
+        // The in-flight guard used to key on the source path alone. With a
+        // cap in play that is wrong twice over: the running worker is
+        // producing a clip at the *old* ceiling into a *different* cache
+        // file, so waving the change through as "already converting" would
+        // leave the person on a quality they did not ask for, with no way
+        // to ask again short of changing the video.
+        let source = scratch_source("quality-in-flight");
+        let path = source.to_string_lossy().into_owned();
+        let mut app = App::new_inert();
+        app.client_prefs.background_video = path.clone();
+        app.start_background_conversion();
+        let first = app.convert_rx.clone().expect("a conversion is in flight");
+        assert_eq!(
+            app.converting,
+            Some((
+                path.clone(),
+                crate::clipconvert::BackgroundQuality::High.cap()
+            ))
+        );
+
+        cycle_quality(&mut app);
+
+        assert!(
+            !app.convert_rx.as_ref().unwrap().same_channel(&first),
+            "the quality change was swallowed by the running conversion"
+        );
+        assert_eq!(
+            app.converting,
+            Some((path, crate::clipconvert::BackgroundQuality::Ultra.cap()))
+        );
+
+        // ...while the *same* quality re-requested against the same source
+        // still recognizes its own worker and leaves it alone.
+        let running = app.convert_rx.clone().unwrap();
+        app.start_background_conversion();
+        assert!(app.convert_rx.as_ref().unwrap().same_channel(&running));
     }
 
     #[test]
@@ -5216,7 +5401,7 @@ mod tests {
     #[test]
     fn auto_fps_mid_conversion_never_opens_the_half_written_cache() {
         let source = scratch_source("in-flight-cache");
-        let cache = crate::clipconvert::cache_path(&source).unwrap();
+        let cache = crate::clipconvert::cache_path(&source, DEFAULT_CAP).unwrap();
         // Exactly the state the worker leaves while it streams frames: the
         // cache file exists but is not a readable clip yet. Held here with
         // a channel of our own so no real worker can race the assertion.
@@ -5224,7 +5409,7 @@ mod tests {
         let (_convert_tx, convert_rx) = bounded::<ConvertEvent>(1);
         let mut app = App::new_inert();
         app.client_prefs.background_video = source.to_string_lossy().into_owned();
-        app.converting = Some(source.to_string_lossy().into_owned());
+        app.converting = Some((source.to_string_lossy().into_owned(), DEFAULT_CAP));
         app.convert_rx = Some(convert_rx);
 
         app.mode = InputMode::EditSetting {
@@ -5245,7 +5430,7 @@ mod tests {
     #[test]
     fn a_corrupt_cache_file_reconverts_instead_of_stranding_the_background() {
         let source = scratch_source("corrupt-cache");
-        let cache = crate::clipconvert::cache_path(&source).unwrap();
+        let cache = crate::clipconvert::cache_path(&source, DEFAULT_CAP).unwrap();
         // What an interrupted conversion used to leave behind: a file at the
         // final cache path that no reader can open. Restoring used to report
         // a load error and stop, and every later commit of the same path

@@ -10,6 +10,7 @@
 //! values for one run via [`UiPrefs::overridden`] without rewriting the file;
 //! only an explicit in-app choice (`t`, `m`, or a TUNE edit) persists.
 
+use crate::clipconvert::BackgroundQuality;
 use crate::theme::ThemeId;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -79,6 +80,12 @@ pub struct UiPrefs {
     /// Playback rate for the background video, in frames per second; `0`
     /// means "use the clip's own capture fps" instead of a fixed rate.
     pub background_fps: u32,
+    /// How finely the background video is converted. Files written before
+    /// this preference existed carry no field and land on the default,
+    /// `High` — which is exactly the size those releases converted at, so
+    /// an upgrade never invalidates a cache on its own.
+    #[serde(with = "quality_name")]
+    pub background_quality: BackgroundQuality,
 }
 
 impl Default for UiPrefs {
@@ -94,6 +101,7 @@ impl Default for UiPrefs {
             background_enabled: true,
             background_dim: DEFAULT_BACKGROUND_DIM,
             background_fps: 0,
+            background_quality: BackgroundQuality::High,
         }
     }
 }
@@ -143,6 +151,29 @@ mod theme_name {
     pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<ThemeId, D::Error> {
         let name = String::deserialize(deserializer)?;
         Ok(name.parse().unwrap_or(ThemeId::Vitals))
+    }
+}
+
+/// Quality presets travel as their displayed names (`"low"` / `"medium"` /
+/// `"high"` / `"ultra"`). An unrecognized name — a typo, or a preset from a
+/// newer release — degrades to the default rather than poisoning the whole
+/// document.
+mod quality_name {
+    use crate::clipconvert::BackgroundQuality;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(
+        quality: &BackgroundQuality,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(quality.name())
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<BackgroundQuality, D::Error> {
+        let name = String::deserialize(deserializer)?;
+        Ok(name.parse().unwrap_or_default())
     }
 }
 
@@ -232,6 +263,7 @@ mod tests {
             background_enabled: false,
             background_dim: 45,
             background_fps: 24,
+            background_quality: BackgroundQuality::Ultra,
         };
         store.save(&prefs).unwrap();
         assert_eq!(store.load(), prefs);
@@ -245,6 +277,7 @@ mod tests {
         assert!(raw.contains("backgroundEnabled"));
         assert!(raw.contains("backgroundDim"));
         assert!(raw.contains("backgroundFps"));
+        assert!(raw.contains("\"backgroundQuality\": \"ultra\""));
         let _ = fs::remove_file(path);
     }
 
@@ -382,6 +415,43 @@ mod tests {
         assert_eq!(prefs.background_dim, 30);
         assert_eq!(prefs.background_fps, 0);
         assert_eq!(prefs.theme, ThemeId::Ledger); // untouched fields survive
+    }
+
+    #[test]
+    fn pre_quality_prefs_files_land_on_high_and_a_bad_name_degrades() {
+        // High is the size every release before the preset converted at, so
+        // an upgrade must not silently reconvert everyone's clip.
+        let (store, path) = scratch_store("quality");
+        fs::write(&path, br#"{ "theme": "vitals", "backgroundFps": 24 }"#).unwrap();
+        let prefs = store.load();
+        assert_eq!(prefs.background_quality, BackgroundQuality::High);
+        assert_eq!(prefs.background_fps, 24, "the rest of the file parsed");
+        // A name from a hand edit or a newer release degrades to the
+        // default instead of failing the whole document.
+        fs::write(
+            &path,
+            br#"{ "backgroundQuality": "cinematic", "backgroundDim": 45 }"#,
+        )
+        .unwrap();
+        let prefs = store.load();
+        assert_eq!(prefs.background_quality, BackgroundQuality::High);
+        assert_eq!(prefs.background_dim, 45, "the rest of the file survived");
+        // Every preset round-trips through disk under its own name.
+        for quality in [
+            BackgroundQuality::Low,
+            BackgroundQuality::Medium,
+            BackgroundQuality::High,
+            BackgroundQuality::Ultra,
+        ] {
+            store
+                .save(&UiPrefs {
+                    background_quality: quality,
+                    ..UiPrefs::default()
+                })
+                .unwrap();
+            assert_eq!(store.load().background_quality, quality);
+        }
+        let _ = fs::remove_file(path);
     }
 
     #[test]
