@@ -436,6 +436,17 @@ mod tests {
         let prefs = store.load();
         assert_eq!(prefs.background_quality, BackgroundQuality::High);
         assert_eq!(prefs.background_dim, 45, "the rest of the file survived");
+        // An empty string is not a name either, and it is the one bad value
+        // worth naming: a file that has round-tripped through a build with
+        // no such field comes back missing the key, and anything that
+        // writes a placeholder writes this. Both degrade, neither throws.
+        fs::write(
+            &path,
+            br#"{ "backgroundQuality": "", "backgroundDim": 45 }"#,
+        )
+        .unwrap();
+        assert_eq!(store.load().background_quality, BackgroundQuality::High);
+        assert_eq!(store.load().background_dim, 45);
         // Every preset round-trips through disk under its own name.
         for quality in [
             BackgroundQuality::Low,
@@ -450,7 +461,32 @@ mod tests {
                 })
                 .unwrap();
             assert_eq!(store.load().background_quality, quality);
+            assert!(
+                fs::read_to_string(&path)
+                    .unwrap()
+                    .contains(&format!("\"backgroundQuality\": \"{}\"", quality.name())),
+                "{} did not reach disk as its own name",
+                quality.name()
+            );
         }
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn the_default_quality_reaches_disk_as_high_not_as_a_placeholder() {
+        // A fresh install's very first save. The name is what the field is
+        // worth on disk: a blank or absent value only survives because the
+        // loader degrades it, and leaning on that is how a preference
+        // quietly stops being a preference.
+        let (store, path) = scratch_store("quality-default");
+        store.save(&UiPrefs::default()).unwrap();
+        let raw = fs::read_to_string(&path).unwrap();
+        assert!(
+            raw.contains("\"backgroundQuality\": \"high\""),
+            "the default quality was not written as its name: {raw}"
+        );
+        assert!(!raw.contains("\"backgroundQuality\": \"\""));
+        assert_eq!(store.load(), UiPrefs::default());
         let _ = fs::remove_file(path);
     }
 

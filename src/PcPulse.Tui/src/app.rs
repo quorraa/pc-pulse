@@ -61,6 +61,10 @@ const DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(400);
 /// already speaking?" is a check against the real string rather than a
 /// second copy of it that could drift.
 const CONVERTING_STATUS: &str = "Converting background…";
+/// The status line the Explorer file dialog owns while it is on screen.
+/// Shared for the same reason, and because it is the *only* line a
+/// redundant conversion request is allowed to replace.
+const CHOOSING_STATUS: &str = "Choosing a video…";
 static CHAT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 fn new_conversation_id() -> String {
@@ -1536,7 +1540,7 @@ impl App {
     /// the test makes itself.
     pub(crate) fn adopt_file_pick(&mut self, receiver: Receiver<PickEvent>) {
         self.pick_rx = Some(receiver);
-        self.status = "Choosing a video…".into();
+        self.status = CHOOSING_STATUS.into();
         self.status_is_error = false;
     }
 
@@ -1610,13 +1614,15 @@ impl App {
         // A different cap is a different cache file, so it is a genuinely
         // new conversion and gets its own worker.
         if self.converting.as_ref() == Some(&(source.clone(), cap)) {
-            // Nothing starts, but the caller may be standing behind a
-            // status line that only a *starting* conversion would ever have
-            // cleared — the file dialog's "Choosing a video…" outlives this
-            // no-op otherwise, and sits there until something unrelated
-            // speaks. Say what is actually happening, without stepping on a
-            // percentage the running worker has already reported.
-            if !self.status.starts_with(CONVERTING_STATUS) {
+            // Nothing starts, so nothing has happened worth announcing —
+            // with one exception. The file dialog's own line is put up by a
+            // picker and taken down by whatever the answer causes; an
+            // answer that lands here causes nothing, so it would sit there
+            // until something unrelated spoke. Replace exactly that line
+            // and nothing else: an error the person is still reading, an
+            // update notice, or a percentage the running worker already
+            // reported are all none of this call's business.
+            if self.status == CHOOSING_STATUS {
                 self.status = CONVERTING_STATUS.into();
                 self.status_is_error = false;
             }
@@ -5318,6 +5324,22 @@ mod tests {
         app.status = "Converting background… 47%".into();
         app.start_background_conversion();
         assert_eq!(app.status, "Converting background… 47%");
+
+        // Nor is anything else. A redundant request replaces the dialog's
+        // own line, because only it is stranded by the no-op — an error the
+        // person is still reading is not this call's to discard.
+        app.set_error("Failed to copy the answer to the clipboard".into());
+        app.start_background_conversion();
+        assert_eq!(app.status, "Failed to copy the answer to the clipboard");
+        assert!(app.status_is_error, "an error was silently downgraded");
+
+        app.status = "PC Pulse v9.9.9 is available — press u to download".into();
+        app.status_is_error = false;
+        app.start_background_conversion();
+        assert_eq!(
+            app.status,
+            "PC Pulse v9.9.9 is available — press u to download"
+        );
     }
 
     #[test]
