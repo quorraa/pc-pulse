@@ -779,8 +779,12 @@ pub enum WorkerCommand {
 // `Result<_, String>` payloads on this background worker->UI channel. Each
 // event is a single owned value passed once per poll, not a hot allocation
 // path, so boxing every other variant to shrink the enum buys nothing;
-// boxing just `Snapshot` would only relocate the same bytes onto the heap
-// and touch every match site below for no behavioral change.
+// boxing just `Snapshot` would only relocate the same bytes onto the heap.
+// The real cost of that box is 9 sites, all here in app.rs and none in
+// ui.rs: 7 constructions (the worker thread plus 6 test fixtures) and 2
+// match arms in `drain_events`. Suppressing the lint here was cheaper than
+// threading `Box::new`/deref through those 9 sites for no behavioral
+// change; revisit if the enum grows further variants this size.
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum WorkerEvent {

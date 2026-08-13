@@ -12,10 +12,15 @@
 //! other groups from being probed.
 //!
 //! [`InventorySampler`] runs the probe once at construction (with one
-//! bounded retry for a cold WMI service) and caches the result for the
-//! process lifetime; `collect()` re-probes at most once a day via a plain
-//! timestamp check, so hardware changes without a service restart still
-//! surface eventually without spending WMI round-trips on every sample.
+//! bounded retry against the already-connected probe, covering a
+//! momentarily busy provider — not a failed namespace connection, which is
+//! sticky for the process lifetime; see `InventorySampler::with_probe`) and
+//! caches the result for the process lifetime; `collect()` re-probes at
+//! most once a day via a plain timestamp check, so hardware changes
+//! without a service restart still surface eventually without spending
+//! WMI round-trips on every sample. A re-probe merges per group rather
+//! than replacing wholesale, so a transient failure never turns a
+//! previously-observed real reading into "unavailable".
 
 use crate::models::{
     BiosInventory, CpuInventory, GpuInventory, HardwareInventory, InventoryGroup, MemoryInventory,
@@ -85,11 +90,20 @@ impl Default for InventorySampler<WmiInventoryProbe> {
 impl<P: InventoryProbe> InventorySampler<P> {
     pub(crate) fn with_probe(probe: P) -> Self {
         let mut cached = probe.collect();
-        // One bounded retry: a cold WMI service (first query moments after
-        // boot, COM apartment still warming up) can fail transiently even
-        // on a machine that genuinely has every group available. A single
+        // One bounded retry against the already-connected probe: a
+        // provider that is momentarily busy (first ExecQuery moments after
+        // boot, WMI service still warming up) can fail transiently even on
+        // a machine that genuinely has every group available. A single
         // immediate retry catches that without looping or blocking the
         // startup path indefinitely.
+        //
+        // This does NOT retry the namespace CONNECTION itself —
+        // `InventoryProbe::collect` takes `&self`, so for `WmiInventoryProbe`
+        // the `ConnectServer` calls already happened once in `new()` and
+        // their result (success or sticky failure) is fixed for the
+        // process lifetime. A `ConnectServer` failure at boot (e.g. the WMI
+        // service itself isn't up yet) is therefore not covered by this
+        // retry; only per-query failures against a live connection are.
         if Self::fully_unavailable(&cached) {
             cached = probe.collect();
         }
@@ -112,12 +126,54 @@ impl<P: InventoryProbe> InventorySampler<P> {
     /// The cached inventory. Re-probes at most once a day; every other
     /// call is a clone of the cache, so this never delays the sampling
     /// loop.
+    ///
+    /// A re-probe merges per group rather than replacing wholesale: static
+    /// hardware truth (the CPU model, the disks that exist, …) does not
+    /// stop being true because one re-probe hit a transient WMI hiccup, so
+    /// a group that goes from present to unavailable keeps its last-known
+    /// value with an annotated detail instead of blanking a real reading
+    /// with "fresh but empty". A group that stays present (or newly
+    /// becomes present) is refreshed from the new probe.
     pub fn collect(&mut self) -> HardwareInventory {
         if self.last_probe.elapsed() >= REPROBE_INTERVAL {
-            self.cached = self.probe.collect();
+            let fresh = self.probe.collect();
+            self.cached = HardwareInventory {
+                cpu: retain_on_failure(&self.cached.cpu, fresh.cpu),
+                system: retain_on_failure(&self.cached.system, fresh.system),
+                bios: retain_on_failure(&self.cached.bios, fresh.bios),
+                memory: retain_on_failure(&self.cached.memory, fresh.memory),
+                storage: retain_on_failure(&self.cached.storage, fresh.storage),
+                gpus: retain_on_failure(&self.cached.gpus, fresh.gpus),
+                collected_at_ms: fresh.collected_at_ms,
+            };
             self.last_probe = Instant::now();
         }
         self.cached.clone()
+    }
+}
+
+/// One group's re-probe outcome, merged against what was previously
+/// cached. A successful `fresh` group always wins (refresh). A failed
+/// `fresh` group keeps `previous`'s value when it had one, so a transient
+/// re-probe failure can never turn real, previously-observed hardware into
+/// "unavailable" — only a group that was never successfully probed stays
+/// unavailable.
+fn retain_on_failure<T: Clone>(
+    previous: &InventoryGroup<T>,
+    fresh: InventoryGroup<T>,
+) -> InventoryGroup<T> {
+    if fresh.value.is_some() {
+        return fresh;
+    }
+    match &previous.value {
+        Some(value) => InventoryGroup {
+            value: Some(value.clone()),
+            detail: format!(
+                "retained from previous probe; latest re-probe failed: {}",
+                fresh.detail
+            ),
+        },
+        None => fresh,
     }
 }
 
@@ -709,6 +765,182 @@ mod tests {
         let third = sampler.collect();
         assert_eq!(sampler.probe.calls.get(), 2);
         assert_eq!(third, first);
+    }
+
+    /// Returns a canned result on each call, advancing through `results` and
+    /// holding on the last entry once exhausted — lets a test script a
+    /// "good first probe, then a re-probe that fails or partially fails"
+    /// sequence.
+    struct SequencedStub {
+        results: Vec<HardwareInventory>,
+        calls: std::cell::Cell<usize>,
+    }
+    impl InventoryProbe for SequencedStub {
+        fn collect(&self) -> HardwareInventory {
+            let index = self.calls.get().min(self.results.len() - 1);
+            self.calls.set(self.calls.get() + 1);
+            self.results[index].clone()
+        }
+    }
+
+    fn fully_healthy_inventory(collected_at_ms: i64) -> HardwareInventory {
+        HardwareInventory {
+            cpu: InventoryGroup::present(CpuInventory {
+                manufacturer: "GenuineIntel".into(),
+                brand: "Intel Core i7".into(),
+                physical_cores: 8,
+                logical_processors: 16,
+                base_clock_mhz: Some(2600),
+                max_clock_mhz: Some(4800),
+            }),
+            system: InventoryGroup::present(SystemInventory {
+                manufacturer: "Dell Inc.".into(),
+                model: "XPS 15".into(),
+            }),
+            bios: InventoryGroup::present(BiosInventory {
+                version: "1.2.3".into(),
+                release_date: Some("20240101000000.000000+000".into()),
+            }),
+            memory: InventoryGroup::present(MemoryInventory {
+                installed_bytes: 32 * 1024 * 1024 * 1024,
+                module_count: 2,
+                speed_mts: Some(4800),
+            }),
+            storage: InventoryGroup::present(vec![StorageDevice {
+                model: "Samsung 990 Pro".into(),
+                size_bytes: 2_000_000_000_000,
+                bus_type: "NVMe".into(),
+                media_type: "ssd".into(),
+            }]),
+            gpus: InventoryGroup::present(vec![GpuInventory {
+                name: "NVIDIA GeForce RTX 4080".into(),
+                vendor: "NVIDIA".into(),
+                driver_version: Some("560.94".into()),
+                vram_bytes: Some(16 * 1024 * 1024 * 1024),
+            }]),
+            collected_at_ms,
+        }
+    }
+
+    #[test]
+    fn a_failed_reprobe_retains_every_previously_good_group_with_an_annotation() {
+        let sampler_probe = SequencedStub {
+            results: vec![
+                fully_healthy_inventory(1_000),
+                HardwareInventory {
+                    cpu: InventoryGroup::unavailable("WMI transient failure"),
+                    system: InventoryGroup::unavailable("WMI transient failure"),
+                    bios: InventoryGroup::unavailable("WMI transient failure"),
+                    memory: InventoryGroup::unavailable("WMI transient failure"),
+                    storage: InventoryGroup::unavailable("WMI transient failure"),
+                    gpus: InventoryGroup::unavailable("WMI transient failure"),
+                    collected_at_ms: 2_000,
+                },
+            ],
+            calls: std::cell::Cell::new(0),
+        };
+        let mut sampler = InventorySampler::with_probe(sampler_probe);
+        let first = sampler.collect();
+        assert_eq!(first.cpu.value.as_ref().unwrap().brand, "Intel Core i7");
+
+        // Force the daily re-probe, which the stub answers with every
+        // group failed.
+        sampler.last_probe = Instant::now() - Duration::from_secs(25 * 60 * 60);
+        let after_failed_reprobe = sampler.collect();
+
+        // Every group keeps its real, previously-observed value — a
+        // transient re-probe failure must never turn a genuine reading
+        // into "unavailable".
+        assert_eq!(
+            after_failed_reprobe.cpu.value.as_ref().unwrap().brand,
+            "Intel Core i7"
+        );
+        assert_eq!(
+            after_failed_reprobe.storage.value.as_ref().unwrap()[0].model,
+            "Samsung 990 Pro"
+        );
+        assert_eq!(
+            after_failed_reprobe.gpus.value.as_ref().unwrap()[0].name,
+            "NVIDIA GeForce RTX 4080"
+        );
+        // …but the detail is annotated so a reader can tell the data is
+        // stale rather than freshly confirmed.
+        for detail in [
+            &after_failed_reprobe.cpu.detail,
+            &after_failed_reprobe.system.detail,
+            &after_failed_reprobe.bios.detail,
+            &after_failed_reprobe.memory.detail,
+            &after_failed_reprobe.storage.detail,
+            &after_failed_reprobe.gpus.detail,
+        ] {
+            assert!(detail.contains("retained from previous probe"), "{detail}");
+            assert!(detail.contains("WMI transient failure"), "{detail}");
+        }
+    }
+
+    #[test]
+    fn a_partially_failed_reprobe_refreshes_the_healthy_groups_and_retains_the_rest() {
+        let mut degraded = fully_healthy_inventory(2_000);
+        // CPU and GPUs come back fresh (and different, to prove a refresh
+        // actually happened rather than accidentally matching the retained
+        // value); everything else fails this re-probe and must be
+        // retained from the first, fully-healthy pass.
+        degraded.cpu = InventoryGroup::present(CpuInventory {
+            manufacturer: "GenuineIntel".into(),
+            brand: "Intel Core i9 (refreshed)".into(),
+            physical_cores: 8,
+            logical_processors: 16,
+            base_clock_mhz: Some(3200),
+            max_clock_mhz: Some(5600),
+        });
+        degraded.system = InventoryGroup::unavailable("WMI transient failure");
+        degraded.bios = InventoryGroup::unavailable("WMI transient failure");
+        degraded.memory = InventoryGroup::unavailable("WMI transient failure");
+        degraded.storage = InventoryGroup::unavailable("WMI transient failure");
+
+        let sampler_probe = SequencedStub {
+            results: vec![fully_healthy_inventory(1_000), degraded],
+            calls: std::cell::Cell::new(0),
+        };
+        let mut sampler = InventorySampler::with_probe(sampler_probe);
+        let first = sampler.collect();
+        assert_eq!(first.cpu.value.as_ref().unwrap().brand, "Intel Core i7");
+
+        sampler.last_probe = Instant::now() - Duration::from_secs(25 * 60 * 60);
+        let after_partial_reprobe = sampler.collect();
+
+        // The groups the re-probe actually answered are refreshed…
+        assert_eq!(
+            after_partial_reprobe.cpu.value.as_ref().unwrap().brand,
+            "Intel Core i9 (refreshed)"
+        );
+        assert!(after_partial_reprobe.cpu.detail.is_empty());
+        assert_eq!(
+            after_partial_reprobe.gpus.value.as_ref().unwrap()[0].name,
+            "NVIDIA GeForce RTX 4080"
+        );
+        // …while the groups that failed this pass keep their previously
+        // observed values, annotated as stale rather than reported empty.
+        assert_eq!(
+            after_partial_reprobe.system.value.as_ref().unwrap().model,
+            "XPS 15"
+        );
+        assert!(
+            after_partial_reprobe
+                .system
+                .detail
+                .contains("retained from previous probe")
+        );
+        assert_eq!(
+            after_partial_reprobe.storage.value.as_ref().unwrap()[0].model,
+            "Samsung 990 Pro"
+        );
+        assert!(
+            after_partial_reprobe
+                .storage
+                .detail
+                .contains("retained from previous probe")
+        );
     }
 
     #[test]
