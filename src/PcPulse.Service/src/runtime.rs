@@ -420,15 +420,28 @@ fn sampling_loop(state: &Arc<AppState>, stop: crossbeam_channel::Receiver<()>) -
             baseline_maturity: baselines.machine.maturity(timestamp_ms),
             names: Some(&baselines),
         };
-        let mut evaluation = state
-            .alerts
-            .lock()
-            .map_err(|_| anyhow!("alert lock poisoned"))?
-            .evaluate(&system, &processes, &settings, calibration);
+        let (mut evaluation, quarantine) = {
+            let mut engine = state
+                .alerts
+                .lock()
+                .map_err(|_| anyhow!("alert lock poisoned"))?;
+            let evaluation = engine.evaluate(&system, &processes, &settings, calibration);
+            // Which instances must not be folded into their own name's norm
+            // this sample. Read under the same lock as the evaluation that
+            // decided it, and small enough (bounded by the growth watch list)
+            // to copy rather than hold the lock across the baseline update.
+            let quarantine = engine.self_training_quarantine().clone();
+            (evaluation, quarantine)
+        };
         baselines
             .machine
             .observe(&system, processes.len(), timestamp_ms);
         for process in &processes {
+            // A confirmed leak does not get to teach this machine that its own
+            // leaking is normal for its executable name.
+            if quarantine.contains(&(process.pid, process.started_at_ms)) {
+                continue;
+            }
             baselines.observe_process(process, timestamp_ms);
         }
         forensics.observe(&evaluation.active, timestamp_ms);
