@@ -1326,11 +1326,14 @@ fn render_rail_keys(frame: &mut Frame<'_>, app: &App, area: Rect) {
     // status line. The rail's size floor guarantees slack below the nine
     // bezel keys; each badge only claims a row when one remains above the
     // key list, so chrome degrades quietly rather than overlapping it.
+    // Learning goes first (bottom-most, so it wins the one row that's
+    // always available) — it's ephemeral and the reason this chrome
+    // exists, while the update badge also has other visible surfaces.
     let badges: Vec<String> = [learning_badge_text(app, true), update_badge_text(app, true)]
         .into_iter()
         .flatten()
         .collect();
-    for (offset, badge) in badges.iter().rev().enumerate() {
+    for (offset, badge) in badges.iter().enumerate() {
         let Some(row_y) = area.bottom().checked_sub(1 + offset as u16) else {
             break;
         };
@@ -1542,6 +1545,52 @@ fn update_badge_text(app: &App, compact: bool) -> Option<String> {
     Some(format!("⇡ v{version}{suffix}"))
 }
 
+/// Decide which of the two header badges to actually print given the width
+/// already spent by fixed chrome (`core_width`, e.g. the link/version text)
+/// that must never be clipped. `separator_width` is how many extra columns
+/// each visible badge costs beyond its own text (the spacer/dot around it),
+/// counted the same way at every call site so the budget matches what's
+/// actually rendered.
+///
+/// Learning outranks the update badge throughout — it's ephemeral and is
+/// the reason this chrome exists, while the update badge has other visible
+/// surfaces (it prints in all three profiles independently). The degrade
+/// ladder tried in order: both badges at full size, then the learning
+/// badge compacted to its short glyph form (still alongside update), then
+/// the update badge dropped entirely (compact learning only), then both
+/// dropped. Whole badges are added or removed — never a partial/truncated
+/// badge — and the fixed core text is never touched, so ratatui's
+/// edge-of-area clipping never gets a chance to cut a token in half.
+fn fit_header_badges(
+    learning_full: Option<String>,
+    learning_compact: Option<String>,
+    update: Option<String>,
+    available_width: usize,
+    core_width: usize,
+    separator_width: usize,
+) -> (Option<String>, Option<String>) {
+    let budget = available_width.saturating_sub(core_width);
+
+    let fits = |learning: &Option<String>, update: &Option<String>| -> bool {
+        let width: usize = [learning, update]
+            .into_iter()
+            .filter_map(|badge| badge.as_ref())
+            .map(|text| text.chars().count() + separator_width)
+            .sum();
+        width <= budget
+    };
+
+    if fits(&learning_full, &update) {
+        (learning_full, update)
+    } else if fits(&learning_compact, &update) {
+        (learning_compact, update)
+    } else if fits(&learning_compact, &None) {
+        (learning_compact, None)
+    } else {
+        (None, None)
+    }
+}
+
 /// The chrome learning badge: persistent, unobtrusive, present in all three
 /// profiles for as long as the snapshot reports the machine baseline is
 /// still young. It mirrors `update_badge_text`'s placement so the operator
@@ -1648,14 +1697,26 @@ fn render_header(frame: &mut Frame<'_>, app: &App, area: Rect) {
     } else {
         "awaiting first telemetry frame".into()
     };
+    // The core line (link state, alert count, version) must never be
+    // clipped, so decide which badges fit *before* building the spans
+    // rather than letting ratatui's edge-of-area clipping cut into it.
+    let core_text = format!("♥ {status}   ⚑ {active} OPEN   v{version} ");
+    let (learning_badge, update_badge) = fit_header_badges(
+        learning_badge_text(app, false),
+        learning_badge_text(app, true),
+        update_badge_text(app, true),
+        usize::from(top[1].width),
+        core_text.chars().count(),
+        3,
+    );
     let mut header_right = Vec::new();
-    if let Some(badge) = learning_badge_text(app, false) {
+    if let Some(badge) = learning_badge {
         header_right.push(Span::styled(
             format!("{badge}   "),
             Style::default().fg(palette().info).bold(),
         ));
     }
-    if let Some(badge) = update_badge_text(app, true) {
+    if let Some(badge) = update_badge {
         header_right.push(Span::styled(
             format!("{badge}   "),
             Style::default().fg(palette().info).bold(),
@@ -1897,41 +1958,51 @@ fn render_masthead(frame: &mut Frame<'_>, app: &App, area: Rect) {
     } else {
         ("SIGNAL LOST", palette().crit)
     };
-    let mut dateline = vec![Span::styled(link, Style::default().fg(link_color).bold())];
-    if let Some(snapshot) = &app.snapshot {
+    let telemetry_text = if let Some(snapshot) = &app.snapshot {
         let shown = app.display_system(&snapshot.system);
         let memory = percent(shown.memory_used_bytes, shown.memory_total_bytes);
-        dateline.push(Span::styled(
-            format!(
-                " · CPU {:.1}% · MEM {memory:.1}% · {}P/{}T · v{}",
-                shown.cpu_percent,
-                shown.process_count,
-                shown.thread_count,
-                snapshot.service_version
-            ),
-            Style::default().fg(palette().muted),
-        ));
-    } else {
-        dateline.push(Span::styled(
-            " · awaiting first telemetry frame",
-            Style::default().fg(palette().muted),
-        ));
-    }
-    dateline.push(Span::styled(
         format!(
-            " · PAGE {:02} — {}",
-            page_index(app.page) + 1,
-            route_name(app.page)
-        ),
+            " · CPU {:.1}% · MEM {memory:.1}% · {}P/{}T · v{}",
+            shown.cpu_percent, shown.process_count, shown.thread_count, snapshot.service_version
+        )
+    } else {
+        " · awaiting first telemetry frame".into()
+    };
+    let page_text = format!(
+        " · PAGE {:02} — {}",
+        page_index(app.page) + 1,
+        route_name(app.page)
+    );
+    let mut dateline = vec![Span::styled(link, Style::default().fg(link_color).bold())];
+    dateline.push(Span::styled(
+        telemetry_text.clone(),
+        Style::default().fg(palette().muted),
+    ));
+    dateline.push(Span::styled(
+        page_text.clone(),
         Style::default().fg(palette().alt).bold(),
     ));
-    if let Some(badge) = learning_badge_text(app, false) {
+    // As in the vitals header, the dateline's fixed core (link, telemetry,
+    // version, page) must never be clipped, so the badges are budgeted
+    // against it before building spans instead of relying on ratatui to
+    // truncate whatever doesn't fit.
+    let core_width =
+        link.chars().count() + telemetry_text.chars().count() + page_text.chars().count();
+    let (learning_badge, update_badge) = fit_header_badges(
+        learning_badge_text(app, false),
+        learning_badge_text(app, true),
+        update_badge_text(app, false),
+        usize::from(area.width),
+        core_width,
+        3,
+    );
+    if let Some(badge) = learning_badge {
         dateline.push(Span::styled(
             format!(" · {badge}"),
             Style::default().fg(palette().info).bold(),
         ));
     }
-    if let Some(badge) = update_badge_text(app, false) {
+    if let Some(badge) = update_badge {
         dateline.push(Span::styled(
             format!(" · {badge}"),
             Style::default().fg(palette().info).bold(),
@@ -8902,7 +8973,10 @@ mod tests {
         snapshot.learning_percent = None;
         snapshot.learning_minutes_left = None;
         let text = buffer_text(render(&mut app).buffer());
-        assert!(!text.contains("LEARNING"), "no learning badge when idle: {text}");
+        assert!(
+            !text.contains("LEARNING"),
+            "no learning badge when idle: {text}"
+        );
     }
 
     #[test]
@@ -8916,7 +8990,10 @@ mod tests {
             snapshot.learning_percent = Some(63);
             snapshot.learning_minutes_left = Some(530);
             let text = buffer_text(render(&mut app).buffer());
-            assert!(text.contains("LEARNING 63% · ~9h"), "vitals header badge: {text}");
+            assert!(
+                text.contains("LEARNING 63% · ~9h"),
+                "vitals header badge: {text}"
+            );
         }
         // Avionics: the rail's bottom block, stacked above the update badge.
         // The 16-column bezel has no room for the full word, so this
@@ -8940,8 +9017,183 @@ mod tests {
             snapshot.learning_percent = Some(63);
             snapshot.learning_minutes_left = Some(530);
             let text = buffer_text(render(&mut app).buffer());
-            assert!(text.contains("LEARNING 63% · ~9h"), "masthead dateline badge: {text}");
+            assert!(
+                text.contains("LEARNING 63% · ~9h"),
+                "masthead dateline badge: {text}"
+            );
         }
+    }
+
+    /// Arms both chrome badges at once: an available update and an
+    /// in-progress learning period. Exercises the case the earlier fix
+    /// missed — each render site was only ever tested with one badge
+    /// live, so the priority order and width budgeting between the two
+    /// went unverified.
+    fn arm_both_badges(app: &mut App) {
+        arm_available_update(app);
+        let snapshot = app.snapshot.as_mut().expect("snapshot");
+        snapshot.learning = true;
+        snapshot.learning_percent = Some(63);
+        snapshot.learning_minutes_left = Some(530);
+    }
+
+    #[test]
+    fn vitals_header_budgets_both_badges_never_clipping_the_core() {
+        let _theme = theme::test_support::activate(theme::ThemeId::Vitals);
+
+        // Reference width (150, the suite's default): both badges fit once
+        // the learning badge yields to its compact glyph form first, and
+        // the version/status core is never touched.
+        let mut app = sample_app();
+        arm_both_badges(&mut app);
+        let text = buffer_text(render_size(&mut app, 150, 46).buffer());
+        assert!(
+            text.contains("v1.18.0"),
+            "version must render intact: {text}"
+        );
+        assert!(
+            text.contains("♥ LINKED / ETW"),
+            "link status must render intact: {text}"
+        );
+        assert!(
+            text.contains("◐ 63% ~9h"),
+            "learning badge must render: {text}"
+        );
+        assert!(
+            text.contains("⇡ v9.9.9 · u"),
+            "update badge must render: {text}"
+        );
+        assert!(
+            !text.contains("LEARNING 63% · ~9h"),
+            "at this width the full word doesn't fit alongside update: {text}"
+        );
+
+        // Narrow width (122): the compact learning badge alone still fits,
+        // but not alongside the update badge too, so update yields first —
+        // learning outranks it. The core is still never clipped.
+        let mut app = sample_app();
+        arm_both_badges(&mut app);
+        let text = buffer_text(render_size(&mut app, 122, 46).buffer());
+        assert!(
+            text.contains("v1.18.0"),
+            "version must render intact: {text}"
+        );
+        assert!(
+            text.contains("♥ LINKED / ETW"),
+            "link status must render intact: {text}"
+        );
+        assert!(
+            text.contains("◐ 63% ~9h"),
+            "learning outranks update and must survive: {text}"
+        );
+        assert!(
+            !text.contains("⇡ v9.9.9"),
+            "update must yield before learning does: {text}"
+        );
+    }
+
+    #[test]
+    fn ledger_masthead_budgets_both_badges_never_clipping_the_core() {
+        let _theme = theme::test_support::activate(theme::ThemeId::Ledger);
+
+        // Reference width (150): plenty of room, both badges print at full
+        // size.
+        let mut app = sample_app();
+        arm_both_badges(&mut app);
+        let text = buffer_text(render_size(&mut app, 150, 46).buffer());
+        assert!(
+            text.contains("v1.18.0"),
+            "version must render intact: {text}"
+        );
+        assert!(
+            text.contains("LEARNING 63% · ~9h"),
+            "learning badge must render in full at reference width: {text}"
+        );
+        assert!(
+            text.contains("⇡ v9.9.9 available · u"),
+            "update badge must render in full at reference width: {text}"
+        );
+
+        // Narrow width (100 — the width the field report's probe used):
+        // neither badge fits at full size alongside the fixed dateline, so
+        // the update badge is dropped whole and the learning badge
+        // compacts to its glyph form. Nothing is clipped mid-token: no
+        // orphaned "~9" without its unit, no half-printed version.
+        let mut app = sample_app();
+        arm_both_badges(&mut app);
+        let text = buffer_text(render_size(&mut app, 100, 46).buffer());
+        assert!(
+            text.contains("v1.18.0"),
+            "version must render intact: {text}"
+        );
+        assert!(
+            text.contains("◐ 63% ~9h"),
+            "learning survives compacted, complete, not truncated (no bare '~9' without its unit): {text}"
+        );
+        assert!(
+            !text.contains("⇡ v9.9.9"),
+            "update yields before the core or the learning badge do: {text}"
+        );
+    }
+
+    #[test]
+    fn rail_bottom_block_prioritizes_learning_over_update_with_only_one_row() {
+        let _theme = theme::test_support::activate(theme::ThemeId::Avionics);
+
+        // Reference: through the full draw() pipeline at a generous
+        // terminal size, the rail's size floor leaves several slack rows,
+        // so both badges appear stacked.
+        let mut app = sample_app();
+        arm_both_badges(&mut app);
+        let text = buffer_text(render_size(&mut app, 150, 46).buffer());
+        assert!(
+            text.contains("◐ 63% ~9h"),
+            "learning badge must render: {text}"
+        );
+        assert!(
+            text.contains("⇡ v9.9.9 · u"),
+            "update badge must render: {text}"
+        );
+
+        // Narrow: construct the rail's key column with exactly one slack
+        // row above the nine bezel keys (below the rail's real size floor,
+        // which never actually produces this — this pins the algorithm's
+        // priority directly). Learning must win the single row; update
+        // must be the one that's dropped, not the reverse.
+        let one_row_area = Rect::new(0, 0, RAIL_WIDTH, Page::ALL.len() as u16 + 1);
+        let backend = TestBackend::new(RAIL_WIDTH, one_row_area.height);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| render_rail_keys(frame, &app, one_row_area))
+            .expect("draw");
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(
+            text.contains("◐ 63% ~9h"),
+            "learning must win the sole available row: {text}"
+        );
+        assert!(
+            !text.contains("⇡ v9.9.9"),
+            "update must yield when only one row is available: {text}"
+        );
+
+        // Two slack rows: both fit, learning still occupies the row
+        // closest to the status block (the one row a size-floor edge case
+        // would keep).
+        let two_row_area = Rect::new(0, 0, RAIL_WIDTH, Page::ALL.len() as u16 + 2);
+        let backend = TestBackend::new(RAIL_WIDTH, two_row_area.height);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| render_rail_keys(frame, &app, two_row_area))
+            .expect("draw");
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(
+            text.contains("◐ 63% ~9h"),
+            "learning badge must render: {text}"
+        );
+        assert!(
+            text.contains("⇡ v9.9.9 · u"),
+            "update badge must render: {text}"
+        );
     }
 
     #[test]
