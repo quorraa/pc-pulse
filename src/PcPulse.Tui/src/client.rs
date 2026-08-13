@@ -4,7 +4,7 @@ use pcpulse_service::{
     config::Settings,
     models::{
         AgentContext, Alert, DiagnosticLogResponse, HistoryResponse, LiveSample, OptimizationPlan,
-        PipeRequest, PipeResponse, ProcessNode, Snapshot,
+        PipeRequest, PipeResponse, ProcessNode, Rating, RatingVerdict, Snapshot,
     },
 };
 use serde::de::DeserializeOwned;
@@ -109,6 +109,19 @@ impl PipeClient {
 
     pub fn terminate(&self, pid: u32, confirmed: bool) -> Result<serde_json::Value> {
         self.send(&PipeRequest::TerminateProcess { pid, confirmed })
+    }
+
+    /// Submit a quick in-app performance rating; the service assembles the
+    /// full record (demand context, digest, open incidents) server-side and
+    /// returns it. Never affects baselines, detector thresholds, or
+    /// severities -- only the notification policy's floors.
+    pub fn add_rating(&self, verdict: RatingVerdict) -> Result<Rating> {
+        self.send(&PipeRequest::AddRating { verdict })
+    }
+
+    /// Rating history, newest first.
+    pub fn ratings(&self, limit: usize) -> Result<Vec<Rating>> {
+        self.send(&PipeRequest::GetRatings { limit })
     }
 
     pub fn send<T: DeserializeOwned>(&self, request: &PipeRequest) -> Result<T> {

@@ -71,6 +71,10 @@ const MS_PER_DAY: f64 = 86_400_000.0;
 /// answer for whatever kind is asked about.
 pub const ALL_KINDS: &str = "*";
 
+/// Tolerance for "is this accumulated/effective offset actually nonzero"
+/// checks, in place of an exact `f64 != 0.0` compare.
+const OFFSET_EPSILON: f64 = 1e-9;
+
 /// The notify-floor adjustments the user's ratings have earned, per alert
 /// kind and demand bucket.
 ///
@@ -108,15 +112,27 @@ impl PolicyOffsets {
             .copied()
             .unwrap_or(0.0);
         let bucket_wide = self.buckets.get(&bucket).copied().unwrap_or(0.0);
-        // The bound is on the total, so the two terms net out first: a kind
-        // the user called a false positive inside a bucket they called slow
-        // is genuinely ambiguous evidence and should land near zero.
+        // Both terms are already bounded to +/-RATING_OFFSET_BOUND at
+        // accumulation time (see `derive_offsets`), so this clamp is on the
+        // *net*: a kind the user called a false positive inside a bucket
+        // they called slow is genuinely ambiguous evidence and should land
+        // near zero, not at either term's own extreme.
         (per_kind + bucket_wide).clamp(-RATING_OFFSET_BOUND, RATING_OFFSET_BOUND)
     }
 
-    /// Every non-zero effective offset, for the agent context and the
-    /// incidents detail pane. Ordered by bucket then kind so the rendered
-    /// list is stable between contexts.
+    /// Every non-zero *effective* per-kind offset, for the agent context and
+    /// the incidents detail pane. Ordered by bucket then kind so the
+    /// rendered list is stable between contexts.
+    ///
+    /// Deliberately reports per-kind offsets only -- never a bucket-wide
+    /// [`ALL_KINDS`] row. A bucket-wide term (an unexplained `sluggish`
+    /// rating) is already netted into every named kind's effective offset by
+    /// [`lookup`](Self::lookup), so surfacing it a second time as its own
+    /// row would double-count it for a reader (an LLM agent, the detail
+    /// pane) that sums or displays both. A bucket whose only adjustment is
+    /// bucket-wide, with no kind ever named, therefore has nothing to show
+    /// here; render it via `lookup(kind, bucket)` for a specific kind
+    /// instead.
     pub fn entries(&self) -> Vec<RatingOffset> {
         let mut entries = Vec::new();
         for bucket in [
@@ -132,21 +148,13 @@ impl PolicyOffsets {
             named.sort();
             for kind in named {
                 let offset = self.lookup(kind, bucket);
-                if offset != 0.0 {
+                if offset.abs() > OFFSET_EPSILON {
                     entries.push(RatingOffset {
                         kind: kind.clone(),
                         bucket,
                         offset,
                     });
                 }
-            }
-            let bucket_wide = self.buckets.get(&bucket).copied().unwrap_or(0.0);
-            if bucket_wide != 0.0 {
-                entries.push(RatingOffset {
-                    kind: ALL_KINDS.to_string(),
-                    bucket,
-                    offset: bucket_wide.clamp(-RATING_OFFSET_BOUND, RATING_OFFSET_BOUND),
-                });
             }
         }
         entries
@@ -194,16 +202,28 @@ pub fn derive_offsets(ratings: &[Rating], now_ms: i64) -> PolicyOffsets {
         match rating.verdict {
             RatingVerdict::Good | RatingVerdict::Acceptable => {
                 for kind in notifying {
-                    *offsets
+                    let term = offsets
                         .kinds
                         .entry(rating.demand)
                         .or_default()
                         .entry(kind.to_string())
-                        .or_insert(0.0) += step;
+                        .or_insert(0.0);
+                    // Clamp the accumulated term itself, not just the netted
+                    // total at lookup time. Without this, a raw sum could
+                    // run arbitrarily far past the bound while `lookup`
+                    // clamped the visible result to it anyway -- so a burst
+                    // of contrary feedback in the *other* term would net
+                    // against a value the bound was already hiding and the
+                    // dial would not move until enough of the original raw
+                    // sum decayed away. Clamping here keeps every term
+                    // within [-BOUND, BOUND] at all times, so a contrary
+                    // rating always shows up in the next `lookup` call.
+                    *term = (*term + step).clamp(-RATING_OFFSET_BOUND, RATING_OFFSET_BOUND);
                 }
             }
             RatingVerdict::Sluggish if notifying.is_empty() => {
-                *offsets.buckets.entry(rating.demand).or_insert(0.0) -= step;
+                let term = offsets.buckets.entry(rating.demand).or_insert(0.0);
+                *term = (*term - step).clamp(-RATING_OFFSET_BOUND, RATING_OFFSET_BOUND);
             }
             RatingVerdict::Sluggish => {}
         }
@@ -878,6 +898,47 @@ mod tests {
     }
 
     #[test]
+    fn a_contrary_rating_moves_the_dial_immediately_not_only_after_decay() {
+        // A per-*term* clamp, not just a clamp on the netted total at
+        // lookup. Twenty same-day false positives push the kind term's raw
+        // sum far past the bound (20 x 0.05 = 1.0); if only the net were
+        // ever clamped, that raw excess would sit there until enough of it
+        // decayed away, and one fresh contrary rating landing in the
+        // *other* term would net against a number the bound was already
+        // hiding -- invisible at lookup, indistinguishable from doing
+        // nothing.
+        let now_ms = 100 * DAY_MS;
+        let false_positives: Vec<Rating> = (0..20)
+            .map(|index| {
+                rating(
+                    RatingVerdict::Good,
+                    DemandBucket::Moderate,
+                    now_ms - index as i64,
+                    &["collectorBudget"],
+                )
+            })
+            .collect();
+        let before = derive_offsets(&false_positives, now_ms)
+            .lookup("collectorBudget", DemandBucket::Moderate);
+        assert!((before - 0.15).abs() < 1e-6, "starts pinned at the bound");
+
+        let mut with_one_contrary = false_positives.clone();
+        with_one_contrary.push(rating(
+            RatingVerdict::Sluggish,
+            DemandBucket::Moderate,
+            now_ms,
+            &[],
+        ));
+        let after = derive_offsets(&with_one_contrary, now_ms)
+            .lookup("collectorBudget", DemandBucket::Moderate);
+        assert!(
+            (after - 0.10).abs() < 1e-6,
+            "one contrary rating must move the dial by a full step \
+             immediately, not stay pinned at the bound: got {after}"
+        );
+    }
+
+    #[test]
     fn one_rating_moves_a_kind_one_step_however_many_incidents_of_it_were_open() {
         // A rating is one piece of evidence about one (kind, bucket). Two
         // open incidents of the same kind is that one kind being wrong once,
@@ -1030,7 +1091,11 @@ mod tests {
     }
 
     #[test]
-    fn effective_offsets_are_reported_for_the_agent_context() {
+    fn effective_offsets_are_reported_per_kind_only_never_bucket_wide() {
+        // A pure bucket-wide relaxation (no kind ever named in that bucket)
+        // must not appear in `entries()` at all -- an agent reading the list
+        // would otherwise double-count it once here and again inside every
+        // named kind's own (already-netted) effective offset.
         let now_ms = 100 * DAY_MS;
         let offsets = derive_offsets(
             &[
@@ -1045,16 +1110,69 @@ mod tests {
             now_ms,
         );
         let entries = offsets.entries();
-        assert_eq!(entries.len(), 2, "{entries:?}");
+        assert_eq!(entries.len(), 1, "{entries:?}");
         assert_eq!(entries[0].kind, "collectorBudget");
         assert_eq!(entries[0].bucket, DemandBucket::Light);
         assert!((entries[0].offset - 0.05).abs() < 1e-9);
-        assert_eq!(
-            entries[1].kind, ALL_KINDS,
-            "a bucket-wide relaxation names no single kind"
+        assert!(
+            entries.iter().all(|entry| entry.kind != ALL_KINDS),
+            "no row may name {ALL_KINDS:?}: {entries:?}"
         );
-        assert_eq!(entries[1].bucket, DemandBucket::Heavy);
-        assert!((entries[1].offset + 0.05).abs() < 1e-9);
+        // The Heavy bucket-wide relaxation is still live -- it is netted
+        // into any named kind's effective offset, just never its own row.
+        assert!((offsets.lookup("sustainedCpu", DemandBucket::Heavy) + 0.05).abs() < 1e-9);
+
+        // When a kind *is* named in a bucket that also carries a bucket-wide
+        // term, `entries()` reports that kind's already-netted effective
+        // offset -- one row, not two -- as long as the net is itself
+        // nonzero (two same-day false positives net +0.05 against one
+        // bucket-wide -0.05).
+        let mixed = derive_offsets(
+            &[
+                rating(
+                    RatingVerdict::Good,
+                    DemandBucket::Heavy,
+                    now_ms,
+                    &["sustainedCpu"],
+                ),
+                rating(
+                    RatingVerdict::Good,
+                    DemandBucket::Heavy,
+                    now_ms,
+                    &["sustainedCpu"],
+                ),
+                rating(RatingVerdict::Sluggish, DemandBucket::Heavy, now_ms, &[]),
+            ],
+            now_ms,
+        );
+        let entries = mixed.entries();
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(entries[0].kind, "sustainedCpu");
+        assert_eq!(entries[0].bucket, DemandBucket::Heavy);
+        assert!(
+            (entries[0].offset - 0.05).abs() < 1e-9,
+            "0.10 - 0.05 nets to 0.05, reported as one row: {entries:?}"
+        );
+
+        // And when the net genuinely lands at zero, the row is dropped too
+        // -- "non-zero effective offset" means the net, not either term.
+        let cancels = derive_offsets(
+            &[
+                rating(
+                    RatingVerdict::Good,
+                    DemandBucket::Heavy,
+                    now_ms,
+                    &["sustainedCpu"],
+                ),
+                rating(RatingVerdict::Sluggish, DemandBucket::Heavy, now_ms, &[]),
+            ],
+            now_ms,
+        );
+        assert!(
+            cancels.entries().is_empty(),
+            "a kind whose net offset is exactly zero has nothing to report: {:?}",
+            cancels.entries()
+        );
     }
 
     #[test]

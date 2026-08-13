@@ -897,9 +897,12 @@ pub struct Rating {
 }
 
 /// One effective notify-floor adjustment the user's ratings have earned, as
-/// surfaced to the agent and the incidents detail pane. `kind` is
-/// [`crate::quality::ALL_KINDS`] when the adjustment applies to every kind in
-/// its bucket, which is what an unexplained `sluggish` rating produces.
+/// surfaced to the agent and the incidents detail pane. Always names a
+/// specific `kind` -- a bucket-wide adjustment (an unexplained `sluggish`
+/// rating, which names no kind) is netted into every named kind's effective
+/// offset instead of appearing as its own row, so a reader summing these
+/// entries never double-counts it. See
+/// [`crate::quality::PolicyOffsets::entries`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct RatingOffset {
@@ -962,6 +965,16 @@ pub enum PipeRequest {
     TerminateProcess {
         pid: u32,
         confirmed: bool,
+    },
+    /// Submit a quick in-app performance rating. The client sends only the
+    /// verdict; the service owns the demand context and digest because the
+    /// data (recent samples, baselines, active incidents) lives there.
+    AddRating {
+        verdict: RatingVerdict,
+    },
+    /// Rating history, newest first, for the UI's rating log.
+    GetRatings {
+        limit: usize,
     },
 }
 
@@ -1164,7 +1177,11 @@ mod tests {
         );
         let restored: Alert = serde_json::from_value(old).unwrap();
         assert!(!restored.archived);
-        assert!(serde_json::to_string(&alert).unwrap().contains("\"archived\":true"));
+        assert!(
+            serde_json::to_string(&alert)
+                .unwrap()
+                .contains("\"archived\":true")
+        );
     }
 
     #[test]
@@ -1228,10 +1245,9 @@ mod tests {
 
     #[test]
     fn request_fields_are_snake_case_on_the_wire_as_documented() {
-        let history: PipeRequest = serde_json::from_str(
-            r#"{"command":"getHistory","from_ms":1,"to_ms":2,"limit":10}"#,
-        )
-        .expect("documented snake_case fields must parse");
+        let history: PipeRequest =
+            serde_json::from_str(r#"{"command":"getHistory","from_ms":1,"to_ms":2,"limit":10}"#)
+                .expect("documented snake_case fields must parse");
         assert!(matches!(history, PipeRequest::GetHistory { .. }));
         let context: PipeRequest =
             serde_json::from_str(r#"{"command":"getAgentContext","window_hours":2}"#)
@@ -1240,10 +1256,8 @@ mod tests {
         // The camelCase spelling protocol.md previously documented never
         // worked; keep it failing loudly rather than silently half-working.
         assert!(
-            serde_json::from_str::<PipeRequest>(
-                r#"{"command":"acknowledgeAlert","alertId":"x"}"#
-            )
-            .is_err()
+            serde_json::from_str::<PipeRequest>(r#"{"command":"acknowledgeAlert","alertId":"x"}"#)
+                .is_err()
         );
     }
 
