@@ -437,8 +437,12 @@ fn sampling_loop(state: &Arc<AppState>, stop: crossbeam_channel::Receiver<()>) -
             .machine
             .observe(&system, processes.len(), timestamp_ms);
         for process in &processes {
-            // A confirmed leak does not get to teach this machine that its own
-            // leaking is normal for its executable name.
+            // An instance that has been climbing monotonically for half an
+            // hour stops teaching its own executable name what "normal" is.
+            // Note this stops *further* teaching only -- whatever its ramp
+            // taught before it qualified is already folded in. See
+            // `AlertEngine::self_training_quarantine` for what that does and
+            // does not buy.
             if quarantine.contains(&(process.pid, process.started_at_ms)) {
                 continue;
             }

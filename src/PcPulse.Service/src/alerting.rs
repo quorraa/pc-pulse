@@ -132,6 +132,18 @@ struct GrowthWindow {
     ///
     /// `None` when there was nothing learned to snapshot (no store, or a name
     /// the store has never seen), which the gate treats as passing open.
+    ///
+    /// **Nothing rearms it.** It is captured once, when the window opens, and
+    /// the only thing that replaces it is the window being surrendered
+    /// entirely and later reopened -- which needs a full watch exit
+    /// ([`GROWTH_WATCH_EXIT`] sustained for a hold window, with no open
+    /// incident). A process that stays watched for a day therefore keeps
+    /// judging itself against a day-old snapshot, and every legitimate
+    /// upward shift in its behaviour since then reads as excursion. That is
+    /// deliberate: the alternative is a norm that drifts toward whatever the
+    /// process is currently doing, which is the exact failure this field
+    /// exists to prevent. The bias is toward reporting, which is the
+    /// direction this detector is allowed to be wrong in.
     norm: Option<AgeBucketStats>,
 }
 
@@ -1068,8 +1080,10 @@ impl AlertEngine {
                 Some(GrowthFate::StaysOpen) => {
                     // The window overrides hysteresis, so the exit clock the
                     // reading may have started is meaningless -- leaving it
-                    // running would let a later `Inconclusive` sample inherit
-                    // a hold that was never actually served.
+                    // running would let the first sample where the window
+                    // falls silent inherit a hold that was never served, and
+                    // close the incident without the quiet the hysteresis
+                    // exists to require.
                     self.below_exit_since.remove(&key);
                     continue;
                 }
@@ -1253,20 +1267,47 @@ impl AlertEngine {
     /// Process instances whose samples the caller must keep out of their own
     /// executable name's learned baseline, as of the last evaluation.
     ///
-    /// A climb that has held a monotonic shape for the full growth-persistence
-    /// window is a confirmed leak, and folding a confirmed leak's readings
-    /// into "what is normal for this name" teaches the machine that leaking
-    /// is normal -- which poisons the judgement of every *later* instance of
-    /// that executable, long after this incident has closed.
+    /// **The predicate is not "confirmed leak".** It is: this instance holds a
+    /// growth window whose shape has been `Monotonic` for an unbroken thirty
+    /// minutes. No alert need ever have been raised. A process creeping upward
+    /// at half its threshold raises nothing -- the raw gate never trips -- and
+    /// still freezes its name's norm for as long as the creep holds its shape,
+    /// which for a genuine slow creeper is indefinitely. The consequence is
+    /// that the norm stays at the creeper's *pre-creep* level rather than
+    /// following it up, so later instances of that name are judged against a
+    /// low bar and fire more readily. That is the permissive direction, and it
+    /// is the direction this detector should fail in, so the broad predicate
+    /// stays; requiring an open incident instead would create a worse loop,
+    /// where a name poisoned high enough to block its own detection would then
+    /// never qualify to stop being poisoned.
     ///
-    /// Scoped to confirmed leaks rather than to everything on the growth
-    /// watch list on purpose. Withholding every watched sample would starve
-    /// the baseline of exactly the observations it needs: a routinely bursty
-    /// process is on the watch list precisely while it bursts, so its peaks
-    /// would never be learned, its norm would collapse to its idle level, and
-    /// every future burst would look abnormal. Confirmed leaks are the narrow
-    /// case where withholding costs nothing, because a leak's readings were
-    /// never a norm worth learning.
+    /// **What this actually buys, precisely.** It stops *further* teaching
+    /// once the thirty-minute mark passes. It does not undo what the ramp
+    /// taught before then, and that is a real quantity: a leak spends its
+    /// whole pre-confirmation ramp folding rising readings into the norm, so
+    /// by the time the quarantine engages the norm has already been dragged
+    /// most of the way to wherever the leak had got to. The current instance
+    /// does not care -- it is judged against [`GrowthWindow::norm`], snapshotted
+    /// before any of that happened -- but a *second* instance of the same
+    /// executable starting afterwards inherits the dragged norm and is
+    /// correspondingly slower to be judged abnormal, by an amount that scales
+    /// with how long the first instance took to confirm.
+    ///
+    /// So: cross-instance protection during the ramp is a **known gap**, not a
+    /// delivered property. Closing it means deferring the decision instead of
+    /// making it live -- buffering an excursion's observations and folding
+    /// them in only once the excursion ends, keeping them if it turned out to
+    /// be a burst and dropping them if it turned out to be a leak. That is
+    /// tracked as follow-up work rather than done here.
+    ///
+    /// Scoped this way rather than to everything on the growth watch list on
+    /// purpose, and the reason is load-bearing: withholding every watched
+    /// sample starves the baseline of exactly the observations it needs. A
+    /// routinely bursty process is on the watch list precisely while it
+    /// bursts, so its peaks are never learned and its norm collapses to its
+    /// idle level -- measured at 303 against an 800 peak -- after which every
+    /// future burst looks abnormal. That variant was implemented and fails
+    /// `a_bursty_process_still_learns_its_own_norm_while_being_judged_by_it`.
     ///
     /// Other instances of the same executable keep contributing throughout.
     pub fn self_training_quarantine(&self) -> &HashSet<(u32, i64)> {
@@ -3104,6 +3145,107 @@ mod tests {
             engine.growth_history.len(),
             1,
             "the window survives a pause shorter than the unwatch hold"
+        );
+    }
+
+    /// A hold clock must not run while the window is holding the incident
+    /// open on its own authority.
+    ///
+    /// The exit hysteresis says "resolve once the reading has sat below the
+    /// exit threshold for a full sustained window". A growth incident spends
+    /// long stretches with its reading below that threshold while its window
+    /// keeps it open anyway (`StaysOpen`) -- the process has paused, or has
+    /// released a token part of what it took. If the clock kept running
+    /// through those stretches, the first sample where the window fell silent
+    /// would find a hold already long since satisfied and close the incident
+    /// on the spot, without the sustained window of quiet the hysteresis is
+    /// supposed to require.
+    #[test]
+    fn a_hold_clock_does_not_survive_the_window_holding_an_incident_open() {
+        let settings = growth_settings();
+        let mut engine = AlertEngine::default();
+        // Climb hard enough to open an incident, then slow to a creep: the
+        // window still reads `Monotonic`, but the raw delta drops under the
+        // entry threshold, so the candidate is absent and the incident is
+        // held open by its window alone.
+        let mut trajectory = flat(300, 10);
+        trajectory.extend((1..=20).map(|step| 300 + 40 * step));
+        let climbed = 300 + 40 * 20;
+        trajectory.extend((1..=20).map(|step| climbed + 5 * step));
+        let threads = flat(4, trajectory.len());
+        let evaluations = drive_growth(
+            &mut engine,
+            &settings,
+            "creeper.exe",
+            &trajectory,
+            &threads,
+            Calibration::default(),
+        );
+
+        let key = "handleGrowth:42:1".to_string();
+        let identity = (42_u32, 1_i64);
+        assert!(
+            engine.active.contains_key(&key),
+            "the window holds the incident open through the creep"
+        );
+        let last_ms =
+            GROWTH_START_MS + (evaluations.len() as i64 - 1) * settings.sample_interval_ms as i64;
+        let hold_ms = i64::from(settings.sustained_samples) * settings.sample_interval_ms as i64;
+
+        // Plant the state a brief undecidable dip leaves behind: a hold clock
+        // started long enough ago to be satisfied the moment it is consulted.
+        engine
+            .below_exit_since
+            .insert(key.clone(), last_ms - 10 * hold_ms);
+
+        // One more creep sample, which takes the `StaysOpen` arm.
+        let next_ms = last_ms + settings.sample_interval_ms as i64;
+        let system = SystemMetric {
+            timestamp_ms: next_ms,
+            ..SystemMetric::default()
+        };
+        let handles = trajectory.last().copied().unwrap_or_default() + 5;
+        engine.evaluate(
+            &system,
+            &[growth_process(next_ms, "creeper.exe", handles, 4)],
+            &settings,
+            Calibration::default(),
+        );
+        assert!(
+            !engine.below_exit_since.contains_key(&key),
+            "the stale clock is discarded while the window holds the incident open"
+        );
+
+        // Now let the window fall silent: too few points to have a shape at
+        // all, so the next sample is decided by hysteresis alone. The clock
+        // has to start over -- if the stale one had survived, this sample
+        // would close the incident outright.
+        if let Some(window) = engine.growth_history.get_mut(&identity) {
+            while window.points.len() > 2 {
+                window.points.pop_front();
+            }
+        }
+        let after_ms = next_ms + settings.sample_interval_ms as i64;
+        let system = SystemMetric {
+            timestamp_ms: after_ms,
+            ..SystemMetric::default()
+        };
+        let evaluation = engine.evaluate(
+            &system,
+            &[growth_process(after_ms, "creeper.exe", handles, 4)],
+            &settings,
+            Calibration::default(),
+        );
+        assert!(
+            evaluation
+                .changed
+                .iter()
+                .all(|alert| alert.resolved_at_ms.is_none()),
+            "a silent window starts the hold afresh instead of inheriting one"
+        );
+        assert!(
+            engine.active.contains_key(&key),
+            "so the incident stays open"
         );
     }
 
