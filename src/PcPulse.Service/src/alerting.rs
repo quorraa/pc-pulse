@@ -561,6 +561,15 @@ fn collector_working_set_growth(history: &VecDeque<ProcessPoint>) -> Option<Coll
     // `stats::classify_trend`; only the collector-specific minimums
     // (MIB total, MIB/4 per step) and the >=5-samples-per-segment gate above
     // stay local to this wrapper.
+    //
+    // `first_mean`/`middle_mean`/`last_mean` above are recomputed a second
+    // time inside `classify_trend` (in `f64`, from the same three windows).
+    // That's intentional duplication, not an oversight: this function needs
+    // the `u128`-summed, precision-preserving means for the reported MB
+    // evidence fields below, while `classify_trend` only needs `f64` means
+    // for its own shape decision -- collapsing the two would mean threading
+    // collector-specific mean-computation details into a shared primitive
+    // meant to stay generic.
     let points: Vec<TrendPoint> = history
         .iter()
         .map(|point| TrendPoint {

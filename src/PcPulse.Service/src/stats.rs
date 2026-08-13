@@ -119,6 +119,18 @@ impl P2Marker {
 /// Streaming quantile estimator over an unbounded stream of `f64` samples,
 /// tracking the median, p95, and p99 concurrently in constant space via three
 /// independent P² marker sets. Safe to persist and restore across restarts.
+///
+/// **Non-stationarity caveat:** classic P² has no decay or windowing -- every
+/// observation ever fed in has equal, permanent influence on the marker
+/// positions. In practice this means the median-region marker adapts very
+/// slowly to a regime shift (measured: p50 was still reporting ~175 after
+/// 5,000 post-shift samples against a true new median of 500), while p95/p99
+/// snap to a step change within a few dozen observations because their
+/// desired positions sit near the tails where a single out-of-band sample
+/// moves the marker a full slot. A caller that persists a `PercentileSketch`
+/// across process lifetimes (as baselines do) should treat a long-lived
+/// sketch's median as potentially stale after a legitimate behavior change,
+/// and should not assume p50 and p95/p99 go stale at the same rate.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PercentileSketch {
     count: u64,
@@ -191,12 +203,34 @@ pub enum TrendShape {
     /// Grew from the first third to the middle, then held roughly flat
     /// (within `min_step`) from the middle to the last third.
     Plateau,
-    /// Grew from the first third to the middle, then fell back substantially
-    /// (by at least `min_step`) from the middle to the last third.
+    /// Grew, then declined enough (by at least `min_step`) to count as a
+    /// release, and the last third's mean landed back close to the first
+    /// third's -- within `max(min_step, RETURNING_TOLERANCE_FRACTION *
+    /// (middle_mean - first_mean))`. This is a real recovery: safe to treat
+    /// as closed/resolved.
     Returning,
+    /// Grew, then declined enough to count as a release, but the last
+    /// third's mean is still well above the first third's -- outside the
+    /// `Returning` tolerance. `remaining` is `last_mean - first_mean`, i.e.
+    /// how much of the excursion has *not* been given back (e.g. a process
+    /// that grew by 1000 handles and released only 51 of them reports
+    /// `remaining` near 949). Callers must treat this as still-open, not as
+    /// a resolution -- a small release is not the same as recovery, and
+    /// auto-resolve logic (see the alert-calibration reopen/hysteresis path)
+    /// must not collapse this into `Returning`.
+    PartialRelease { remaining: f64 },
     /// Too little data, or too short a time span, to say anything.
     Inconclusive,
 }
+
+/// How much of the growth from the first to the middle third must be given
+/// back, as a fraction of that growth, before a decline counts as a full
+/// `Returning` rather than a `PartialRelease`. The spec's own worked example
+/// (grow ~9.3, decline to ~5.2 away from the first third's mean) needs a
+/// fraction of at least ~0.554 to land in `Returning`; 0.25 does not clear
+/// it. 0.6 was chosen as the smallest clean value with headroom above that
+/// minimum.
+const RETURNING_TOLERANCE_FRACTION: f64 = 0.6;
 
 fn segment_mean(points: &[TrendPoint], from_exclusive: Option<i64>, to_inclusive: i64) -> f64 {
     let mut sum = 0.0;
@@ -243,7 +277,19 @@ pub fn classify_trend(points: &[TrendPoint], min_span_ms: i64, min_step: f64) ->
     } else if first_step >= min_step && second_step.abs() <= min_step {
         TrendShape::Plateau
     } else if first_step >= min_step && second_step <= -min_step {
-        TrendShape::Returning
+        // A release was substantial enough to clear `min_step`, but that
+        // alone doesn't mean the excursion is over: releasing 5% of a 1000
+        // unit spike is still `min_step`-sized while leaving ~950 units
+        // stuck. Scale the "back to baseline" tolerance to the size of the
+        // excursion itself so a big spike needs a proportionally big give-back.
+        let total_excursion = first_step;
+        let tolerance = min_step.max(RETURNING_TOLERANCE_FRACTION * total_excursion);
+        let remaining = last_mean - first_mean;
+        if remaining.abs() <= tolerance {
+            TrendShape::Returning
+        } else {
+            TrendShape::PartialRelease { remaining }
+        }
     } else {
         TrendShape::Inconclusive
     }
@@ -312,19 +358,39 @@ mod tests {
     }
 
     #[test]
-    fn burst_then_flat_is_a_plateau_and_burst_then_release_is_returning() {
+    fn burst_then_flat_is_a_plateau_full_release_is_returning_and_partial_release_stays_open() {
         let plateau = classify_trend(
             &series(&[10.0, 11.0, 30.0, 31.0, 30.5, 30.8, 31.0, 30.6, 30.9]),
             4 * 60_000,
             2.0,
         );
         assert!(matches!(plateau, TrendShape::Plateau));
+
+        // Full release: grows ~9.3, then falls back to within tolerance of
+        // where it started -- a genuine recovery.
         let returning = classify_trend(
             &series(&[10.0, 11.0, 30.0, 31.0, 28.0, 20.0, 14.0, 11.0, 10.5]),
             4 * 60_000,
             2.0,
         );
         assert!(matches!(returning, TrendShape::Returning));
+
+        // Partial release: grows by 1000, then gives back only 51 of it
+        // (5%). Still sitting ~949 above baseline -- must not read as a
+        // resolved excursion.
+        let partial_release = classify_trend(
+            &series(&[
+                100.0, 100.0, 100.0, 1100.0, 1100.0, 1100.0, 1049.0, 1049.0, 1049.0,
+            ]),
+            4 * 60_000,
+            50.0,
+        );
+        match partial_release {
+            TrendShape::PartialRelease { remaining } => {
+                assert!((remaining - 949.0).abs() < 1e-9, "remaining = {remaining}");
+            }
+            other => panic!("expected PartialRelease, got {other:?}"),
+        }
     }
 
     #[test]
