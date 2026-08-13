@@ -477,6 +477,15 @@ fn sampling_loop(state: &Arc<AppState>, stop: crossbeam_channel::Receiver<()>) -
             snapshot.processes = processes.clone();
             snapshot.active_alerts = evaluation.active;
             snapshot.hardware = hardware;
+            // `calibration` was computed above from this same `timestamp_ms`,
+            // before this sample folded into the baseline -- reuse it rather
+            // than re-deriving learning state from a baseline that has since
+            // observed one more point.
+            snapshot.learning = calibration.learning;
+            snapshot.learning_hours_left = calibration.learning.then(|| {
+                let remaining_fraction = (1.0 - calibration.baseline_maturity).clamp(0.0, 1.0);
+                (remaining_fraction * 24.0).ceil() as u8
+            });
         }
         if Instant::now() >= next_system_write {
             state.storage.insert_system(&system)?;
