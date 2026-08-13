@@ -8,8 +8,8 @@ use crate::{
     theme::{self, LayoutKind, palette},
 };
 use pcpulse_service::models::{
-    Alert, HardwareMetrics, OptimizationPlan, PlanAction, PlanRisk, ProcessMetric, Severity,
-    SystemMetric,
+    Alert, HardwareMetrics, IncidentState, OptimizationPlan, PlanAction, PlanRisk, ProcessMetric,
+    Severity, SystemMetric,
 };
 use ratatui::{
     Frame,
@@ -4260,22 +4260,60 @@ fn render_tree(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
 fn render_alerts(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let sections =
         Layout::horizontal([Constraint::Percentage(42), Constraint::Percentage(58)]).split(area);
+    let now_ms = app
+        .snapshot
+        .as_ref()
+        .map_or(0, |snapshot| snapshot.system.timestamp_ms);
     let rows = app
         .visible_alerts()
         .into_iter()
         .enumerate()
         .map(|(index, alert)| {
-            let state = if alert.resolved_at_ms.is_some() {
-                "resolved"
+            // History-only rows (the engine decided not to notify) mute the
+            // whole row rather than just tagging it, so the operator's eye
+            // is drawn to the incidents that actually paged them.
+            let muted = !alert.notify;
+            let mut state_label = if alert.resolved_at_ms.is_some() {
+                "resolved".to_string()
             } else if alert.acknowledged {
-                "ack"
+                "ack".to_string()
+            } else if matches!(alert.state, IncidentState::Reopened) {
+                // Phase E: reopen resets acknowledged/archived on the engine
+                // side, so this tag is the only surviving signal that the
+                // incident came back rather than opening fresh.
+                "REOPENED".to_string()
             } else {
-                "ACTIVE"
+                "ACTIVE".to_string()
             };
+            let active_like = state_label == "ACTIVE" || state_label == "REOPENED";
+            if muted {
+                // The lifecycle label loses to the "history" tag rather than
+                // sharing the cramped STATE column with it -- notify:false
+                // already means this row exists only as a record, so what
+                // it *would* have been tagged is less important than that.
+                state_label = "history".to_string();
+            }
+            // The FINDING column's floor is 18 cells (`alert_constraints`);
+            // a wide terminal gives it more, but the suffix must survive
+            // the floor, so the title yields far more room to it than the
+            // unsuffixed 42-char cap does.
+            let title = if alert.occurrence_count > 1 {
+                format!(
+                    "{} ×{}",
+                    format::truncate(&alert.title, 12),
+                    alert.occurrence_count
+                )
+            } else {
+                format::truncate(&alert.title, 42)
+            };
+            let dim = |default: Color| if muted { palette().faint } else { default };
             Row::new(vec![
-                Cell::from(severity_label(alert.severity)).style(severity_badge(alert.severity)),
-                Cell::from(format::truncate(&alert.title, 42))
-                    .style(Style::default().fg(palette().text).bold()),
+                Cell::from(severity_label(alert.severity)).style(if muted {
+                    Style::default().fg(palette().faint)
+                } else {
+                    severity_badge(alert.severity)
+                }),
+                Cell::from(title).style(Style::default().fg(dim(palette().text)).bold()),
                 Cell::from(
                     alert
                         .process_name
@@ -4283,18 +4321,29 @@ fn render_alerts(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                         .unwrap_or("system / driver")
                         .to_string(),
                 )
-                .style(Style::default().fg(palette().muted)),
-                Cell::from(state).style(
+                .style(Style::default().fg(dim(palette().muted))),
+                Cell::from(state_label).style(
                     Style::default()
-                        .fg(if state == "ACTIVE" {
+                        .fg(if muted {
+                            palette().faint
+                        } else if active_like {
                             palette().warn
                         } else {
                             palette().faint
                         })
                         .bold(),
                 ),
-                Cell::from(format::timestamp(alert.first_seen_ms))
-                    .style(Style::default().fg(palette().faint)),
+                Cell::from(Line::from(vec![
+                    Span::styled(
+                        format::age(alert.last_seen_ms, now_ms),
+                        Style::default().fg(dim(palette().faint)),
+                    ),
+                    Span::raw(" "),
+                    Span::styled(
+                        confidence_marker(alert.quality.confidence),
+                        Style::default().fg(dim(confidence_color(alert.quality.confidence))),
+                    ),
+                ])),
             ])
             .style(Style::default().bg(if index.is_multiple_of(2) {
                 palette().surface
@@ -4314,8 +4363,11 @@ fn render_alerts(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                 ),
                 sortable_header_cell("OWNER", app.alert_sort == AlertSort::Owner, palette().warn),
                 sortable_header_cell("STATE", app.alert_sort == AlertSort::State, palette().warn),
+                // Sorted by first-seen still, but the cell itself shows
+                // last-seen age plus the confidence marker -- "first seen"
+                // is already on the detail pane.
                 sortable_header_cell(
-                    "SEEN",
+                    "AGE",
                     app.alert_sort == AlertSort::FirstSeen,
                     palette().warn,
                 ),
@@ -4364,25 +4416,31 @@ fn render_alert_detail(frame: &mut Frame<'_>, alert: Option<&Alert>, area: Rect)
             Style::default().fg(severity_color(alert.severity)).bold(),
         ),
         detail_line("Severity", format!("{:?}", alert.severity)),
-        detail_line(
-            "State",
-            {
-                let lifecycle = if alert.resolved_at_ms.is_some() {
-                    "resolved"
-                } else if alert.acknowledged {
-                    "acknowledged"
-                } else {
-                    "active"
-                };
-                // Archive is orthogonal to lifecycle: an archived finding can
-                // still be active and updating.
-                if alert.archived {
-                    format!("{lifecycle} · archived")
-                } else {
-                    lifecycle.into()
-                }
-            },
-        ),
+        detail_line("State", {
+            let mut lifecycle = if alert.resolved_at_ms.is_some() {
+                "resolved".to_string()
+            } else if alert.acknowledged {
+                "acknowledged".to_string()
+            } else if matches!(alert.state, IncidentState::Reopened) {
+                // Phase E: the engine resets acknowledged/archived on
+                // reopen, so this branch is the only place a resurrected
+                // incident still reads as "not brand new".
+                "reopened".to_string()
+            } else {
+                "active".to_string()
+            };
+            // Archive is orthogonal to lifecycle: an archived finding can
+            // still be active and updating.
+            if alert.archived {
+                lifecycle.push_str(" · archived");
+            }
+            // History-only: the engine decided this incident's evidence
+            // doesn't clear the notification floor, so it never paged.
+            if !alert.notify {
+                lifecycle.push_str(" · history");
+            }
+            lifecycle
+        }),
         detail_line(
             "Owner",
             alert
@@ -4393,7 +4451,29 @@ fn render_alert_detail(frame: &mut Frame<'_>, alert: Option<&Alert>, area: Rect)
         ),
         detail_line("First seen", format::timestamp(alert.first_seen_ms)),
         detail_line("Last seen", format::timestamp(alert.last_seen_ms)),
+        detail_line(
+            "Last reopened",
+            if matches!(alert.state, IncidentState::Reopened) {
+                format::timestamp(alert.last_seen_ms)
+            } else {
+                "n/a".into()
+            },
+        ),
         detail_line("Occurrences", alert.occurrence_count.to_string()),
+        detail_line("Notifications", alert.notify_generation.to_string()),
+        Line::raw(""),
+        Line::styled(
+            "▸ QUALITY SCORES",
+            Style::default().fg(palette().warn).bold(),
+        ),
+        detail_line("Confidence", format!("{:.2}", alert.quality.confidence)),
+        detail_line("Persistence", format!("{:.2}", alert.quality.persistence)),
+        detail_line(
+            "Corroboration",
+            format!("{:.2}", alert.quality.corroboration),
+        ),
+        detail_line("User impact", format!("{:.2}", alert.quality.user_impact)),
+        detail_line("Novelty", format!("{:.2}", alert.quality.novelty)),
         Line::raw(""),
         Line::styled("▸ DIAGNOSIS", Style::default().fg(palette().alt).bold()),
         Line::raw(alert.explanation.clone()),
@@ -6245,6 +6325,27 @@ fn render_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
                 }),
             ),
         ])
+    } else if app.snapshot.as_ref().is_some_and(|snapshot| snapshot.learning) {
+        let percent = app
+            .snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.learning_percent)
+            .unwrap_or(0);
+        let minutes_left = app
+            .snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.learning_minutes_left)
+            .unwrap_or(0);
+        Line::from(vec![
+            Span::styled(
+                " LEARNING ",
+                Style::default().fg(palette().bg).bg(palette().info).bold(),
+            ),
+            Span::styled(
+                format!("  {}", learning_status_text(percent, minutes_left)),
+                Style::default().fg(palette().muted),
+            ),
+        ])
     } else {
         Line::styled(
             " mouse  click select / focus  ·  wheel scroll  ·  table headers sort  ·  right-click process confirms",
@@ -6264,6 +6365,25 @@ fn render_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
         ),
         area,
     );
+}
+
+/// The statusline's learning line: how far the machine baseline has got and
+/// how much more *monitoring* (not wall-clock waiting) it still needs. The
+/// service counts only time it spends observing, so the phrasing avoids
+/// promising the operator that the countdown runs while the machine sleeps.
+/// Under an hour the remainder reads in plain minutes, so the last stretch
+/// visibly moves.
+fn learning_status_text(percent: u8, minutes_left: u16) -> String {
+    let hours = minutes_left / 60;
+    let minutes = minutes_left % 60;
+    let remaining = if hours == 0 {
+        format!("{minutes}m")
+    } else if minutes == 0 {
+        format!("{hours}h")
+    } else {
+        format!("{hours}h {minutes}m")
+    };
+    format!("learning your machine — {percent}% (~{remaining} of monitoring left)")
 }
 
 /// Per-page contextual hints, shared by the statusline footer and the
@@ -6521,6 +6641,29 @@ fn severity_badge(severity: Severity) -> Style {
         .fg(palette().bg)
         .bg(severity_color(severity))
         .bold()
+}
+
+/// Three-dot confidence gauge for `AlertQuality::confidence`, thresholds per
+/// the alert-calibration spec (Phase E): below 0.34 is low, below 0.67 is
+/// medium, at or above 0.67 is high.
+fn confidence_marker(confidence: f64) -> &'static str {
+    if confidence < 0.34 {
+        "●○○"
+    } else if confidence < 0.67 {
+        "●●○"
+    } else {
+        "●●●"
+    }
+}
+
+fn confidence_color(confidence: f64) -> Color {
+    if confidence < 0.34 {
+        palette().crit
+    } else if confidence < 0.67 {
+        palette().warn
+    } else {
+        palette().ok
+    }
 }
 
 #[cfg(test)]
@@ -8497,6 +8640,202 @@ mod tests {
             occurrence_count: 1,
             resolved_at_ms: None,
             archived: false,
+            fingerprint: String::new(),
+            state: pcpulse_service::models::IncidentState::Open,
+            quality: pcpulse_service::models::AlertQuality::default(),
+            notify: true,
+            notify_generation: 0,
+        }
+    }
+
+    /// The alerts table's content rect: past `render_alerts`'s own inset
+    /// *and* the `accent_panel` block's rounded border (which the table
+    /// widget draws for itself, so `render_alerts` never returns the inner
+    /// rect directly).
+    fn alerts_table_rect(area: Rect) -> Rect {
+        let body = regions(area).body;
+        let sections = Layout::horizontal([Constraint::Percentage(42), Constraint::Percentage(58)])
+            .split(body);
+        inset(sections[0]).inner(Margin::new(1, 1))
+    }
+
+    #[test]
+    fn history_only_rows_render_muted_with_a_history_tag_while_notified_rows_stay_standard() {
+        let _theme = theme::test_support::activate(theme::ThemeId::Vitals);
+        let mut app = sample_app();
+        app.page = Page::Alerts;
+        let notified = sample_alert("sustainedCpu", Severity::Critical);
+        let mut history_only = sample_alert("dpcInterrupt", Severity::Warning);
+        // Kept short: the FINDING column's guaranteed floor is 18 cells, and
+        // this test locates the row by searching the rendered buffer for
+        // the full title.
+        history_only.title = "DPC quiet gap".into();
+        history_only.notify = false;
+        app.alerts = vec![notified.clone(), history_only.clone()];
+        // No row selected: the row-highlight style patches the whole
+        // selected row's background, which would swallow the very badge
+        // fill this test is checking for.
+        app.alert_state.select(None);
+        let area = Rect::new(0, 0, 150, 46);
+        let backend = render_size(&mut app, area.width, area.height);
+        let buffer = backend.buffer();
+        let text = buffer_text(buffer);
+        assert!(text.contains("history"), "history tag must render: {text}");
+        let table = alerts_table_rect(area);
+        let notified_y = (0..buffer.area.height)
+            .find(|y| row_text(buffer, *y).contains(&notified.title))
+            .expect("notified row must be visible");
+        let muted_y = (0..buffer.area.height)
+            .find(|y| row_text(buffer, *y).contains(&history_only.title))
+            .expect("history-only row must be visible");
+        assert!(
+            lit_cells(
+                buffer,
+                Rect::new(table.x, notified_y, 5, 1),
+                severity_color(Severity::Critical)
+            ) > 0,
+            "a notified row keeps its solid severity badge"
+        );
+        assert_eq!(
+            lit_cells(
+                buffer,
+                Rect::new(table.x, muted_y, 5, 1),
+                severity_color(Severity::Warning)
+            ),
+            0,
+            "a history-only row must not keep the colored severity badge fill"
+        );
+        assert!(row_text(buffer, muted_y).contains("history"));
+        assert!(!row_text(buffer, notified_y).contains("history"));
+    }
+
+    #[test]
+    fn repeated_incidents_show_the_occurrence_suffix_and_a_matching_confidence_marker() {
+        let _theme = theme::test_support::activate(theme::ThemeId::Vitals);
+        let mut app = sample_app();
+        app.page = Page::Alerts;
+        let mut repeated = sample_alert("sustainedCpu", Severity::Warning);
+        repeated.occurrence_count = 12;
+        app.alerts = vec![repeated];
+        let backend = render(&mut app);
+        let text = buffer_text(backend.buffer());
+        assert!(
+            text.contains("×12"),
+            "occurrence suffix must render: {text}"
+        );
+
+        // Thresholds per the spec: below 0.34 low, below 0.67 mid, else high.
+        for (confidence, marker) in [
+            (0.0, "●○○"),
+            (0.33, "●○○"),
+            (0.34, "●●○"),
+            (0.66, "●●○"),
+            (0.67, "●●●"),
+            (1.0, "●●●"),
+        ] {
+            let mut alert = sample_alert("sustainedCpu", Severity::Warning);
+            alert.quality.confidence = confidence;
+            app.alerts = vec![alert];
+            let backend = render(&mut app);
+            let text = buffer_text(backend.buffer());
+            assert!(
+                text.contains(marker),
+                "confidence {confidence} must show marker {marker}: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn statusline_carries_the_learning_text_while_the_machine_baseline_is_young() {
+        let _theme = theme::test_support::activate(theme::ThemeId::Vitals);
+        let mut app = sample_app();
+        // The learning line only wins once the higher-priority OFFLINE and
+        // STATUS lines have nothing to say -- `sample_app` starts with a
+        // "Connecting to collector…" status, so clear it first.
+        app.status.clear();
+        {
+            let snapshot = app.snapshot.as_mut().expect("snapshot");
+            snapshot.learning = true;
+            snapshot.learning_percent = Some(63);
+            snapshot.learning_minutes_left = Some(530);
+        }
+        let backend = render(&mut app);
+        let text = buffer_text(backend.buffer());
+        assert!(
+            text.contains("learning your machine"),
+            "learning statusline must render: {text}"
+        );
+        assert!(text.contains("63%"), "learning percent must render: {text}");
+        assert!(
+            text.contains("~8h 50m of monitoring left"),
+            "remaining monitoring time must render: {text}"
+        );
+
+        // Once learning completes the statusline reverts to its usual hint.
+        let snapshot = app.snapshot.as_mut().expect("snapshot");
+        snapshot.learning = false;
+        snapshot.learning_percent = None;
+        snapshot.learning_minutes_left = None;
+        let backend = render(&mut app);
+        let text = buffer_text(backend.buffer());
+        assert!(!text.contains("learning your machine"), "{text}");
+    }
+
+    #[test]
+    fn learning_status_text_reads_in_hours_then_minutes() {
+        assert_eq!(
+            learning_status_text(63, 530),
+            "learning your machine — 63% (~8h 50m of monitoring left)"
+        );
+        // A whole number of hours drops the empty minutes.
+        assert_eq!(
+            learning_status_text(50, 720),
+            "learning your machine — 50% (~12h of monitoring left)"
+        );
+        // The final stretch reads in minutes so progress stays visible.
+        assert_eq!(
+            learning_status_text(97, 41),
+            "learning your machine — 97% (~41m of monitoring left)"
+        );
+        // A brand-new machine is honest about having learned nothing yet.
+        assert_eq!(
+            learning_status_text(0, 1_440),
+            "learning your machine — 0% (~24h of monitoring left)"
+        );
+    }
+
+    #[test]
+    fn detail_pane_lists_all_five_quality_scores_state_and_lifecycle_counters() {
+        let _theme = theme::test_support::activate(theme::ThemeId::Vitals);
+        let mut app = sample_app();
+        app.page = Page::Alerts;
+        let mut alert = sample_alert("sustainedCpu", Severity::Warning);
+        alert.state = pcpulse_service::models::IncidentState::Reopened;
+        alert.notify_generation = 3;
+        alert.quality = pcpulse_service::models::AlertQuality {
+            confidence: 0.81,
+            persistence: 0.42,
+            corroboration: 0.65,
+            user_impact: 0.9,
+            novelty: 0.15,
+        };
+        app.alerts = vec![alert];
+        app.alert_state.select(Some(0));
+        let backend = render(&mut app);
+        let text = buffer_text(backend.buffer());
+        for expected in [
+            "0.81",
+            "0.42",
+            "0.65",
+            "0.90",
+            "0.15",
+            "reopened",
+            "Notifications: 3",
+        ] {
+            assert!(
+                text.contains(expected),
+                "detail pane must show {expected}: {text}"
+            );
         }
     }
 
@@ -8659,6 +8998,7 @@ mod tests {
             }],
             available: true,
             detail: String::new(),
+            inventory: None,
         };
         app.connected = true;
         app.live_history.push_back(system.clone());
@@ -8669,6 +9009,9 @@ mod tests {
             processes: vec![process],
             active_alerts: Vec::new(),
             hardware,
+            learning: false,
+            learning_percent: None,
+            learning_minutes_left: None,
         });
         app
     }

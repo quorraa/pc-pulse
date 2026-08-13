@@ -135,11 +135,54 @@ pub enum Severity {
     Critical,
 }
 
+/// Lifecycle state of an incident (the durable identity behind a
+/// fingerprint), independent of the per-sample `Alert.resolved_at_ms`.
+/// Absent in alerts persisted before incident lifecycle tracking existed;
+/// the default treats them as open, matching prior behavior.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum IncidentState {
+    #[default]
+    Open,
+    Reopened,
+    Resolved,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Evidence {
     pub label: String,
     pub value: String,
+}
+
+/// Calibration signals the alert engine used to decide whether an incident
+/// was worth notifying about. `Default` treats an alert as fully trusted
+/// (all `1.0`) — correct for pre-calibration records, since the engine only
+/// overwrites this for live incidents it is actively scoring.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AlertQuality {
+    pub confidence: f64,
+    pub persistence: f64,
+    pub corroboration: f64,
+    pub user_impact: f64,
+    pub novelty: f64,
+}
+
+impl Default for AlertQuality {
+    fn default() -> Self {
+        Self {
+            confidence: 1.0,
+            persistence: 1.0,
+            corroboration: 1.0,
+            user_impact: 1.0,
+            novelty: 1.0,
+        }
+    }
+}
+
+fn default_notify() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -166,6 +209,30 @@ pub struct Alert {
     /// keeps old JSON deserializing and the protocol version is unchanged.
     #[serde(default)]
     pub archived: bool,
+    /// Stable identity for the underlying incident, shared across the
+    /// reopen/resolve cycle. Absent in alerts persisted before incident
+    /// fingerprints existed; the default empty string keeps old JSON
+    /// deserializing and the protocol version is unchanged.
+    #[serde(default)]
+    pub fingerprint: String,
+    /// Lifecycle state of the incident this alert represents. Absent in
+    /// pre-upgrade alerts; the default keeps old JSON deserializing.
+    #[serde(default)]
+    pub state: IncidentState,
+    /// Calibration signals behind the `notify` decision. Absent in
+    /// pre-upgrade alerts; the default keeps old JSON deserializing.
+    #[serde(default)]
+    pub quality: AlertQuality,
+    /// Whether this alert should surface a notification. Absent in
+    /// pre-upgrade alerts; the default is `true` so old records keep
+    /// notifying exactly like they did before quality gating existed.
+    #[serde(default = "default_notify")]
+    pub notify: bool,
+    /// Monotonic counter bumped whenever this incident's notification
+    /// eligibility is recomputed (e.g. on reopen). Absent in pre-upgrade
+    /// alerts; the default `0` keeps old JSON deserializing.
+    #[serde(default)]
+    pub notify_generation: u32,
 }
 
 /// One ACPI thermal zone reading, converted from decikelvin to Celsius.
@@ -202,6 +269,12 @@ pub struct HardwareMetrics {
     pub gpus: Vec<GpuMetrics>,
     pub available: bool,
     pub detail: String,
+    /// The vendor-neutral hardware inventory (what exists), independent of
+    /// the gauges above (what is currently measurable). `None` only until
+    /// the collector's first inventory probe completes; absent entirely in
+    /// snapshots from services older than hardware inventory, which the
+    /// `#[serde(default)]` on this struct keeps deserializing.
+    pub inventory: Option<HardwareInventory>,
 }
 
 impl Default for HardwareMetrics {
@@ -213,6 +286,143 @@ impl Default for HardwareMetrics {
             gpus: Vec::new(),
             available: false,
             detail: "no hardware telemetry in this snapshot".into(),
+            inventory: None,
+        }
+    }
+}
+
+/// One inventory group's outcome: either the probed value, or a reason it
+/// could not be determined. `detail` is empty on success and non-empty on
+/// `unavailable` — it never carries a fabricated reading. Missing hardware
+/// TELEMETRY (a gauge that can't be read right now) never implies missing
+/// hardware (an inventory group that failed to enumerate); the two are
+/// deliberately separate concepts.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct InventoryGroup<T> {
+    pub value: Option<T>,
+    pub detail: String,
+    /// When the probe pass that produced this group's current `value` (or,
+    /// for an `unavailable` group with no value, this group's `detail`)
+    /// actually ran. A re-probe that fails for this specific group keeps
+    /// the group's previous value and detail rather than fabricating an
+    /// "unavailable" from fresh data that never arrived — see
+    /// `metrics::inventory`'s `retain_on_failure` — so this stamp can
+    /// legitimately lag behind `HardwareInventory::collected_at_ms`
+    /// (which is simply "when the most recent probe attempt ran").
+    /// Additive: `#[serde(default)]` so a group payload written before
+    /// this field existed still deserializes, as `0`.
+    #[serde(default)]
+    pub collected_at_ms: i64,
+}
+
+impl<T> InventoryGroup<T> {
+    pub fn present(value: T, collected_at_ms: i64) -> Self {
+        Self {
+            value: Some(value),
+            detail: String::new(),
+            collected_at_ms,
+        }
+    }
+
+    pub fn unavailable(detail: impl Into<String>, collected_at_ms: i64) -> Self {
+        Self {
+            value: None,
+            detail: detail.into(),
+            collected_at_ms,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct CpuInventory {
+    pub manufacturer: String,
+    pub brand: String,
+    pub physical_cores: u32,
+    pub logical_processors: u32,
+    pub base_clock_mhz: Option<u32>,
+    pub max_clock_mhz: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SystemInventory {
+    pub manufacturer: String,
+    pub model: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct BiosInventory {
+    pub version: String,
+    pub release_date: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryInventory {
+    pub installed_bytes: u64,
+    pub module_count: u32,
+    pub speed_mts: Option<u32>,
+}
+
+/// One physical storage device. `media_type` is `"ssd"`, `"hdd"`, or
+/// `"unknown"` — the `Win32_DiskDrive` fallback path can identify the bus
+/// but not the media, so it always reports `"unknown"` rather than guess.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct StorageDevice {
+    pub model: String,
+    pub size_bytes: u64,
+    pub bus_type: String,
+    pub media_type: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct GpuInventory {
+    pub name: String,
+    pub vendor: String,
+    pub driver_version: Option<String>,
+    pub vram_bytes: Option<u64>,
+}
+
+/// The vendor-neutral hardware inventory: what exists, independent of what
+/// the gauges can currently measure. Every group is probed independently,
+/// so one group's failure (e.g. a locked-down storage namespace) never
+/// blanks the others. Probed once at collector construction and re-probed
+/// at most once a day; see `metrics::inventory`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct HardwareInventory {
+    pub cpu: InventoryGroup<CpuInventory>,
+    pub system: InventoryGroup<SystemInventory>,
+    pub bios: InventoryGroup<BiosInventory>,
+    pub memory: InventoryGroup<MemoryInventory>,
+    pub storage: InventoryGroup<Vec<StorageDevice>>,
+    pub gpus: InventoryGroup<Vec<GpuInventory>>,
+    /// When the most recent probe *attempt* ran — not when every group's
+    /// value was last confirmed. A re-probe that fails for some groups
+    /// still advances this timestamp (an attempt did happen), while those
+    /// groups keep their own older `InventoryGroup::collected_at_ms`; read
+    /// the per-group stamp for "how fresh is this specific reading".
+    pub collected_at_ms: i64,
+}
+
+impl HardwareInventory {
+    /// Every group starts `unavailable`; callers fill in the groups they
+    /// actually probed. Used both as the pre-probe placeholder and as a
+    /// concise base for test fixtures (`..HardwareInventory::empty(0)`).
+    pub fn empty(collected_at_ms: i64) -> Self {
+        Self {
+            cpu: InventoryGroup::unavailable("not probed", collected_at_ms),
+            system: InventoryGroup::unavailable("not probed", collected_at_ms),
+            bios: InventoryGroup::unavailable("not probed", collected_at_ms),
+            memory: InventoryGroup::unavailable("not probed", collected_at_ms),
+            storage: InventoryGroup::unavailable("not probed", collected_at_ms),
+            gpus: InventoryGroup::unavailable("not probed", collected_at_ms),
+            collected_at_ms,
         }
     }
 }
@@ -230,6 +440,25 @@ pub struct Snapshot {
     /// the extra field.
     #[serde(default)]
     pub hardware: HardwareMetrics,
+    /// True while the machine-wide baseline (`BaselineStore::machine`) has
+    /// observed less than the notification policy's learning period, so
+    /// clients can tell the operator the machine is still calibrating.
+    /// Absent in snapshots from services older than alert calibration; the
+    /// default `false` keeps old JSON deserializing as "done learning",
+    /// matching the notification policy's own pre-calibration behavior.
+    #[serde(default)]
+    pub learning: bool,
+    /// Learning progress as a whole percent (floored) while `learning` is
+    /// true; `None` once the baseline has matured, and for snapshots from
+    /// services that predate the field.
+    #[serde(default)]
+    pub learning_percent: Option<u8>,
+    /// Minutes of *observed* time still owed before the baseline matures.
+    /// Not a wall-clock countdown: a machine that sleeps makes no progress,
+    /// so this is time the collector must still spend watching. `None`
+    /// alongside `learning_percent`.
+    #[serde(default)]
+    pub learning_minutes_left: Option<u16>,
 }
 
 impl Default for Snapshot {
@@ -241,6 +470,9 @@ impl Default for Snapshot {
             processes: Vec::new(),
             active_alerts: Vec::new(),
             hardware: HardwareMetrics::default(),
+            learning: false,
+            learning_percent: None,
+            learning_minutes_left: None,
         }
     }
 }
@@ -690,6 +922,7 @@ mod tests {
                 }],
                 available: true,
                 detail: String::new(),
+                inventory: None,
             },
             ..Snapshot::default()
         };
@@ -716,6 +949,45 @@ mod tests {
         assert!(snapshot.hardware.thermal_zones.is_empty());
         assert!(snapshot.hardware.gpus.is_empty());
         assert!(!snapshot.hardware.detail.is_empty());
+    }
+
+    #[test]
+    fn snapshot_learning_fields_round_trip_in_camel_case() {
+        let snapshot = Snapshot {
+            learning: true,
+            learning_percent: Some(63),
+            learning_minutes_left: Some(530),
+            ..Snapshot::default()
+        };
+        let json = serde_json::to_string(&snapshot).unwrap();
+        assert!(json.contains("\"learning\":true"), "wire: {json}");
+        assert!(
+            json.contains("\"learningPercent\":63"),
+            "camelCase wire name: {json}"
+        );
+        assert!(
+            json.contains("\"learningMinutesLeft\":530"),
+            "camelCase wire name: {json}"
+        );
+        let restored: Snapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored, snapshot);
+    }
+
+    #[test]
+    fn snapshot_without_learning_fields_still_deserializes() {
+        // A snapshot serialized by a pre-calibration service has none of the
+        // keys; all must default to "done learning".
+        let json = serde_json::json!({
+            "protocolVersion": crate::PROTOCOL_VERSION,
+            "serviceVersion": "1.16.0",
+            "system": serde_json::to_value(SystemMetric::default()).unwrap(),
+            "processes": [],
+            "activeAlerts": [],
+        });
+        let snapshot: Snapshot = serde_json::from_value(json).unwrap();
+        assert!(!snapshot.learning);
+        assert_eq!(snapshot.learning_percent, None);
+        assert_eq!(snapshot.learning_minutes_left, None);
     }
 
     #[test]
@@ -771,12 +1043,8 @@ mod tests {
         assert_eq!(restored, sample);
     }
 
-    #[test]
-    fn alert_without_archived_field_still_deserializes() {
-        // An alert persisted (or served) by a pre-archive service has no
-        // `archived` key; it must parse as unarchived, and the flag must
-        // ride the wire in camelCase for current alerts.
-        let alert = Alert {
+    fn test_alert() -> Alert {
+        Alert {
             id: "a-1".into(),
             kind: "sustainedCpu".into(),
             severity: Severity::Warning,
@@ -791,7 +1059,23 @@ mod tests {
             acknowledged: false,
             occurrence_count: 1,
             resolved_at_ms: None,
+            archived: false,
+            fingerprint: String::new(),
+            state: IncidentState::Open,
+            quality: AlertQuality::default(),
+            notify: true,
+            notify_generation: 0,
+        }
+    }
+
+    #[test]
+    fn alert_without_archived_field_still_deserializes() {
+        // An alert persisted (or served) by a pre-archive service has no
+        // `archived` key; it must parse as unarchived, and the flag must
+        // ride the wire in camelCase for current alerts.
+        let alert = Alert {
             archived: true,
+            ..test_alert()
         };
         let mut old = serde_json::to_value(&alert).unwrap();
         assert!(
@@ -801,6 +1085,35 @@ mod tests {
         let restored: Alert = serde_json::from_value(old).unwrap();
         assert!(!restored.archived);
         assert!(serde_json::to_string(&alert).unwrap().contains("\"archived\":true"));
+    }
+
+    #[test]
+    fn pre_upgrade_alert_json_gains_compatible_defaults() {
+        // A verbatim pre-upgrade payload shape (no fingerprint/state/quality/notify).
+        let old = r#"{"id":"abc","kind":"sustainedCpu","severity":"warning",
+            "firstSeenMs":1,"lastSeenMs":2,"processId":10,"processName":"x.exe",
+            "title":"t","explanation":"e","evidence":[],"recommendation":"r",
+            "acknowledged":false,"occurrenceCount":3,"resolvedAtMs":null}"#;
+        let alert: Alert = serde_json::from_str(old).unwrap();
+        assert!(alert.notify, "old records must behave like today");
+        assert_eq!(alert.notify_generation, 0);
+        assert_eq!(alert.fingerprint, "");
+        assert!(matches!(alert.state, IncidentState::Open));
+        assert!((alert.quality.confidence - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn new_fields_serialize_as_camel_case() {
+        let alert = Alert {
+            fingerprint: "dpcInterrupt".into(),
+            notify: false,
+            notify_generation: 2,
+            ..test_alert()
+        };
+        let json = serde_json::to_string(&alert).unwrap();
+        assert!(json.contains("\"fingerprint\":\"dpcInterrupt\""));
+        assert!(json.contains("\"notifyGeneration\":2"));
+        assert!(json.contains("\"state\":\"open\""));
     }
 
     #[test]

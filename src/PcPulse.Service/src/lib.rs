@@ -2,14 +2,17 @@
 
 pub mod alerting;
 pub mod analysis;
+pub mod baselines;
 pub mod config;
 pub mod etw;
 pub mod eventlog;
 pub mod metrics;
 pub mod models;
 pub mod pipe;
+pub mod quality;
 pub mod runtime;
 pub mod service;
+pub mod stats;
 pub mod storage;
 
 pub const SERVICE_NAME: &str = "PcPulseCollector";

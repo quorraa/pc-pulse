@@ -135,6 +135,10 @@ impl<P: HardwareProbe> HardwareSampler<P> {
             gpus,
             available,
             detail: notes.join("; "),
+            // `MetricCollector::collect` fills this in from the separate
+            // (much more slowly re-probed) inventory sampler immediately
+            // after every call, so this sampler owns none of it.
+            inventory: None,
         };
         self.cached.clone()
     }

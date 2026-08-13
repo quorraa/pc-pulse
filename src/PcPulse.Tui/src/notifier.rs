@@ -204,25 +204,13 @@ fn poll_alerts(window: HWND, stopping: Arc<AtomicBool>) {
                     );
                 }
                 failures = 0;
-                let current: HashSet<String> = snapshot
-                    .active_alerts
-                    .iter()
-                    .map(|alert| alert.id.clone())
-                    .collect();
-                if initialized && notifications_enabled {
-                    for alert in snapshot
-                        .active_alerts
-                        .iter()
-                        // Acknowledged and archived findings are both
-                        // deliberate user decisions; neither pops a balloon.
-                        .filter(|alert| {
-                            !alert.acknowledged && !alert.archived && !seen.contains(&alert.id)
-                        })
-                    {
+                let pending =
+                    pending_notifications(&snapshot.active_alerts, &mut seen, initialized);
+                if notifications_enabled {
+                    for alert in pending {
                         notify_alert(window, alert);
                     }
                 }
-                seen = current;
                 initialized = true;
             }
             Err(_) => {
@@ -244,6 +232,77 @@ fn poll_alerts(window: HWND, stopping: Arc<AtomicBool>) {
             thread::sleep(Duration::from_millis(100));
         }
     }
+}
+
+/// One tray-notification identity. The tray pops once per incident *and*
+/// notification generation, so bumping the generation (the service's renotify
+/// signal) re-pops a live incident and nothing else does.
+type NotificationKey = (String, u32);
+
+fn notification_key(alert: &Alert) -> NotificationKey {
+    (alert.id.clone(), alert.notify_generation)
+}
+
+/// Ceiling on remembered notifications before the poller forgets everything
+/// no longer on screen. Distinct incidents arrive at a rate of a few a day on
+/// a struggling machine, so this is a safety valve, not a working limit.
+const SEEN_CAP: usize = 512;
+
+/// Which active findings should pop a balloon this poll, updating what the
+/// poller has seen.
+///
+/// Extracted from [`poll_alerts`] so the policy is testable without a window
+/// handle or a live collector -- the rest of that loop is Win32 plumbing.
+///
+/// A finding pops when the service marked it notifiable (`notify`), the user
+/// has not acknowledged or archived it, and this `(id, generation)` pair is
+/// new. Old-service compatibility rides on the model defaults: a record
+/// without the calibration fields deserializes as `notify = true,
+/// notify_generation = 0`, which is exactly the pre-calibration behavior.
+fn pending_notifications<'a>(
+    active: &'a [Alert],
+    seen: &mut HashSet<NotificationKey>,
+    initialized: bool,
+) -> Vec<&'a Alert> {
+    let pending: Vec<&Alert> = if initialized {
+        active
+            .iter()
+            // Acknowledged and archived findings are both deliberate user
+            // decisions; neither pops a balloon.
+            .filter(|alert| {
+                alert.notify
+                    && !alert.acknowledged
+                    && !alert.archived
+                    && !seen.contains(&notification_key(alert))
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    // Remember only what the service considers notifiable. A suppressed
+    // finding is deliberately not recorded: when its quality later clears the
+    // notification floor it has to pop, even though its generation never
+    // changed.
+    //
+    // The memory outlives the finding on purpose. An incident that resolves
+    // and reopens inside the service's quiet period comes back with the same
+    // id and the same generation, and reopening is deliberately silent -- a
+    // per-poll snapshot of what is on screen would have forgotten it and
+    // popped the same balloon twice.
+    for alert in active.iter().filter(|alert| alert.notify) {
+        seen.insert(notification_key(alert));
+    }
+    if seen.len() > SEEN_CAP {
+        // A safety valve, not a policy: drop everything that is not still on
+        // screen rather than growing without bound across a long session.
+        // Accepted hole: an incident evicted here that later resolves and
+        // reopens pops a second balloon. It takes 512+ distinct notified
+        // incidents in one tray session to reach, and a duplicate balloon is
+        // a better failure than unbounded memory.
+        let live: HashSet<&str> = active.iter().map(|alert| alert.id.as_str()).collect();
+        seen.retain(|(id, _)| live.contains(id.as_str()));
+    }
+    pending
 }
 
 fn notify_alert(window: HWND, alert: &Alert) {
@@ -327,4 +386,165 @@ pub fn show_fatal_error(message: &str) -> Result<()> {
 
 fn wide(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(Some(0)).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pcpulse_service::models::{AlertQuality, IncidentState};
+
+    fn alert(id: &str) -> Alert {
+        Alert {
+            id: id.into(),
+            kind: "sustainedCpu".into(),
+            severity: Severity::Warning,
+            first_seen_ms: 0,
+            last_seen_ms: 0,
+            process_id: Some(42),
+            process_name: Some("worker.exe".into()),
+            title: "Sustained CPU usage".into(),
+            explanation: String::new(),
+            evidence: Vec::new(),
+            recommendation: String::new(),
+            acknowledged: false,
+            occurrence_count: 1,
+            resolved_at_ms: None,
+            archived: false,
+            fingerprint: "sustainedCpu:42:1".into(),
+            state: IncidentState::Open,
+            quality: AlertQuality::default(),
+            notify: true,
+            notify_generation: 0,
+        }
+    }
+
+    fn ids(pending: Vec<&Alert>) -> Vec<String> {
+        pending.iter().map(|alert| alert.id.clone()).collect()
+    }
+
+    #[test]
+    fn the_first_poll_primes_without_popping() {
+        let mut seen = HashSet::new();
+        let active = vec![alert("a"), alert("b")];
+        assert!(pending_notifications(&active, &mut seen, false).is_empty());
+        // Everything present at startup is now remembered, so the next poll
+        // stays quiet too.
+        assert!(pending_notifications(&active, &mut seen, true).is_empty());
+    }
+
+    #[test]
+    fn a_notifiable_finding_pops_once_and_not_again() {
+        let mut seen = HashSet::new();
+        pending_notifications(&[], &mut seen, false);
+        let active = vec![alert("a")];
+        assert_eq!(ids(pending_notifications(&active, &mut seen, true)), ["a"]);
+        assert!(pending_notifications(&active, &mut seen, true).is_empty());
+    }
+
+    #[test]
+    fn a_generation_bump_pops_the_same_incident_again() {
+        let mut seen = HashSet::new();
+        let mut active = vec![alert("a")];
+        pending_notifications(&active, &mut seen, false);
+        assert!(pending_notifications(&active, &mut seen, true).is_empty());
+        // The service escalated (or the fingerprint materially changed) and
+        // bumped the generation: the same incident earns a fresh balloon.
+        active[0].notify_generation = 1;
+        assert_eq!(ids(pending_notifications(&active, &mut seen, true)), ["a"]);
+        assert!(pending_notifications(&active, &mut seen, true).is_empty());
+        // Nothing else about the record re-pops it.
+        active[0].occurrence_count = 99;
+        active[0].last_seen_ms = 500;
+        active[0].quality.confidence = 0.9;
+        assert!(pending_notifications(&active, &mut seen, true).is_empty());
+    }
+
+    #[test]
+    fn a_suppressed_finding_stays_silent_until_the_service_marks_it_notifiable() {
+        let mut seen = HashSet::new();
+        let mut active = vec![alert("a")];
+        active[0].notify = false;
+        pending_notifications(&active, &mut seen, false);
+        for _ in 0..3 {
+            assert!(pending_notifications(&active, &mut seen, true).is_empty());
+        }
+        // Its quality cleared the floor. The generation never moved, so the
+        // poller must not have banked this pair while it was suppressed.
+        active[0].notify = true;
+        assert_eq!(ids(pending_notifications(&active, &mut seen, true)), ["a"]);
+        assert!(pending_notifications(&active, &mut seen, true).is_empty());
+    }
+
+    #[test]
+    fn a_reopened_incident_the_user_already_saw_stays_silent() {
+        let mut seen = HashSet::new();
+        pending_notifications(&[], &mut seen, false);
+        let active = vec![alert("a")];
+        assert_eq!(ids(pending_notifications(&active, &mut seen, true)), ["a"]);
+        // It resolves and leaves the snapshot for a while.
+        for _ in 0..3 {
+            assert!(pending_notifications(&[], &mut seen, true).is_empty());
+        }
+        // The service reopens it inside the quiet period: same incident, same
+        // generation, and the user has already been told about it.
+        assert!(pending_notifications(&active, &mut seen, true).is_empty());
+        // A refire past the quiet period is a new incident with a new id, and
+        // that is news.
+        let fresh = vec![alert("b")];
+        assert_eq!(ids(pending_notifications(&fresh, &mut seen, true)), ["b"]);
+    }
+
+    #[test]
+    fn the_poller_remembers_within_a_bound() {
+        let mut seen = HashSet::new();
+        pending_notifications(&[], &mut seen, false);
+        for index in 0..(SEEN_CAP * 2) {
+            let active = vec![alert(&format!("incident-{index}"))];
+            assert_eq!(
+                ids(pending_notifications(&active, &mut seen, true)).len(),
+                1
+            );
+            assert!(seen.len() <= SEEN_CAP + 1, "memory must stay bounded");
+        }
+    }
+
+    #[test]
+    fn acknowledged_and_archived_findings_never_pop() {
+        for decide in [
+            |alert: &mut Alert| alert.acknowledged = true,
+            |alert: &mut Alert| alert.archived = true,
+        ] {
+            let mut seen = HashSet::new();
+            pending_notifications(&[], &mut seen, false);
+            let mut active = vec![alert("a")];
+            decide(&mut active[0]);
+            assert!(pending_notifications(&active, &mut seen, true).is_empty());
+            // The user's decision is remembered, so undoing it does not pop a
+            // balloon for a finding they already dealt with.
+            active[0].acknowledged = false;
+            active[0].archived = false;
+            assert!(pending_notifications(&active, &mut seen, true).is_empty());
+        }
+    }
+
+    #[test]
+    fn a_pre_calibration_record_notifies_exactly_as_it_used_to() {
+        // A payload from a service that predates the quality layer: no
+        // notify, no generation, no quality. It must pop like it always did.
+        let legacy: Alert = serde_json::from_str(
+            r#"{"id":"legacy","kind":"sustainedCpu","severity":"warning","firstSeenMs":1,
+                "lastSeenMs":2,"processId":42,"processName":"worker.exe","title":"t",
+                "explanation":"e","evidence":[],"recommendation":"r","acknowledged":false,
+                "occurrenceCount":1,"resolvedAtMs":null}"#,
+        )
+        .unwrap();
+        assert!(legacy.notify && legacy.notify_generation == 0);
+        let mut seen = HashSet::new();
+        pending_notifications(&[], &mut seen, false);
+        let active = vec![legacy];
+        assert_eq!(
+            ids(pending_notifications(&active, &mut seen, true)),
+            ["legacy"]
+        );
+    }
 }
