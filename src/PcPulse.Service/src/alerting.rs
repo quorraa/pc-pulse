@@ -2,7 +2,7 @@ use crate::{
     baselines::RunningStats,
     config::Settings,
     metrics::interrupts::VerdictState,
-    models::{Alert, Evidence, IncidentState, ProcessMetric, Severity, SystemMetric},
+    models::{Alert, AlertQuality, Evidence, IncidentState, ProcessMetric, Severity, SystemMetric},
     quality::{Calibration, NotifyDecision, QualityInputs, decide, score},
     stats::{TrendPoint, TrendShape, classify_trend},
 };
@@ -197,6 +197,18 @@ struct IncidentCalibration {
     /// restate them, and the last thing the detector said is the best thing
     /// known about it.
     quality: CandidateQuality,
+    /// Set when this run of breaching samples began by reopening a resolved
+    /// incident: the severity that incident was remembered at before it
+    /// resolved. A reopen has no active `previous` alert to escalate
+    /// against (the incident was not in `active` a moment ago), so the
+    /// scoring pass substitutes this remembered severity instead -- a
+    /// reopen at a higher band must still renotify. Persistence resets on a
+    /// reopen and can take several samples to clear the notify floor again,
+    /// so this stays set (surviving across evaluations) until a scoring
+    /// pass actually gets to use it, at which point it is cleared so a
+    /// genuine escalation bumps the generation exactly once rather than on
+    /// every later sample.
+    reopened_from_severity: Option<Severity>,
 }
 
 /// When an incident was last marked notifiable, and at which generation.
@@ -222,6 +234,11 @@ struct ResolvedIncident {
     first_seen_ms: i64,
     occurrence_count: u32,
     notify_generation: u32,
+    /// The incident's severity at the moment it resolved. Without this, an
+    /// escalation on reopen (e.g. resolved at Warning, reopens at Critical)
+    /// is undetectable: the reopen has no active `previous` alert to compare
+    /// against, so the escalation check has nothing to escalate from.
+    severity: Severity,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -267,6 +284,14 @@ pub struct AlertEngine {
     /// where the incident is held open by hysteresis, with no candidate to
     /// carry it -- and a dropped flag is a renotification the user never got.
     pending_verdict_change: bool,
+    /// The collector's own working-set samples, retained to a fixed 30
+    /// minutes -- independent of `history`'s 5-minute cap, which exists for
+    /// the per-process growth *deltas* (`memoryGrowth`, `handleGrowth`,
+    /// `threadGrowth`), not for `collectorGrowth`'s trend shape. `collectorGrowth`
+    /// needs a genuine 30-minute span to classify Monotonic vs. Plateau vs.
+    /// Returning, so it keeps its own longer-lived buffer rather than
+    /// widening `history` for every process.
+    collector_growth_points: VecDeque<TrendPoint>,
 }
 
 impl AlertEngine {
@@ -297,6 +322,7 @@ impl AlertEngine {
                         first_seen_ms: alert.first_seen_ms,
                         occurrence_count: alert.occurrence_count,
                         notify_generation: alert.notify_generation,
+                        severity: alert.severity,
                     },
                 );
             }
@@ -625,25 +651,35 @@ impl AlertEngine {
 
             if process.pid == std::process::id() {
                 let memory_mb = process.working_set_bytes as f64 / MIB;
-                let memory_breached = memory_mb >= 25.0;
-                let cpu_breached = process.cpu_percent >= settings.collector_cpu_percent;
-                let handles_breached = process.handle_count >= COLLECTOR_HANDLE_BUDGET;
+                let memory_ratio = memory_mb / 25.0;
+                let cpu_ratio = ratio(process.cpu_percent, settings.collector_cpu_percent);
+                let handles_ratio =
+                    f64::from(process.handle_count) / f64::from(COLLECTOR_HANDLE_BUDGET);
+                let memory_breached = memory_ratio >= 1.0;
+                let cpu_breached = cpu_ratio >= 1.0;
+                let handles_breached = handles_ratio >= 1.0;
+                // Three absolute budgets share one incident, so its exit
+                // reading is how far the worst dimension sits above its
+                // own ceiling; 1.0 is the entry threshold by construction.
+                let worst_ratio = [memory_ratio, cpu_ratio, handles_ratio]
+                    .into_iter()
+                    .fold(0.0_f64, f64::max);
+                let budget_key = process_key("collectorBudget", process);
                 if track_exits {
-                    // Three absolute budgets share one incident, so its exit
-                    // reading is how far the worst dimension sits above its
-                    // own ceiling; 1.0 is the entry threshold by construction.
-                    readings.insert(
-                        process_key("collectorBudget", process),
-                        [
-                            memory_mb / 25.0,
-                            ratio(process.cpu_percent, settings.collector_cpu_percent),
-                            f64::from(process.handle_count) / f64::from(COLLECTOR_HANDLE_BUDGET),
-                        ]
-                        .into_iter()
-                        .fold(0.0_f64, f64::max),
-                    );
+                    readings.insert(budget_key.clone(), worst_ratio);
                 }
                 if memory_breached || cpu_breached || handles_breached {
+                    // How long the worst dimension has sat at or above its
+                    // bare ceiling without a break, from the calibration the
+                    // *previous* evaluation left behind -- this sample's own
+                    // streak has not been recorded yet. Feeds the alternate
+                    // ten-minute entry path below.
+                    let continuous_breach_ms = self
+                        .calibrations
+                        .get(&budget_key)
+                        .and_then(|terms| terms.breach_since_ms)
+                        .map_or(0, |since| process.timestamp_ms - since);
+                    let severity = collector_budget_severity(worst_ratio, continuous_breach_ms);
                     let mut budget_evidence = Vec::new();
                     if memory_breached {
                         budget_evidence.push(evidence(
@@ -686,7 +722,7 @@ impl AlertEngine {
                     candidates.push(process_candidate(
                         process,
                         "collectorBudget",
-                        Severity::Critical,
+                        severity,
                         settings.sustained_samples.max(5),
                         "Collector resource budget exceeded",
                         "The PC Pulse collector has remained beyond at least one absolute production resource budget.".into(),
@@ -695,25 +731,65 @@ impl AlertEngine {
                     ).with_entry(1.0));
                 }
 
+                // A dedicated 30-minute buffer, independent of the 5-minute
+                // `history` used for growth deltas: `collectorGrowth` needs
+                // a genuine 30-minute span to classify Monotonic vs. Plateau
+                // vs. Returning.
+                self.collector_growth_points.push_back(TrendPoint {
+                    at_ms: process.timestamp_ms,
+                    value: process.working_set_bytes as f64,
+                });
+                let growth_cutoff = process.timestamp_ms - COLLECTOR_GROWTH_WINDOW_MS;
+                while self
+                    .collector_growth_points
+                    .front()
+                    .is_some_and(|point| point.at_ms < growth_cutoff)
+                {
+                    self.collector_growth_points.pop_front();
+                }
+
                 let age_ms = process.timestamp_ms.saturating_sub(process.started_at_ms);
                 if age_ms >= 10 * 60_000
-                    && let Some(growth) = collector_working_set_growth(history)
+                    && let Some((severity, growth)) =
+                        collector_growth_shape(self.collector_growth_points.make_contiguous())
                 {
+                    let (title, explanation, recommendation): (&str, String, &str) = match severity
+                    {
+                        Severity::Warning => (
+                            "Collector working set is trending upward",
+                            "After startup warm-up, the PC Pulse collector working set rose through each segment of a mature 30-minute observation window instead of making a one-time cache allocation.".into(),
+                            "Capture diagnostics and keep observing. Restart only the PC Pulse Collector service if the trend continues; report repeatable growth rather than terminating monitored applications.",
+                        ),
+                        _ => (
+                            "Collector working set grew, then leveled off or gave it back",
+                            "The PC Pulse collector working set grew earlier in the 30-minute observation window but has since plateaued or returned toward its starting level. Recorded for visibility; not an active leak.".into(),
+                            "No action needed while the trend does not persist. Keep observing if growth resumes.",
+                        ),
+                    };
                     candidates.push(process_candidate(
                         process,
                         "collectorGrowth",
-                        Severity::Warning,
+                        severity,
                         settings.sustained_samples.max(15),
-                        "Collector working set is trending upward",
-                        "After startup warm-up, the PC Pulse collector working set rose through each segment of a mature observation window instead of making a one-time cache allocation.".into(),
+                        title,
+                        explanation,
                         vec![
                             evidence("Sustained growth", format!("{:.1} MB", growth.growth_mb)),
-                            evidence("Early-window mean", format!("{:.1} MB", growth.first_mean_mb)),
-                            evidence("Mid-window mean", format!("{:.1} MB", growth.middle_mean_mb)),
+                            evidence(
+                                "Early-window mean",
+                                format!("{:.1} MB", growth.first_mean_mb),
+                            ),
+                            evidence(
+                                "Mid-window mean",
+                                format!("{:.1} MB", growth.middle_mean_mb),
+                            ),
                             evidence("Recent mean", format!("{:.1} MB", growth.last_mean_mb)),
-                            evidence("Observation window", format!("{:.0} seconds", growth.window_seconds)),
+                            evidence(
+                                "Observation window",
+                                format!("{:.0} seconds", growth.window_seconds),
+                            ),
                         ],
-                        "Capture diagnostics and keep observing. Restart only the PC Pulse Collector service if the trend continues; report repeatable growth rather than terminating monitored applications.",
+                        recommendation,
                     ));
                 }
             }
@@ -723,7 +799,13 @@ impl AlertEngine {
             (a.read_bytes_per_sec + a.write_bytes_per_sec)
                 .total_cmp(&(b.read_bytes_per_sec + b.write_bytes_per_sec))
         });
-        let disk_key = format!("diskLatency:{}", owner.map_or(0, |p| p.pid));
+        // Fixed key, matching `dpcInterrupt`'s pattern: the top-I/O owner
+        // churns sample to sample, and embedding its pid in the fingerprint
+        // used to resolve-and-split the incident on every attribution change,
+        // defeating hysteresis. The owner still identifies itself in the
+        // evidence and explanation below; only the incident identity is
+        // fixed to the condition, not to whoever is currently blamed for it.
+        let disk_key = "diskLatency".to_string();
         if track_exits {
             readings.insert(disk_key.clone(), system.disk_latency_ms);
             // The kernel-pool detector fires on the excess over its learned
@@ -913,6 +995,12 @@ impl AlertEngine {
                     .resolved_memory
                     .remove(&candidate.key)
                     .filter(|prior| system.timestamp_ms - prior.resolved_at_ms <= QUIET_PERIOD_MS);
+                if let Some(prior) = &reopened {
+                    self.calibrations
+                        .entry(candidate.key.clone())
+                        .or_default()
+                        .reopened_from_severity = Some(prior.severity);
+                }
                 let alert = Alert {
                     id: reopened
                         .as_ref()
@@ -975,6 +1063,7 @@ impl AlertEngine {
                         first_seen_ms: alert.first_seen_ms,
                         occurrence_count: alert.occurrence_count,
                         notify_generation: alert.notify_generation,
+                        severity: alert.severity,
                     },
                 );
                 resolved.push(alert);
@@ -1046,11 +1135,17 @@ impl AlertEngine {
             // at a pass that actually scores the incident.
             let pending_change = key.as_str() == DPC_KEY && self.pending_verdict_change;
             let material_change = terms.material_change || pending_change;
+            // A reopen has no active `previous` alert to escalate against
+            // (a moment ago the incident was resolved, not open), so stand
+            // in the severity it was remembered at before it resolved.
+            let remembered = terms
+                .reopened_from_severity
+                .map(|severity| remembered_previous(severity, notified.is_some()));
             let decision = decide(
                 alert,
                 &quality,
                 calibration.learning,
-                previous.get(key),
+                remembered.as_ref().or_else(|| previous.get(key)),
                 material_change,
             );
             // The detector's own bar, applied after the generic floors and
@@ -1077,6 +1172,16 @@ impl AlertEngine {
             alert.notify = decision.notify;
             if decision.bump_generation {
                 alert.notify_generation = alert.notify_generation.saturating_add(1);
+            }
+            if decision.notify {
+                // Consumed: this incident has now actually been scored
+                // against its pre-reopen severity, whether or not that
+                // produced a bump. Later samples compare against its own
+                // ongoing state like any other open incident, so a genuine
+                // escalation cannot bump the generation more than once.
+                if let Some(entry) = self.calibrations.get_mut(key) {
+                    entry.reopened_from_severity = None;
+                }
             }
             if decision.notify
                 && notified.is_none_or(|memory| memory.generation != alert.notify_generation)
@@ -1168,31 +1273,37 @@ impl AlertEngine {
     }
 }
 
-fn collector_working_set_growth(history: &VecDeque<ProcessPoint>) -> Option<CollectorGrowth> {
-    let first = history.front()?;
-    let last = history.back()?;
-    let span_ms = last.timestamp_ms.saturating_sub(first.timestamp_ms);
-    if span_ms < 4 * 60_000 {
+/// The window `classify_trend` must see before it will call a shape at all
+/// for `collectorGrowth`, matching the spec's "persist >= 30 minutes"
+/// requirement -- a shorter apparent trend is noise, not a leak.
+const COLLECTOR_GROWTH_WINDOW_MS: i64 = 30 * 60_000;
+/// Minimum absolute working-set movement for a `Monotonic` or still-elevated
+/// `PartialRelease` shape to count as a real trend rather than sampling
+/// jitter in the collector's own working set.
+const COLLECTOR_GROWTH_MIN_BYTES: f64 = MIB;
+
+/// Classify the collector's own working-set trend over its rolling
+/// 30-minute buffer and band it into a severity. `Monotonic` growth (or a
+/// `PartialRelease` that is still mostly stuck, per `stats::classify_trend`'s
+/// contract) is a live trend: Warning. `Plateau` or `Returning` -- grew,
+/// then leveled off or gave most of it back -- is recorded for visibility
+/// but is not an active leak: Info, and (being event-shaped, like every
+/// other candidate here) eligible to resolve the moment neither the
+/// candidate nor the hysteresis hold applies. Anything else (not enough
+/// span or data, or a real trend too small to matter) raises nothing.
+fn collector_growth_shape(points: &[TrendPoint]) -> Option<(Severity, CollectorGrowth)> {
+    if points.len() < 6 {
         return None;
     }
+    let first_ms = points.iter().map(|point| point.at_ms).min()?;
+    let last_ms = points.iter().map(|point| point.at_ms).max()?;
+    let span_ms = last_ms.saturating_sub(first_ms);
     let third = span_ms / 3;
-    let first_end = first.timestamp_ms + third;
-    let middle_end = first.timestamp_ms + 2 * third;
-    let (first_mean, first_samples) = mean_working_set(
-        history
-            .iter()
-            .filter(|point| point.timestamp_ms <= first_end),
-    );
-    let (middle_mean, middle_samples) = mean_working_set(
-        history
-            .iter()
-            .filter(|point| point.timestamp_ms > first_end && point.timestamp_ms <= middle_end),
-    );
-    let (last_mean, last_samples) = mean_working_set(
-        history
-            .iter()
-            .filter(|point| point.timestamp_ms > middle_end),
-    );
+    let first_end = first_ms + third;
+    let middle_end = first_ms + 2 * third;
+    let (first_mean, first_samples) = trend_mean(points, None, first_end);
+    let (middle_mean, middle_samples) = trend_mean(points, Some(first_end), middle_end);
+    let (last_mean, last_samples) = trend_mean(points, Some(middle_end), last_ms);
     if [first_samples, middle_samples, last_samples]
         .into_iter()
         .any(|samples| samples < 5)
@@ -1200,52 +1311,54 @@ fn collector_working_set_growth(history: &VecDeque<ProcessPoint>) -> Option<Coll
         return None;
     }
 
-    // The shape test (three equal-duration segments, each successive mean
-    // must clear the prior by a minimum step) is the shared primitive in
-    // `stats::classify_trend`; only the collector-specific minimums
-    // (MIB total, MIB/4 per step) and the >=5-samples-per-segment gate above
-    // stay local to this wrapper.
-    //
-    // `first_mean`/`middle_mean`/`last_mean` above are recomputed a second
-    // time inside `classify_trend` (in `f64`, from the same three windows).
-    // That's intentional duplication, not an oversight: this function needs
-    // the `u128`-summed, precision-preserving means for the reported MB
-    // evidence fields below, while `classify_trend` only needs `f64` means
-    // for its own shape decision -- collapsing the two would mean threading
-    // collector-specific mean-computation details into a shared primitive
-    // meant to stay generic.
-    let points: Vec<TrendPoint> = history
-        .iter()
-        .map(|point| TrendPoint {
-            at_ms: point.timestamp_ms,
-            value: point.working_set_bytes as f64,
-        })
-        .collect();
-    let TrendShape::Monotonic { total_growth } = classify_trend(&points, 4 * 60_000, MIB / 4.0)
-    else {
-        return None;
+    let shape = classify_trend(points, COLLECTOR_GROWTH_WINDOW_MS, MIB / 4.0);
+    let (severity, growth_bytes) = match shape {
+        TrendShape::Monotonic { total_growth } if total_growth >= COLLECTOR_GROWTH_MIN_BYTES => {
+            (Severity::Warning, total_growth)
+        }
+        TrendShape::PartialRelease { remaining } if remaining >= COLLECTOR_GROWTH_MIN_BYTES => {
+            // Still mostly stuck per `classify_trend`'s own contract (see
+            // `stats::RETURNING_TOLERANCE_FRACTION`): a live trend, not a
+            // resolved excursion.
+            (Severity::Warning, remaining)
+        }
+        TrendShape::Plateau | TrendShape::Returning => (Severity::Info, last_mean - first_mean),
+        _ => return None,
     };
-    if total_growth < MIB {
-        return None;
-    }
 
-    Some(CollectorGrowth {
-        growth_mb: total_growth / MIB,
-        first_mean_mb: first_mean / MIB,
-        middle_mean_mb: middle_mean / MIB,
-        last_mean_mb: last_mean / MIB,
-        window_seconds: span_ms as f64 / 1_000.0,
-    })
+    Some((
+        severity,
+        CollectorGrowth {
+            growth_mb: growth_bytes / MIB,
+            first_mean_mb: first_mean / MIB,
+            middle_mean_mb: middle_mean / MIB,
+            last_mean_mb: last_mean / MIB,
+            window_seconds: span_ms as f64 / 1_000.0,
+        },
+    ))
 }
 
-fn mean_working_set<'a>(points: impl Iterator<Item = &'a ProcessPoint>) -> (f64, usize) {
-    let (sum, count) = points.fold((0_u128, 0_usize), |(sum, count), point| {
-        (sum + u128::from(point.working_set_bytes), count + 1)
-    });
+/// Mean of the points whose timestamp falls in `(from_exclusive, to_inclusive]`,
+/// mirroring `stats::classify_trend`'s own internal segment split so the
+/// evidence reports exactly the windows the shape decision was made from.
+fn trend_mean(
+    points: &[TrendPoint],
+    from_exclusive: Option<i64>,
+    to_inclusive: i64,
+) -> (f64, usize) {
+    let mut sum = 0.0;
+    let mut count = 0usize;
+    for point in points {
+        let after_start = from_exclusive.is_none_or(|from| point.at_ms > from);
+        if after_start && point.at_ms <= to_inclusive {
+            sum += point.value;
+            count += 1;
+        }
+    }
     if count == 0 {
         (0.0, 0)
     } else {
-        (sum as f64 / count as f64, count)
+        (sum / count as f64, count)
     }
 }
 
@@ -1264,6 +1377,69 @@ fn ratio(value: f64, threshold: f64) -> f64 {
         f64::INFINITY
     } else {
         0.0
+    }
+}
+
+/// Fraction of the collector budget ceiling a reading must clear before the
+/// band counts as a genuine overage rather than a hairline crossing.
+const COLLECTOR_BUDGET_WARNING_BAND: f64 = 1.15;
+/// Fraction of the ceiling at which a collector budget overage is Critical
+/// regardless of how long it has run.
+const COLLECTOR_BUDGET_CRITICAL_BAND: f64 = 2.0;
+/// How long a reading may sit at the bare ceiling (below the 1.15x band)
+/// before the alternate entry path escalates it to Warning anyway. A single
+/// hairline crossing must stay Info; a reading stuck there for this long is
+/// no longer a hairline.
+const COLLECTOR_BUDGET_CONTINUOUS_WARNING_MS: i64 = 10 * 60_000;
+
+/// Bands a collector budget reading (already normalized to a ratio of its
+/// ceiling, 1.0 = the ceiling itself) into a severity. `[1.0, 1.15)` is
+/// in-band: Info, history-only, and never escalates on ratio alone. Above
+/// the band and below double the ceiling is Warning; at or past double is
+/// Critical outright. The alternate path: a reading that never crosses 1.15x
+/// but has sat at or above the bare ceiling continuously for ten minutes
+/// still escalates to Warning -- a stuck low-grade overage should not go
+/// unflagged forever, even though a momentary hairline crossing must stay
+/// Info (see `a_hairline_ceiling_crossing_is_informational_never_critical`).
+fn collector_budget_severity(worst_ratio: f64, continuous_breach_ms: i64) -> Severity {
+    if worst_ratio >= COLLECTOR_BUDGET_CRITICAL_BAND {
+        Severity::Critical
+    } else if worst_ratio >= COLLECTOR_BUDGET_WARNING_BAND
+        || continuous_breach_ms >= COLLECTOR_BUDGET_CONTINUOUS_WARNING_MS
+    {
+        Severity::Warning
+    } else {
+        Severity::Info
+    }
+}
+
+/// A stand-in `previous` for [`quality::decide`]'s escalation check when the
+/// real "previous" is not an active alert but a resolved incident's
+/// remembered state (a reopen). `decide` only reads `.severity` and
+/// `.notify` off of `previous`, so every other field here is an unused
+/// placeholder -- this value is never stored or surfaced anywhere.
+fn remembered_previous(severity: Severity, notified: bool) -> Alert {
+    Alert {
+        id: String::new(),
+        kind: String::new(),
+        severity,
+        first_seen_ms: 0,
+        last_seen_ms: 0,
+        process_id: None,
+        process_name: None,
+        title: String::new(),
+        explanation: String::new(),
+        evidence: Vec::new(),
+        recommendation: String::new(),
+        acknowledged: false,
+        occurrence_count: 0,
+        resolved_at_ms: None,
+        archived: false,
+        fingerprint: String::new(),
+        state: IncidentState::Resolved,
+        quality: AlertQuality::default(),
+        notify: notified,
+        notify_generation: 0,
     }
 }
 
@@ -1575,6 +1751,11 @@ mod tests {
 
     #[test]
     fn collector_critical_evidence_leads_with_the_actual_breach() {
+        // Calibration banding (Task 7) means a ratio has to clear 2x the
+        // ceiling to read Critical -- 0.25% against the 0.2% default ceiling
+        // is only 1.25x (in the Warning band), so this fixture was bumped
+        // to 0.5% (2.5x) to keep exercising the Critical evidence-ordering
+        // path this test is actually about.
         let mut engine = AlertEngine::default();
         let settings = Settings {
             sustained_samples: 2,
@@ -1588,7 +1769,7 @@ mod tests {
                 &[collector_process(
                     system.timestamp_ms,
                     0,
-                    0.25,
+                    0.5,
                     20 * 1024 * 1024,
                     210,
                 )],
@@ -1609,15 +1790,20 @@ mod tests {
 
     #[test]
     fn mature_continuous_collector_growth_is_a_warning() {
+        // Calibration (Task 7) moved `collectorGrowth` to a genuine
+        // 30-minute `classify_trend` window, so this fixture was extended
+        // from ~5 minutes to just past 30 minutes of steady linear growth
+        // (still well under the 25 MB budget ceiling, so it does not also
+        // trip `collectorBudget`).
         let mut engine = AlertEngine::default();
         let settings = Settings {
             sustained_samples: 2,
             ..Settings::default()
         };
         let mut system = SystemMetric::default();
-        for index in 0..160 {
+        for index in 0..950 {
             system.timestamp_ms = 10 * 60_000 + index * 2_000;
-            let working_set = 18 * 1024 * 1024 + index as u64 * 18 * 1024;
+            let working_set = 18 * 1024 * 1024 + index as u64 * 4 * 1024;
             engine.evaluate(
                 &system,
                 &[collector_process(
@@ -1644,6 +1830,460 @@ mod tests {
                 .values()
                 .all(|alert| alert.kind != "collectorBudget")
         );
+    }
+
+    #[test]
+    fn disk_latency_owner_churn_does_not_split_the_incident() {
+        // Carried assignment: the diskLatency key used to embed the top-I/O
+        // owner's pid, so owner churn (a different process becomes the
+        // busiest reader/writer each sample) resolved-and-split the
+        // incident and defeated hysteresis entirely (confirmed by probe).
+        // The fingerprint is now the fixed string "diskLatency", matching
+        // `dpcInterrupt`'s pattern -- one incident per latency condition
+        // regardless of attribution churn.
+        let mut engine = AlertEngine::default();
+        let settings = Settings {
+            sustained_samples: 2,
+            ..Settings::default()
+        };
+        let mut system = SystemMetric {
+            disk_latency_ms: 999.0,
+            ..SystemMetric::default()
+        };
+        let mut ids: HashSet<String> = HashSet::new();
+        for index in 0..20 {
+            system.timestamp_ms = index * 2_000;
+            // Alternate which process is the busiest I/O owner every sample.
+            let mut a = process(system.timestamp_ms, 1.0, 20);
+            a.pid = 100;
+            a.name = "reader.exe".into();
+            let mut b = process(system.timestamp_ms, 1.0, 20);
+            b.pid = 200;
+            b.name = "writer.exe".into();
+            if index % 2 == 0 {
+                a.read_bytes_per_sec = 50.0 * MIB;
+                b.read_bytes_per_sec = 1.0 * MIB;
+            } else {
+                a.read_bytes_per_sec = 1.0 * MIB;
+                b.read_bytes_per_sec = 50.0 * MIB;
+            }
+            let evaluation = engine.evaluate(&system, &[a, b], &settings, Calibration::default());
+            for alert in evaluation
+                .active
+                .iter()
+                .filter(|alert| alert.kind == "diskLatency")
+            {
+                ids.insert(alert.id.clone());
+            }
+        }
+        assert_eq!(
+            ids.len(),
+            1,
+            "owner churn must not resolve-and-split the incident: {ids:?}"
+        );
+    }
+
+    #[test]
+    fn a_hairline_ceiling_crossing_is_informational_never_critical() {
+        // The Lenovo field case: ceiling 0.75%, observed 0.769% (in-band).
+        // Sustained for many samples: alert exists at Info, notify == false,
+        // severity never reaches Critical; telemetry recorded (alert present
+        // in evaluation output).
+        let mut engine = AlertEngine::default();
+        let settings = Settings {
+            sustained_samples: 2,
+            collector_cpu_percent: 0.75,
+            ..Settings::default()
+        };
+        let mut system = SystemMetric::default();
+        let mut severities = Vec::new();
+        // Two minutes -- comfortably under the ten-minute alternate entry
+        // path, so only the ratio band is under test here.
+        for index in 0..60 {
+            system.timestamp_ms = 20 * 60_000 + index * 2_000;
+            let evaluation = engine.evaluate(
+                &system,
+                &[collector_process(
+                    system.timestamp_ms,
+                    0,
+                    0.769,
+                    16 << 20,
+                    200,
+                )],
+                &settings,
+                Calibration::default(),
+            );
+            if let Some(alert) = evaluation
+                .active
+                .iter()
+                .find(|alert| alert.kind == "collectorBudget")
+            {
+                assert!(!alert.notify, "an in-band crossing must never notify");
+                severities.push(alert.severity);
+            }
+        }
+        assert!(
+            !severities.is_empty(),
+            "the crossing must be recorded in evaluation output"
+        );
+        assert!(
+            severities
+                .iter()
+                .all(|&severity| severity == Severity::Info),
+            "must stay Info throughout, never Critical: {severities:?}"
+        );
+    }
+
+    #[test]
+    fn the_band_and_double_ceiling_set_severity() {
+        // 0.9% vs 0.75 ceiling (>=1.15x) sustained => Warning.
+        // 1.6% vs 0.75 ceiling (>=2x) sustained => Critical.
+        let severity_at = |cpu: f64| {
+            let mut engine = AlertEngine::default();
+            let settings = Settings {
+                sustained_samples: 2,
+                collector_cpu_percent: 0.75,
+                ..Settings::default()
+            };
+            let mut system = SystemMetric::default();
+            for index in 0..5 {
+                system.timestamp_ms = 20 * 60_000 + index * 2_000;
+                engine.evaluate(
+                    &system,
+                    &[collector_process(
+                        system.timestamp_ms,
+                        0,
+                        cpu,
+                        16 << 20,
+                        200,
+                    )],
+                    &settings,
+                    Calibration::default(),
+                );
+            }
+            engine
+                .active
+                .values()
+                .find(|alert| alert.kind == "collectorBudget")
+                .map(|alert| alert.severity)
+        };
+        assert_eq!(severity_at(0.9), Some(Severity::Warning));
+        assert_eq!(severity_at(1.6), Some(Severity::Critical));
+    }
+
+    #[test]
+    fn a_stuck_bare_ceiling_reading_upgrades_to_warning_after_ten_minutes() {
+        // The alternate entry path: a reading that never crosses the 1.15x
+        // band but has sat at or above the bare ceiling continuously for ten
+        // minutes still escalates to Warning -- a stuck low-grade overage
+        // must not go unflagged forever, even though the same in-band ratio
+        // held only briefly (see the Lenovo case above) must stay Info.
+        let mut engine = AlertEngine::default();
+        let settings = Settings {
+            sustained_samples: 2,
+            collector_cpu_percent: 0.75,
+            ..Settings::default()
+        };
+        let mut system = SystemMetric::default();
+        let mut severities = Vec::new();
+        // Eleven minutes: past the ten-minute alternate-path threshold.
+        for index in 0..340 {
+            system.timestamp_ms = 20 * 60_000 + index * 2_000;
+            let evaluation = engine.evaluate(
+                &system,
+                &[collector_process(
+                    system.timestamp_ms,
+                    0,
+                    0.769,
+                    16 << 20,
+                    200,
+                )],
+                &settings,
+                Calibration::default(),
+            );
+            if let Some(alert) = evaluation
+                .active
+                .iter()
+                .find(|alert| alert.kind == "collectorBudget")
+            {
+                severities.push(alert.severity);
+            }
+        }
+        assert_eq!(
+            severities.first(),
+            Some(&Severity::Info),
+            "must start Info like any hairline crossing: {severities:?}"
+        );
+        assert_eq!(
+            severities.last(),
+            Some(&Severity::Warning),
+            "a bare-ceiling reading stuck for ten minutes must escalate to Warning: {severities:?}"
+        );
+        assert!(
+            severities
+                .iter()
+                .all(|&severity| severity != Severity::Critical),
+            "the alternate path only reaches Warning, never Critical: {severities:?}"
+        );
+    }
+
+    #[test]
+    fn working_set_oscillation_in_the_steady_range_stays_informational() {
+        // WS bouncing 11-16 MB for an hour: at most one incident, Info,
+        // notify == false, no reopen churn (single id throughout).
+        let mut engine = AlertEngine::default();
+        let settings = Settings {
+            sustained_samples: 2,
+            ..Settings::default()
+        };
+        let mut system = SystemMetric::default();
+        let mut ids: HashSet<String> = HashSet::new();
+        // High-frequency oscillation (an 8-second period) so any 30-minute
+        // trend window sees hundreds of complete cycles -- noise the shape
+        // classifier must not mistake for a trend.
+        for index in 0..1_800 {
+            system.timestamp_ms = index * 2_000;
+            let working_set: u64 = if index % 4 < 2 { 11 << 20 } else { 16 << 20 };
+            let evaluation = engine.evaluate(
+                &system,
+                &[collector_process(
+                    system.timestamp_ms,
+                    0,
+                    0.01,
+                    working_set,
+                    50,
+                )],
+                &settings,
+                Calibration::default(),
+            );
+            for alert in evaluation
+                .active
+                .iter()
+                .filter(|alert| alert.kind == "collectorGrowth" || alert.kind == "collectorBudget")
+            {
+                ids.insert(alert.id.clone());
+                assert_eq!(
+                    alert.severity,
+                    Severity::Info,
+                    "oscillation must never escalate: {alert:?}"
+                );
+                assert!(!alert.notify, "an Info incident must never notify");
+            }
+        }
+        assert!(
+            ids.len() <= 1,
+            "no reopen churn: at most one incident id throughout the hour: {ids:?}"
+        );
+    }
+
+    #[test]
+    fn a_thirty_minute_monotonic_climb_upgrades_to_warning_once() {
+        // Feed a genuine monotonic WS climb over 30+ min: Warning, notify
+        // true exactly once (generation bumps once).
+        let mut engine = AlertEngine::default();
+        let settings = Settings {
+            sustained_samples: 2,
+            ..Settings::default()
+        };
+        let mut system = SystemMetric::default();
+        let mut notify_flags = Vec::new();
+        let mut severities = Vec::new();
+        let mut generations = Vec::new();
+        for index in 0..1_000 {
+            system.timestamp_ms = 10 * 60_000 + index * 2_000;
+            let working_set = 18 * 1024 * 1024 + index as u64 * 4 * 1024;
+            let evaluation = engine.evaluate(
+                &system,
+                &[collector_process(
+                    system.timestamp_ms,
+                    0,
+                    0.05,
+                    working_set,
+                    210,
+                )],
+                &settings,
+                Calibration::default(),
+            );
+            if let Some(alert) = evaluation
+                .active
+                .iter()
+                .find(|alert| alert.kind == "collectorGrowth")
+            {
+                notify_flags.push(alert.notify);
+                severities.push(alert.severity);
+                generations.push(alert.notify_generation);
+            }
+        }
+        assert!(
+            !severities.is_empty(),
+            "the climb must eventually raise the incident"
+        );
+        assert!(
+            severities
+                .iter()
+                .all(|&severity| severity == Severity::Warning),
+            "growth must read Warning, never Info or Critical: {severities:?}"
+        );
+        // Exactly one rising edge: notify goes false -> true once and never
+        // flaps back for the rest of the run.
+        let mut rising_edges = 0;
+        let mut previous = false;
+        for &notify in &notify_flags {
+            if notify && !previous {
+                rising_edges += 1;
+            }
+            previous = notify;
+        }
+        assert_eq!(
+            rising_edges, 1,
+            "must become notify-worthy exactly once: {notify_flags:?}"
+        );
+        assert!(
+            *notify_flags.last().unwrap(),
+            "must still be notifying at the end of the climb"
+        );
+        // The generation that popped stays put once set: nothing escalates
+        // past Warning here, so there is nothing left to bump again.
+        let first_notify = notify_flags.iter().position(|&notify| notify).unwrap();
+        let generation_after_pop = generations[first_notify];
+        assert!(
+            generations[first_notify..]
+                .iter()
+                .all(|&generation| generation == generation_after_pop),
+            "the generation must not bump again while nothing escalates further: {generations:?}"
+        );
+    }
+
+    #[test]
+    fn a_reopen_at_a_higher_band_renotifies_with_a_generation_bump() {
+        // Carried assignment: `ResolvedIncident` must carry severity so a
+        // reopen at a higher band is detectable as an escalation. Resolve a
+        // collectorBudget incident at Warning, then reopen it within the
+        // quiet period at Critical (2x ceiling): same incident id, and the
+        // escalation bumps notify_generation exactly once. This is the only
+        // end-to-end escalation-on-reopen coverage in the codebase.
+        let mut engine = AlertEngine::default();
+        let settings = Settings {
+            sustained_samples: 2,
+            ..Settings::default()
+        };
+        let ceiling = settings.collector_cpu_percent;
+        let mut system = SystemMetric::default();
+
+        // Phase 1: open and notify at Warning (1.3x ceiling).
+        let mut opened = None;
+        for index in 0..15 {
+            system.timestamp_ms = 20 * 60_000 + index * 2_000;
+            let evaluation = engine.evaluate(
+                &system,
+                &[collector_process(
+                    system.timestamp_ms,
+                    0,
+                    ceiling * 1.3,
+                    1 << 20,
+                    50,
+                )],
+                &settings,
+                Calibration::default(),
+            );
+            if let Some(alert) = evaluation
+                .active
+                .iter()
+                .find(|alert| alert.kind == "collectorBudget" && alert.notify)
+            {
+                opened = Some(alert.clone());
+            }
+        }
+        let opened = opened.expect("the incident must actually notify at Warning before resolving");
+        assert_eq!(opened.severity, Severity::Warning);
+        let opened_generation = opened.notify_generation;
+
+        // Phase 2: recover well under the exit ratio and hold for a full
+        // sustained window to resolve.
+        let mut resolved = None;
+        for _ in 0..8 {
+            system.timestamp_ms += 2_000;
+            let evaluation = engine.evaluate(
+                &system,
+                &[collector_process(system.timestamp_ms, 0, 0.0, 1 << 20, 10)],
+                &settings,
+                Calibration::default(),
+            );
+            resolved = resolved.or_else(|| {
+                evaluation
+                    .changed
+                    .iter()
+                    .find(|alert| alert.kind == "collectorBudget" && alert.resolved_at_ms.is_some())
+                    .cloned()
+            });
+        }
+        let resolved = resolved.expect("the warning incident must resolve");
+        assert_eq!(resolved.id, opened.id);
+        assert_eq!(resolved.severity, Severity::Warning);
+        assert_eq!(resolved.state, IncidentState::Resolved);
+        assert!(
+            engine
+                .active
+                .values()
+                .all(|alert| alert.kind != "collectorBudget")
+        );
+
+        // Phase 3: reopen inside the quiet period at Critical (>= 2x ceiling).
+        let mut reopened_id = None;
+        let mut severities = Vec::new();
+        let mut bumped_generation = None;
+        for _ in 0..20 {
+            system.timestamp_ms += 2_000;
+            let evaluation = engine.evaluate(
+                &system,
+                &[collector_process(
+                    system.timestamp_ms,
+                    0,
+                    ceiling * 2.5,
+                    1 << 20,
+                    50,
+                )],
+                &settings,
+                Calibration::default(),
+            );
+            if let Some(alert) = evaluation
+                .active
+                .iter()
+                .find(|alert| alert.kind == "collectorBudget")
+            {
+                reopened_id = Some(alert.id.clone());
+                severities.push(alert.severity);
+                if alert.notify && bumped_generation.is_none() {
+                    bumped_generation = Some(alert.notify_generation);
+                }
+            }
+        }
+        assert_eq!(
+            reopened_id,
+            Some(opened.id.clone()),
+            "a reopen inside the quiet period must reuse the same incident"
+        );
+        assert!(
+            severities
+                .iter()
+                .all(|&severity| severity == Severity::Critical),
+            "must read Critical throughout the reopen: {severities:?}"
+        );
+        let bumped_generation =
+            bumped_generation.expect("the reopened incident must eventually notify");
+        assert_eq!(
+            bumped_generation,
+            opened_generation + 1,
+            "an escalation on reopen must bump the generation exactly once"
+        );
+
+        // The generation must not bump again on later samples.
+        let final_alert = engine
+            .active
+            .values()
+            .find(|alert| alert.kind == "collectorBudget")
+            .expect("still open");
+        assert_eq!(final_alert.notify_generation, bumped_generation);
     }
 
     /// A three-sample sustained window on the default 2 s interval, so the
@@ -2122,20 +2762,23 @@ mod tests {
 
     #[test]
     fn one_time_collector_cache_step_is_not_a_growth_trend() {
-        let mut history = VecDeque::new();
-        for index in 0..151 {
-            history.push_back(ProcessPoint {
-                timestamp_ms: index * 2_000,
-                working_set_bytes: if index < 30 {
-                    18 * 1024 * 1024
+        // A one-time cache allocation early in a full 30-minute window: the
+        // step lands entirely inside the first third, so that segment's own
+        // mean is already dragged most of the way to the post-step level.
+        // The remaining first-to-middle step is too small to clear the
+        // shape test's minimum, so this must classify as `Inconclusive`
+        // (not `Monotonic`) and raise no candidate at all.
+        let points: Vec<TrendPoint> = (0..=900)
+            .map(|index| TrendPoint {
+                at_ms: index * 2_000,
+                value: if index < 30 {
+                    18.0 * 1024.0 * 1024.0
                 } else {
-                    20 * 1024 * 1024
+                    20.0 * 1024.0 * 1024.0
                 },
-                handles: 210,
-                threads: 8,
-            });
-        }
-        assert!(collector_working_set_growth(&history).is_none());
+            })
+            .collect();
+        assert!(collector_growth_shape(&points).is_none());
     }
 
     const DPC_TITLE: &str = "High DPC or interrupt activity";
