@@ -1,6 +1,7 @@
 use crate::{
     config::Settings,
     models::{Alert, Evidence, ProcessMetric, Severity, SystemMetric},
+    stats::{TrendPoint, TrendShape, classify_trend},
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use uuid::Uuid;
@@ -588,14 +589,29 @@ fn collector_working_set_growth(history: &VecDeque<ProcessPoint>) -> Option<Coll
     {
         return None;
     }
-    let growth = last_mean - first_mean;
-    let first_step = middle_mean - first_mean;
-    let second_step = last_mean - middle_mean;
-    if growth < MIB || first_step < MIB / 4.0 || second_step < MIB / 4.0 {
+
+    // The shape test (three equal-duration segments, each successive mean
+    // must clear the prior by a minimum step) is the shared primitive in
+    // `stats::classify_trend`; only the collector-specific minimums
+    // (MIB total, MIB/4 per step) and the >=5-samples-per-segment gate above
+    // stay local to this wrapper.
+    let points: Vec<TrendPoint> = history
+        .iter()
+        .map(|point| TrendPoint {
+            at_ms: point.timestamp_ms,
+            value: point.working_set_bytes as f64,
+        })
+        .collect();
+    let TrendShape::Monotonic { total_growth } = classify_trend(&points, 4 * 60_000, MIB / 4.0)
+    else {
+        return None;
+    };
+    if total_growth < MIB {
         return None;
     }
+
     Some(CollectorGrowth {
-        growth_mb: growth / MIB,
+        growth_mb: total_growth / MIB,
         first_mean_mb: first_mean / MIB,
         middle_mean_mb: middle_mean / MIB,
         last_mean_mb: last_mean / MIB,
@@ -709,7 +725,13 @@ mod tests {
                 system.timestamp_ms = 20 * 60_000 + index * 2_000;
                 engine.evaluate(
                     &system,
-                    &[collector_process(system.timestamp_ms, 0, 1.0, 16 << 20, 200)],
+                    &[collector_process(
+                        system.timestamp_ms,
+                        0,
+                        1.0,
+                        16 << 20,
+                        200,
+                    )],
                     &settings,
                 );
             }
@@ -734,7 +756,13 @@ mod tests {
                 system.timestamp_ms = 20 * 60_000 + index * 2_000;
                 engine.evaluate(
                     &system,
-                    &[collector_process(system.timestamp_ms, 0, 1.0, 40 << 20, 200)],
+                    &[collector_process(
+                        system.timestamp_ms,
+                        0,
+                        1.0,
+                        40 << 20,
+                        200,
+                    )],
                     &raised,
                 );
             }
@@ -825,8 +853,11 @@ mod tests {
         // The condition persists: the next evaluation's changed record (the
         // one that reaches storage) must still carry the flag.
         system.timestamp_ms += 2_000;
-        let evaluation =
-            engine.evaluate(&system, &[process(system.timestamp_ms, 95.0, 20)], &settings);
+        let evaluation = engine.evaluate(
+            &system,
+            &[process(system.timestamp_ms, 95.0, 20)],
+            &settings,
+        );
         let updated = evaluation
             .changed
             .iter()

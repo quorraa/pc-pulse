@@ -10,6 +10,7 @@ pub mod models;
 pub mod pipe;
 pub mod runtime;
 pub mod service;
+pub mod stats;
 pub mod storage;
 
 pub const SERVICE_NAME: &str = "PcPulseCollector";
