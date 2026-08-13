@@ -206,8 +206,9 @@ pub enum TrendShape {
     /// Grew, then declined enough (by at least `min_step`) to count as a
     /// release, and the last third's mean landed back close to the first
     /// third's -- within `max(min_step, RETURNING_TOLERANCE_FRACTION *
-    /// (middle_mean - first_mean))`. This is a real recovery: safe to treat
-    /// as closed/resolved.
+    /// (middle_mean - first_mean))`. Callers (notably the alert-calibration
+    /// reopen/hysteresis path) auto-resolve on this variant, so it must only
+    /// fire when the release is genuinely near-complete.
     Returning,
     /// Grew, then declined enough to count as a release, but the last
     /// third's mean is still well above the first third's -- outside the
@@ -225,12 +226,20 @@ pub enum TrendShape {
 
 /// How much of the growth from the first to the middle third must be given
 /// back, as a fraction of that growth, before a decline counts as a full
-/// `Returning` rather than a `PartialRelease`. The spec's own worked example
-/// (grow ~9.3, decline to ~5.2 away from the first third's mean) needs a
-/// fraction of at least ~0.554 to land in `Returning`; 0.25 does not clear
-/// it. 0.6 was chosen as the smallest clean value with headroom above that
-/// minimum.
-const RETURNING_TOLERANCE_FRACTION: f64 = 0.6;
+/// `Returning` rather than a `PartialRelease`.
+///
+/// This value is safety-derived, not fixture-derived: `Returning` is what
+/// the alert-calibration reopen/hysteresis path (Task 9) auto-resolves an
+/// open finding on, so a release must be *near-complete* to qualify. At
+/// fraction `f`, anything that gives back at least `(1 - f)` of the
+/// excursion reads as `Returning`; the rest reads as `PartialRelease` and
+/// stays open. `0.25` means a release must reclaim at least 75% of the
+/// excursion -- a process still sitting on 40% of what it grew (a plausible,
+/// dangerous "mostly stuck" case) correctly lands in `PartialRelease`, not
+/// `Returning`. Do not raise this to make a specific fixture pass; fix the
+/// fixture instead (see `partial_release_boundary_is_not_returning` for a
+/// worked 40%-still-elevated case that must reject `Returning`).
+const RETURNING_TOLERANCE_FRACTION: f64 = 0.25;
 
 fn segment_mean(points: &[TrendPoint], from_exclusive: Option<i64>, to_inclusive: i64) -> f64 {
     let mut sum = 0.0;
@@ -366,10 +375,14 @@ mod tests {
         );
         assert!(matches!(plateau, TrendShape::Plateau));
 
-        // Full release: grows ~9.3, then falls back to within tolerance of
-        // where it started -- a genuine recovery.
+        // Full release: baseline ~10.5, bursts to ~29.7 entirely inside the
+        // middle third, then settles back to ~11.2 -- a genuine recovery.
+        // (The burst must land fully inside the middle third: if it leaks
+        // into the first third it inflates first_mean and hides how close
+        // the release actually got, which is exactly the bug this fixture
+        // used to have.)
         let returning = classify_trend(
-            &series(&[10.0, 11.0, 30.0, 31.0, 28.0, 20.0, 14.0, 11.0, 10.5]),
+            &series(&[10.0, 11.0, 10.5, 30.0, 31.0, 28.0, 12.0, 11.0, 10.5]),
             4 * 60_000,
             2.0,
         );
@@ -388,6 +401,26 @@ mod tests {
         match partial_release {
             TrendShape::PartialRelease { remaining } => {
                 assert!((remaining - 949.0).abs() < 1e-9, "remaining = {remaining}");
+            }
+            other => panic!("expected PartialRelease, got {other:?}"),
+        }
+    }
+
+    /// The dangerous boundary case the tolerance fraction exists to guard:
+    /// a burst that only gives back 40% of its growth (baseline 10, peak 30,
+    /// settles at 22 -- 8 of the 20-unit excursion released, 12 still stuck)
+    /// must never read as `Returning`, or Task 9's auto-resolve would close
+    /// a finding that's still 60% elevated.
+    #[test]
+    fn partial_release_boundary_is_not_returning() {
+        let shape = classify_trend(
+            &series(&[10.0, 10.0, 10.0, 30.0, 30.0, 30.0, 22.0, 22.0, 22.0]),
+            4 * 60_000,
+            2.0,
+        );
+        match shape {
+            TrendShape::PartialRelease { remaining } => {
+                assert!((remaining - 12.0).abs() < 1e-9, "remaining = {remaining}");
             }
             other => panic!("expected PartialRelease, got {other:?}"),
         }
