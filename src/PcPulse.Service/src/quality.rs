@@ -15,11 +15,30 @@ const PERSISTENCE_SATURATION_WINDOWS: f64 = 3.0;
 /// Ten samples is two-plus sustained windows at the default cadence -- enough
 /// that the reading is not one lucky spike.
 const SAMPLE_DEPTH_SATURATION: f64 = 10.0;
-/// Confidence weights; they sum to 1.0. Baseline maturity leads because a
-/// learned norm is what separates "unusual" from "Tuesday".
-const MATURITY_WEIGHT: f64 = 0.4;
-const SAMPLE_DEPTH_WEIGHT: f64 = 0.3;
-const ATTRIBUTION_WEIGHT: f64 = 0.3;
+/// Confidence weights. The floors are the spec's and are not negotiable, so
+/// the weights are what has to make them behave. They sum to 1.0 and are
+/// derived from three constraints, each pinned by a test:
+///
+/// 1. **The confidence floor must still bind after learning.** With a fully
+///    matured baseline, the *minimum* achievable confidence (shallowest
+///    evidence, no attribution) must sit below 0.5, or every Warning that
+///    persists would notify and the floor would be decoration.
+///    `0.25 + 0.35·0.1 + 0.40·0.5 = 0.485 < 0.5`.
+/// 2. **A well-evidenced Critical must be able to notify on day one.** With
+///    maturity at zero, maximum sample depth and a stable attribution must
+///    still reach the learning-period floor of 0.6 -- the spec's "a
+///    genuinely dying machine should not be silenced by an immature
+///    baseline". `0.35 + 0.40 = 0.75 >= 0.6`.
+/// 3. **An unknown attribution stays exactly neutral** between a stable and
+///    an unstable one, which any weighting satisfies as long as the neutral
+///    value is the midpoint (see [`NEUTRAL_ATTRIBUTION`]).
+///
+/// Attribution therefore leads: naming the thing responsible, repeatably, is
+/// the strongest evidence a detector can offer, and it is the one input that
+/// does not need a day of history to become available.
+const MATURITY_WEIGHT: f64 = 0.25;
+const SAMPLE_DEPTH_WEIGHT: f64 = 0.35;
+const ATTRIBUTION_WEIGHT: f64 = 0.40;
 /// An unknown attribution is neither corroborating nor disqualifying.
 const NEUTRAL_ATTRIBUTION: f64 = 0.5;
 
@@ -63,8 +82,17 @@ pub struct QualityInputs<'a> {
     pub alert: &'a Alert,
     /// The detector's sustained window (`required_samples × interval`).
     pub sustained_window_ms: i64,
-    /// How long the underlying condition has been breaching, measured from
-    /// the first breaching sample -- not from when the incident opened.
+    /// Time since the incident's breach streak began -- the first breaching
+    /// sample of the run that produced it, not the moment the incident
+    /// opened and not its `first_seen_ms`.
+    ///
+    /// It keeps accruing while the engine holds an incident open through
+    /// hysteresis (value below the entry threshold but above the exit
+    /// threshold), because that hold *is* the condition continuing: the
+    /// engine only closes the incident once the value has cleared the exit
+    /// threshold for a full window. So this is "how long this incident has
+    /// been going on", which is deliberately not the same as "how many
+    /// samples breached the entry threshold".
     pub breach_duration_ms: i64,
     /// Machine baseline age / 24 h, clamped to 0-1.
     pub baseline_maturity: f64,
@@ -331,6 +359,59 @@ mod tests {
         // total confidence; the empty opposite is zero.
         assert!((with(1.0, Some(true), 10) - 1.0).abs() < 1e-9);
         assert!((with(0.0, Some(false), 0) - 0.0).abs() < 1e-9);
+    }
+
+    /// Confidence weight constraint 1: after learning, the *weakest* evidence
+    /// must still fall short of the confidence floor, or the floor is
+    /// decoration and every persisting Warning notifies.
+    #[test]
+    fn a_shallow_warning_stays_gated_by_confidence_after_learning() {
+        let mut shallow = alert(Severity::Warning);
+        shallow.occurrence_count = 1;
+        let probe = inputs(&shallow, 10 * WINDOW_MS);
+        let scored = score(&probe);
+        assert!(
+            (scored.persistence - 1.0).abs() < 1e-9,
+            "the condition itself is unambiguous"
+        );
+        assert!(
+            scored.confidence < CONFIDENCE_FLOOR,
+            "a matured baseline with one sample and no attribution: {}",
+            scored.confidence
+        );
+        assert!(!decide(&shallow, &scored, false, None, false).notify);
+        // Depth alone gets it over the floor, which is the point: the gate is
+        // evidence, not time.
+        let mut deep = shallow.clone();
+        deep.occurrence_count = 10;
+        let scored = score(&inputs(&deep, 10 * WINDOW_MS));
+        assert!(scored.confidence >= CONFIDENCE_FLOOR);
+        assert!(decide(&deep, &scored, false, None, false).notify);
+    }
+
+    /// Confidence weight constraint 2: a machine that is dying on its first
+    /// day must be able to say so, if the evidence is there.
+    #[test]
+    fn a_well_evidenced_critical_notifies_on_day_one() {
+        let mut dying = alert(Severity::Critical);
+        dying.occurrence_count = 10;
+        let mut probe = inputs(&dying, 3 * WINDOW_MS);
+        // Nothing learned yet -- the machine started an hour ago.
+        probe.baseline_maturity = 0.0;
+        probe.attribution_stable = Some(true);
+        let scored = score(&probe);
+        assert!(
+            scored.confidence >= LEARNING_CONFIDENCE_FLOOR,
+            "deep, repeatably attributed evidence must clear the learning floor: {}",
+            scored.confidence
+        );
+        assert!(decide(&dying, &scored, true, None, false).notify);
+        // Without the attribution it is a guess against an unlearned machine,
+        // and the learning period keeps it quiet.
+        probe.attribution_stable = None;
+        let unattributed = score(&probe);
+        assert!(unattributed.confidence < LEARNING_CONFIDENCE_FLOOR);
+        assert!(!decide(&dying, &unattributed, true, None, false).notify);
     }
 
     #[test]

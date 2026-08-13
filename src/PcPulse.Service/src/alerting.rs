@@ -163,7 +163,8 @@ pub struct AlertEngine {
     /// Scoring terms for each incident with a live streak or an open alert,
     /// keyed like `streaks`.
     calibrations: HashMap<String, IncidentCalibration>,
-    /// Fingerprint -> the last notification the policy authorized for it.
+    /// Engine key (which is the incident's fingerprint) -> the last
+    /// notification the policy authorized for it, keyed like `streaks`.
     notify_memory: HashMap<String, NotifyMemory>,
     baselines: HashMap<(u32, i64), ProcessBaseline>,
     history: HashMap<(u32, i64), VecDeque<ProcessPoint>>,
@@ -1714,11 +1715,79 @@ mod tests {
                 .expect("an open incident is persisted every sample it is scored");
             assert_eq!(stored.quality, active.quality);
             assert_eq!(stored.notify, active.notify);
-            assert!(
+            // Confidence is what the machine actually knows, and on a learned
+            // machine it clears the floor as soon as the incident has more
+            // than its opening sample behind it -- so persistence is the only
+            // thing still holding the notification back above.
+            assert_eq!(
                 stored.quality.confidence >= 0.5,
-                "a mature machine, deep samples"
+                stored.occurrence_count > 1,
+                "confidence tracks evidence depth, not the clock"
             );
         }
+    }
+
+    #[test]
+    fn an_incident_held_open_by_hysteresis_keeps_earning_persistence() {
+        // The engine holds an incident open while its value sits between the
+        // exit and entry thresholds, because that hold *is* the condition
+        // continuing. Persistence measures the incident, not the count of
+        // entry-threshold breaches, so it keeps accruing through the hold --
+        // and an incident can therefore become notifiable during one.
+        let settings = lifecycle_settings();
+        let mut engine = AlertEngine::default();
+        drive_cpu(&mut engine, &settings, 0, 4, 95.0);
+        let opened = only_active(&engine);
+        assert!(!opened.notify, "not yet persistent enough to interrupt");
+        let occurrences = opened.occurrence_count;
+
+        // 0.90x the entry threshold: no candidate fires (so no new breaching
+        // sample is recorded) but it is above the 0.85 exit ratio, so the
+        // incident cannot close either.
+        let held = drive_cpu(
+            &mut engine,
+            &settings,
+            4 * settings.sample_interval_ms as i64,
+            4,
+            settings.cpu_percent * 0.90,
+        );
+        let during_hold: Vec<(i64, bool, f64, u32)> = held
+            .iter()
+            .map(|evaluation| {
+                let alert = evaluation
+                    .active
+                    .first()
+                    .expect("hysteresis keeps the incident open");
+                (
+                    alert.first_seen_ms,
+                    alert.notify,
+                    alert.quality.persistence,
+                    alert.occurrence_count,
+                )
+            })
+            .collect();
+        let mut previous = opened.quality.persistence;
+        for (_, _, persistence, count) in &during_hold {
+            assert!(
+                *persistence > previous,
+                "persistence accrues through a hold"
+            );
+            assert_eq!(
+                *count, occurrences,
+                "no new breaching sample is being credited"
+            );
+            previous = *persistence;
+        }
+        assert!(
+            during_hold
+                .first()
+                .is_some_and(|(_, notify, _, _)| !*notify),
+            "the hold starts below the notification floor"
+        );
+        assert!(
+            during_hold.last().is_some_and(|(_, notify, _, _)| *notify),
+            "and crosses it while the value is still under the entry threshold"
+        );
     }
 
     #[test]

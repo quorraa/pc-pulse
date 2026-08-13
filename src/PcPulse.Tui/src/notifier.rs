@@ -295,6 +295,10 @@ fn pending_notifications<'a>(
     if seen.len() > SEEN_CAP {
         // A safety valve, not a policy: drop everything that is not still on
         // screen rather than growing without bound across a long session.
+        // Accepted hole: an incident evicted here that later resolves and
+        // reopens pops a second balloon. It takes 512+ distinct notified
+        // incidents in one tray session to reach, and a duplicate balloon is
+        // a better failure than unbounded memory.
         let live: HashSet<&str> = active.iter().map(|alert| alert.id.as_str()).collect();
         seen.retain(|(id, _)| live.contains(id.as_str()));
     }
