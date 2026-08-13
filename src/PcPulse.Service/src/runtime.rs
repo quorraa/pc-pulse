@@ -281,7 +281,12 @@ struct IssuedContext {
 /// is arithmetically inaudible long before it is dropped -- and the bound
 /// keeps a machine with a thousand stored ratings from re-deriving the whole
 /// table on every new one.
-const POLICY_OFFSET_RATINGS: usize = 200;
+///
+/// Public because the TUI derives the *same* offsets for display and must
+/// read exactly as much history as the engine does: two independently
+/// chosen bounds could show the operator a figure the policy is not
+/// applying. One constant, one tie, checked by the compiler.
+pub const POLICY_OFFSET_RATINGS: usize = 200;
 
 /// Trailing window a rating's demand bucket is classified against (Global
 /// Constraints: "trailing 10 min composite").

@@ -19,6 +19,9 @@ use pcpulse_service::{
         Snapshot, SystemMetric,
     },
     quality::{PolicyOffsets, derive_offsets},
+    // The engine's own bound on how much rating history the policy is
+    // derived from; the display side reads exactly as much.
+    runtime::POLICY_OFFSET_RATINGS,
 };
 use ratatui::{
     crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
@@ -77,10 +80,6 @@ pub const RATING_NUDGE_INTERVAL_MS: i64 = 24 * 3_600_000;
 /// Labels given under real load are the ones the policy can learn from; a
 /// rating at idle teaches nothing about behavior under demand.
 pub const RATING_NUDGE_HEAVY_MINUTES: u16 = 10;
-/// How much rating history the client derives its display offsets from —
-/// the same bound the service uses for the policy itself, so the incidents
-/// pane can never show a figure the engine is not actually applying.
-const RATING_HISTORY_LIMIT: usize = 200;
 static CHAT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 fn new_conversation_id() -> String {
@@ -1019,7 +1018,9 @@ fn worker_loop(commands: Receiver<WorkerCommand>, events: Sender<WorkerEvent>) {
                                 // when it stored this; re-read them so the
                                 // incidents pane agrees immediately.
                                 let _ = events.send(WorkerEvent::Ratings(
-                                    client.ratings(RATING_HISTORY_LIMIT).map_err(error_text),
+                                    client
+                                        .ratings(POLICY_OFFSET_RATINGS)
+                                        .map_err(error_text),
                                 ));
                             }
                             Err(error) => {
@@ -1029,7 +1030,7 @@ fn worker_loop(commands: Receiver<WorkerCommand>, events: Sender<WorkerEvent>) {
                     }
                     Ok(WorkerCommand::RefreshRatings) => {
                         let _ = events.send(WorkerEvent::Ratings(
-                            client.ratings(RATING_HISTORY_LIMIT).map_err(error_text),
+                            client.ratings(POLICY_OFFSET_RATINGS).map_err(error_text),
                         ));
                     }
                     Ok(WorkerCommand::CheckUpdate) => {
@@ -2287,15 +2288,29 @@ impl App {
     /// The `f` overlay: one keypress answers it. Anything that is not a
     /// choice or Esc is ignored, so a stray key cannot file a verdict the
     /// user did not mean — the same discipline as the termination gate.
+    ///
+    /// A modified key is not a choice either: Ctrl-G and Alt-S are chords
+    /// aimed at the terminal or the shell, not answers to this question,
+    /// and treating them as `g`/`s` would file a verdict the user never
+    /// gave. Same guard as the vault-rename band's character arm.
     fn handle_rating_key(&mut self, key: KeyEvent) -> bool {
         let verdict = match key.code {
             KeyCode::Esc => {
                 self.mode = InputMode::Normal;
                 return false;
             }
-            KeyCode::Char('g') => RatingVerdict::Good,
-            KeyCode::Char('a') => RatingVerdict::Acceptable,
-            KeyCode::Char('s') => RatingVerdict::Sluggish,
+            KeyCode::Char(choice)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                match choice {
+                    'g' => RatingVerdict::Good,
+                    'a' => RatingVerdict::Acceptable,
+                    's' => RatingVerdict::Sluggish,
+                    _ => return false,
+                }
+            }
             _ => return false,
         };
         // Closed before the answer lands: the pipe round trip happens on the
@@ -2762,8 +2777,15 @@ impl App {
     /// whole feature exists for); and more than one ask a day is nagging.
     /// A service that does not report the demand context (`None`) never
     /// nudges — an unknown heavy-minutes figure is not a zero.
+    ///
+    /// It also waits its turn behind a failure. An error on the statusline
+    /// is the one message the operator must not lose, and the nudge would
+    /// both overwrite it and burn the day's single ask on a line nobody
+    /// read — so the stamp is only spent when the question is actually
+    /// asked.
     pub(crate) fn maybe_nudge_for_rating(&mut self, snapshot: &Snapshot, now_ms: i64) {
-        if snapshot.learning
+        if self.status_is_error
+            || snapshot.learning
             || now_ms.saturating_sub(self.client_prefs.last_rating_nudge_ms)
                 < RATING_NUDGE_INTERVAL_MS
             || snapshot.heavy_minutes_trailing_hour.unwrap_or(0) < RATING_NUDGE_HEAVY_MINUTES
@@ -6451,6 +6473,23 @@ mod tests {
         app.handle_key(key(KeyCode::Char('x')));
         assert!(matches!(app.mode, InputMode::RatePerformance));
 
+        // Nor does a modified one: Ctrl-G is a terminal chord, not an
+        // answer, and must never be read as "good".
+        for modifiers in [KeyModifiers::CONTROL, KeyModifiers::ALT] {
+            for choice in ['g', 'a', 's'] {
+                app.handle_key(KeyEvent::new(KeyCode::Char(choice), modifiers));
+                assert!(
+                    matches!(app.mode, InputMode::RatePerformance),
+                    "{modifiers:?}+{choice} closed the overlay"
+                );
+                assert_eq!(
+                    commands.try_iter().count(),
+                    0,
+                    "{modifiers:?}+{choice} filed a rating"
+                );
+            }
+        }
+
         app.handle_key(key(KeyCode::Esc));
         assert!(matches!(app.mode, InputMode::Normal));
         assert_eq!(app.status, "untouched", "cancelling says nothing");
@@ -6529,6 +6568,17 @@ mod tests {
         //    zero -- and is not a reason to ask either.
         app.maybe_nudge_for_rating(&nudge_snapshot(false, None), now_ms);
         assert!(app.status.is_empty(), "unreported: {}", app.status);
+        // 4. A failure is on the statusline: the nudge neither overwrites it
+        //    nor spends the day's single ask behind it.
+        app.set_error("Collector unreachable".into());
+        app.maybe_nudge_for_rating(&nudge_snapshot(false, Some(45)), now_ms);
+        assert_eq!(app.status, "Collector unreachable");
+        assert_eq!(
+            app.client_prefs.last_rating_nudge_ms, 0,
+            "an unasked question must not burn the clock"
+        );
+        app.status.clear();
+        app.status_is_error = false;
 
         // All three gates pass.
         app.maybe_nudge_for_rating(&nudge_snapshot(false, Some(10)), now_ms);
