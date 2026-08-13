@@ -3,7 +3,7 @@ use crate::{
     config::Settings,
     metrics::interrupts::VerdictState,
     models::{Alert, AlertQuality, Evidence, IncidentState, ProcessMetric, Severity, SystemMetric},
-    quality::{Calibration, NotifyDecision, QualityInputs, decide, score},
+    quality::{Calibration, NotifyDecision, PolicyOffsets, QualityInputs, decide, score},
     stats::{TrendPoint, TrendShape, classify_trend},
 };
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -425,6 +425,12 @@ pub struct AlertEngine {
     pool_baseline: RunningStats,
     /// The latest DPC/interrupt attribution and learned kernel-rate norms.
     interrupts: InterruptContext,
+    /// The notify-floor adjustments the user's performance ratings have
+    /// earned, per (kind, demand bucket). Derived by the runtime from the
+    /// rating history and pushed in via
+    /// [`AlertEngine::observe_rating_offsets`]; empty (and therefore
+    /// completely inert) on a machine nobody has rated.
+    rating_offsets: PolicyOffsets,
     /// One flag per sample -- "was the kernel rate at or above what this
     /// machine has learned is normal" -- over the trailing
     /// [`SUSTAINED_P95_MS`].
@@ -497,6 +503,18 @@ impl AlertEngine {
             }
         }
         self.interrupts = context;
+    }
+
+    /// Feed the notify-floor offsets derived from the user's ratings. The
+    /// runtime calls this at startup and after each new rating; an engine
+    /// that is never told keeps the shipped floors exactly.
+    pub fn observe_rating_offsets(&mut self, offsets: PolicyOffsets) {
+        self.rating_offsets = offsets;
+    }
+
+    /// What the ratings have done to the policy, for the agent context.
+    pub fn rating_offsets(&self) -> &PolicyOffsets {
+        &self.rating_offsets
     }
 
     /// Open incidents that speak for the user rather than the machine. Read
@@ -1501,12 +1519,18 @@ impl AlertEngine {
             let remembered = terms
                 .reopened_from_severity
                 .map(|severity| remembered_previous(severity, notified.is_some()));
+            // The user's feedback for this kind under the demand the machine
+            // is under *now* -- not the demand any rating was given at. A
+            // rating is evidence about its own bucket only, so an offset
+            // earned under heavy load has no say while the machine idles.
+            let offset = self.rating_offsets.lookup(&alert.kind, calibration.demand);
             let decision = decide(
                 alert,
                 &quality,
                 calibration.learning,
                 remembered.as_ref().or_else(|| previous.get(key)),
                 material_change,
+                offset,
             );
             // The detector's own bar, applied after the generic floors and
             // only ever downward.
@@ -2022,8 +2046,8 @@ fn evidence(label: impl Into<String>, value: impl Into<String>) -> Evidence {
 mod tests {
     use super::*;
     use crate::baselines::BaselineStore;
-    use crate::models::IncidentState;
-    use crate::quality::{CONFIDENCE_FLOOR, PERSISTENCE_FLOOR};
+    use crate::models::{DemandBucket, DemandDetail, IncidentState, Rating, RatingVerdict};
+    use crate::quality::{CONFIDENCE_FLOOR, PERSISTENCE_FLOOR, derive_offsets};
 
     fn process(timestamp_ms: i64, cpu: f64, memory_mb: u64) -> ProcessMetric {
         ProcessMetric {
@@ -4696,6 +4720,92 @@ mod tests {
         assert!(
             engine.active.is_empty(),
             "and it closes itself once the step clears the window"
+        );
+    }
+
+    /// The offsets three unexplained `sluggish` ratings in `bucket` leave
+    /// behind: every kind in that bucket, relaxed to the ±0.15 bound.
+    fn relaxed(bucket: DemandBucket) -> PolicyOffsets {
+        let now_ms = 100 * 86_400_000;
+        let ratings: Vec<Rating> = (0..3)
+            .map(|index| Rating {
+                id: format!("rating-{index}"),
+                at_ms: now_ms,
+                verdict: RatingVerdict::Sluggish,
+                demand: bucket,
+                demand_detail: DemandDetail {
+                    cpu_percent: 0.0,
+                    cpu_percentile: None,
+                    memory_occupancy_pct: 0.0,
+                    memory_percentile: None,
+                    disk_latency_ms: 0.0,
+                    disk_percentile: None,
+                    io_bytes_per_sec: 0.0,
+                    io_percentile: None,
+                },
+                digest: serde_json::Value::Null,
+                open_incidents: Vec::new(),
+                during_learning: false,
+                unexplained: true,
+            })
+            .collect();
+        derive_offsets(&ratings, now_ms)
+    }
+
+    #[test]
+    fn rating_offsets_move_the_engines_notification_decision_in_their_own_bucket() {
+        // End-to-end: the offsets the runtime hands the engine are applied
+        // against the *current* demand bucket, so a relaxation earned under
+        // heavy load does nothing while the machine is idling -- and the
+        // reverse (the deceptive-comfort guard) holds at the engine too.
+        let settings = lifecycle_settings();
+        let marginal = 5;
+
+        let mut shipped = AlertEngine::default();
+        drive_cpu(&mut shipped, &settings, 0, marginal, 95.0);
+        let baseline = only_active(&shipped);
+        assert!(
+            !baseline.notify,
+            "the fixture must sit below the shipped floors: {:?}",
+            baseline.quality
+        );
+
+        // Same drive, same bucket the rating was given in: now it notifies.
+        let mut relaxed_engine = AlertEngine::default();
+        relaxed_engine.observe_rating_offsets(relaxed(DemandBucket::Heavy));
+        drive_cpu_calibrated(
+            &mut relaxed_engine,
+            &settings,
+            0,
+            marginal,
+            95.0,
+            Calibration {
+                demand: DemandBucket::Heavy,
+                ..Calibration::default()
+            },
+        );
+        assert!(
+            only_active(&relaxed_engine).notify,
+            "the user's heavy-load feedback must reach the decision"
+        );
+
+        // Same offsets, machine now idling: the light bucket is untouched.
+        let mut other_bucket = AlertEngine::default();
+        other_bucket.observe_rating_offsets(relaxed(DemandBucket::Heavy));
+        drive_cpu_calibrated(
+            &mut other_bucket,
+            &settings,
+            0,
+            marginal,
+            95.0,
+            Calibration {
+                demand: DemandBucket::Light,
+                ..Calibration::default()
+            },
+        );
+        assert!(
+            !only_active(&other_bucket).notify,
+            "an offset must never leak out of the bucket that earned it"
         );
     }
 }

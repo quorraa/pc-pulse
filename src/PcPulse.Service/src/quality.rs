@@ -8,7 +8,10 @@
 //! scores attached so the suppression is explainable.
 
 use crate::baselines::BaselineStore;
-use crate::models::{Alert, AlertQuality, Severity};
+use crate::models::{
+    Alert, AlertQuality, DemandBucket, Rating, RatingOffset, RatingVerdict, Severity,
+};
+use std::collections::{HashMap, HashSet};
 
 /// Breach duration, in sustained windows, at which persistence saturates.
 const PERSISTENCE_SATURATION_WINDOWS: f64 = 3.0;
@@ -53,6 +56,169 @@ pub const CONFIDENCE_FLOOR: f64 = 0.5;
 pub const CRITICAL_CONFIDENCE_FLOOR: f64 = 0.35;
 pub const LEARNING_CONFIDENCE_FLOOR: f64 = 0.6;
 
+/// How far one rating moves the floors for the (kind, bucket) it speaks
+/// about, how far the whole rating history is ever allowed to move them, and
+/// how long a rating's say in the matter lasts. All three are the spec's.
+pub const RATING_OFFSET_STEP: f64 = 0.05;
+pub const RATING_OFFSET_BOUND: f64 = 0.15;
+const RATING_OFFSET_HALF_LIFE_DAYS: f64 = 30.0;
+const MS_PER_DAY: f64 = 86_400_000.0;
+
+/// The `kind` an offset carries when it applies to *every* kind in its
+/// bucket -- what an unexplained `sluggish` rating produces, since the user
+/// felt something no detector named. Only ever emitted for display
+/// ([`PolicyOffsets::entries`]); [`PolicyOffsets::lookup`] folds it into the
+/// answer for whatever kind is asked about.
+pub const ALL_KINDS: &str = "*";
+
+/// The notify-floor adjustments the user's ratings have earned, per alert
+/// kind and demand bucket.
+///
+/// Derived fresh from the rating history by [`derive_offsets`] -- the
+/// `ratings` table is the single source of truth and this is a cache of a
+/// pure function over it, never a second mutable store. Decay is therefore
+/// applied at derivation time from each rating's age, not by mutating
+/// anything on a schedule.
+///
+/// Two kinds of term live here because the spec's two signals have different
+/// reach. A false positive names a kind (that incident was not worth
+/// interrupting me for); a false negative names none (something slowed this
+/// machine down and nothing told me), so it moves every kind in its bucket,
+/// including kinds no rating has ever mentioned and kinds no detector has
+/// shipped yet. Enumerating "every kind" is impossible, so the bucket-wide
+/// term is stored as itself and added at lookup.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PolicyOffsets {
+    /// bucket -> kind -> summed, decayed per-kind term.
+    kinds: HashMap<DemandBucket, HashMap<String, f64>>,
+    /// bucket -> summed, decayed term applying to every kind in it.
+    buckets: HashMap<DemandBucket, f64>,
+}
+
+impl PolicyOffsets {
+    /// The additive floor adjustment for one alert kind under one demand
+    /// bucket. Positive is stricter (harder to notify), negative is more
+    /// permissive, and a machine whose user has never rated anything -- or
+    /// whose ratings all confirmed the system was right -- gets 0.0.
+    pub fn lookup(&self, kind: &str, bucket: DemandBucket) -> f64 {
+        let per_kind = self
+            .kinds
+            .get(&bucket)
+            .and_then(|kinds| kinds.get(kind))
+            .copied()
+            .unwrap_or(0.0);
+        let bucket_wide = self.buckets.get(&bucket).copied().unwrap_or(0.0);
+        // The bound is on the total, so the two terms net out first: a kind
+        // the user called a false positive inside a bucket they called slow
+        // is genuinely ambiguous evidence and should land near zero.
+        (per_kind + bucket_wide).clamp(-RATING_OFFSET_BOUND, RATING_OFFSET_BOUND)
+    }
+
+    /// Every non-zero effective offset, for the agent context and the
+    /// incidents detail pane. Ordered by bucket then kind so the rendered
+    /// list is stable between contexts.
+    pub fn entries(&self) -> Vec<RatingOffset> {
+        let mut entries = Vec::new();
+        for bucket in [
+            DemandBucket::Light,
+            DemandBucket::Moderate,
+            DemandBucket::Heavy,
+        ] {
+            let mut named: Vec<&String> = self
+                .kinds
+                .get(&bucket)
+                .map(|kinds| kinds.keys().collect())
+                .unwrap_or_default();
+            named.sort();
+            for kind in named {
+                let offset = self.lookup(kind, bucket);
+                if offset != 0.0 {
+                    entries.push(RatingOffset {
+                        kind: kind.clone(),
+                        bucket,
+                        offset,
+                    });
+                }
+            }
+            let bucket_wide = self.buckets.get(&bucket).copied().unwrap_or(0.0);
+            if bucket_wide != 0.0 {
+                entries.push(RatingOffset {
+                    kind: ALL_KINDS.to_string(),
+                    bucket,
+                    offset: bucket_wide.clamp(-RATING_OFFSET_BOUND, RATING_OFFSET_BOUND),
+                });
+            }
+        }
+        entries
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.kinds.is_empty() && self.buckets.is_empty()
+    }
+}
+
+/// Read the notification policy's offsets out of the rating history.
+///
+/// A rating only ever speaks about its own demand bucket. That is the
+/// deceptive-comfort guard, and it is the whole reason the bucket is stored
+/// on the rating rather than recomputed: a month of "feels fine" collected
+/// while the machine idled says nothing about how it behaves under load, and
+/// must leave the heavy bucket exactly as strict as the day it shipped.
+///
+/// Each qualifying rating contributes one [`RATING_OFFSET_STEP`], weighted by
+/// a 30-day half-life on its age, and the sum is bounded at lookup:
+///
+/// - `good`/`acceptable` while a kind was notifying (notify true and not
+///   acknowledged) -- a false positive: that kind gets **stricter** in that
+///   bucket. One step per rating per kind, not per incident: two open
+///   incidents of one kind is that kind being wrong once.
+/// - `sluggish` with nothing notifying -- a false negative: **every** kind in
+///   that bucket gets more permissive.
+/// - `sluggish` while something was notifying -- confirmation: the system was
+///   right, so nothing moves.
+/// - anything rated during the learning period -- inert: the policy it would
+///   adjust is not in effect yet.
+pub fn derive_offsets(ratings: &[Rating], now_ms: i64) -> PolicyOffsets {
+    let mut offsets = PolicyOffsets::default();
+    for rating in ratings {
+        if rating.during_learning {
+            continue;
+        }
+        let step = RATING_OFFSET_STEP * decay_weight(now_ms - rating.at_ms);
+        let notifying: HashSet<&str> = rating
+            .open_incidents
+            .iter()
+            .filter(|incident| incident.notify && !incident.acknowledged)
+            .map(|incident| incident.kind.as_str())
+            .collect();
+        match rating.verdict {
+            RatingVerdict::Good | RatingVerdict::Acceptable => {
+                for kind in notifying {
+                    *offsets
+                        .kinds
+                        .entry(rating.demand)
+                        .or_default()
+                        .entry(kind.to_string())
+                        .or_insert(0.0) += step;
+                }
+            }
+            RatingVerdict::Sluggish if notifying.is_empty() => {
+                *offsets.buckets.entry(rating.demand).or_insert(0.0) -= step;
+            }
+            RatingVerdict::Sluggish => {}
+        }
+    }
+    offsets
+}
+
+/// How much say a rating still has, halving every 30 days. A rating dated in
+/// the future (clock skew across a restart) counts as fresh rather than
+/// growing without bound.
+fn decay_weight(age_ms: i64) -> f64 {
+    let days = age_ms.max(0) as f64 / MS_PER_DAY;
+    0.5_f64.powf(days / RATING_OFFSET_HALF_LIFE_DAYS)
+}
+
 /// What the runtime knows about the machine's learned baselines when it asks
 /// the engine to evaluate a sample.
 ///
@@ -75,6 +241,12 @@ pub struct Calibration<'a> {
     /// `None` means "no norms available", which every consuming gate must
     /// treat as passing open, exactly as an unknown name does.
     pub names: Option<&'a BaselineStore>,
+    /// How demanding the machine's workload is *right now*, which is the
+    /// bucket the user's rating offsets are read against. A rating is only
+    /// ever evidence about its own bucket, so the live bucket has to reach
+    /// the decision -- an offset earned under heavy load must not quietly
+    /// apply while the machine idles, and vice versa.
+    pub demand: DemandBucket,
 }
 
 impl Default for Calibration<'_> {
@@ -83,6 +255,10 @@ impl Default for Calibration<'_> {
             learning: false,
             baseline_maturity: 1.0,
             names: None,
+            // The unrated machine's bucket is immaterial (every lookup
+            // answers 0.0), so the least-demanding one is the honest default
+            // for a caller that has no demand reading to offer.
+            demand: DemandBucket::Light,
         }
     }
 }
@@ -202,12 +378,19 @@ fn novelty(inputs: &QualityInputs) -> f64 {
 /// an incident *inside* the quiet period, so a recurrence after a full quiet
 /// period is a genuinely new incident with a fresh id and generation 0, and
 /// the tray has by definition never seen that pair. There is nothing to bump.
+///
+/// `offset` is the user's rating feedback for this alert's kind under the
+/// machine's *current* demand bucket ([`PolicyOffsets::lookup`]), added to
+/// both floors: positive makes this kind harder to notify, negative easier.
+/// It is bounded to ±0.15 by construction, and 0.0 -- the value for a machine
+/// nobody has rated -- reproduces the shipped policy exactly.
 pub fn decide(
     alert: &Alert,
     quality: &AlertQuality,
     learning: bool,
     previous: Option<&Alert>,
     material_change: bool,
+    offset: f64,
 ) -> NotifyDecision {
     let severity_ok = match alert.severity {
         // Info findings are history-only by construction.
@@ -222,8 +405,8 @@ pub fn decide(
         _ => CONFIDENCE_FLOOR,
     };
     let notify = severity_ok
-        && quality.persistence >= PERSISTENCE_FLOOR
-        && quality.confidence >= confidence_floor;
+        && quality.persistence >= PERSISTENCE_FLOOR + offset
+        && quality.confidence >= confidence_floor + offset;
 
     // Only an incident that was already popping can *re*-notify. One that was
     // suppressed needs no bump: the tray never recorded a suppressed
@@ -252,7 +435,7 @@ fn rank(severity: Severity) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::IncidentState;
+    use crate::models::{DemandDetail, IncidentState, OpenIncidentRef};
 
     const WINDOW_MS: i64 = 6_000;
 
@@ -390,14 +573,14 @@ mod tests {
             "a matured baseline with one sample and no attribution: {}",
             scored.confidence
         );
-        assert!(!decide(&shallow, &scored, false, None, false).notify);
+        assert!(!decide(&shallow, &scored, false, None, false, 0.0).notify);
         // Depth alone gets it over the floor, which is the point: the gate is
         // evidence, not time.
         let mut deep = shallow.clone();
         deep.occurrence_count = 10;
         let scored = score(&inputs(&deep, 10 * WINDOW_MS));
         assert!(scored.confidence >= CONFIDENCE_FLOOR);
-        assert!(decide(&deep, &scored, false, None, false).notify);
+        assert!(decide(&deep, &scored, false, None, false, 0.0).notify);
     }
 
     /// Confidence weight constraint 2: a machine that is dying on its first
@@ -416,13 +599,13 @@ mod tests {
             "deep, repeatably attributed evidence must clear the learning floor: {}",
             scored.confidence
         );
-        assert!(decide(&dying, &scored, true, None, false).notify);
+        assert!(decide(&dying, &scored, true, None, false, 0.0).notify);
         // Without the attribution it is a guess against an unlearned machine,
         // and the learning period keeps it quiet.
         probe.attribution_stable = None;
         let unattributed = score(&probe);
         assert!(unattributed.confidence < LEARNING_CONFIDENCE_FLOOR);
-        assert!(!decide(&dying, &unattributed, true, None, false).notify);
+        assert!(!decide(&dying, &unattributed, true, None, false, 0.0).notify);
     }
 
     #[test]
@@ -453,7 +636,7 @@ mod tests {
     #[test]
     fn a_persistent_confident_warning_notifies() {
         let alert = alert(Severity::Warning);
-        let decision = decide(&alert, &quality(0.5, 0.5), false, None, false);
+        let decision = decide(&alert, &quality(0.5, 0.5), false, None, false, 0.0);
         assert_eq!(
             decision,
             NotifyDecision {
@@ -466,8 +649,8 @@ mod tests {
     #[test]
     fn a_warning_below_either_floor_is_suppressed() {
         let warning = alert(Severity::Warning);
-        assert!(!decide(&warning, &quality(0.5, 0.49), false, None, false).notify);
-        assert!(!decide(&warning, &quality(0.49, 0.9), false, None, false).notify);
+        assert!(!decide(&warning, &quality(0.5, 0.49), false, None, false, 0.0).notify);
+        assert!(!decide(&warning, &quality(0.49, 0.9), false, None, false, 0.0).notify);
         // Info never notifies however good it looks.
         assert!(
             !decide(
@@ -475,7 +658,8 @@ mod tests {
                 &quality(1.0, 1.0),
                 false,
                 None,
-                false
+                false,
+                0.0
             )
             .notify
         );
@@ -484,24 +668,24 @@ mod tests {
     #[test]
     fn a_critical_notifies_down_to_the_lower_confidence_floor() {
         let alert = alert(Severity::Critical);
-        assert!(decide(&alert, &quality(0.5, 0.35), false, None, false).notify);
-        assert!(!decide(&alert, &quality(0.5, 0.34), false, None, false).notify);
+        assert!(decide(&alert, &quality(0.5, 0.35), false, None, false, 0.0).notify);
+        assert!(!decide(&alert, &quality(0.5, 0.34), false, None, false, 0.0).notify);
         // The relaxed floor is confidence only: persistence still gates.
-        assert!(!decide(&alert, &quality(0.49, 1.0), false, None, false).notify);
+        assert!(!decide(&alert, &quality(0.49, 1.0), false, None, false, 0.0).notify);
     }
 
     #[test]
     fn the_learning_period_suppresses_warnings_however_good() {
         let alert = alert(Severity::Warning);
-        assert!(decide(&alert, &quality(1.0, 1.0), false, None, false).notify);
-        assert!(!decide(&alert, &quality(1.0, 1.0), true, None, false).notify);
+        assert!(decide(&alert, &quality(1.0, 1.0), false, None, false, 0.0).notify);
+        assert!(!decide(&alert, &quality(1.0, 1.0), true, None, false, 0.0).notify);
     }
 
     #[test]
     fn the_learning_period_lets_a_critical_through_at_six_tenths_confidence() {
         let alert = alert(Severity::Critical);
-        assert!(decide(&alert, &quality(0.5, 0.6), true, None, false).notify);
-        assert!(!decide(&alert, &quality(0.5, 0.59), true, None, false).notify);
+        assert!(decide(&alert, &quality(0.5, 0.6), true, None, false, 0.0).notify);
+        assert!(!decide(&alert, &quality(0.5, 0.59), true, None, false, 0.0).notify);
     }
 
     #[test]
@@ -519,6 +703,7 @@ mod tests {
             false,
             Some(&previous),
             false,
+            0.0,
         );
         assert_eq!(
             steady,
@@ -534,7 +719,8 @@ mod tests {
                 &good,
                 false,
                 Some(&previous),
-                false
+                false,
+                0.0
             )
             .bump_generation
         );
@@ -547,7 +733,8 @@ mod tests {
                 &good,
                 false,
                 Some(&was_critical),
-                false
+                false,
+                0.0
             )
             .bump_generation
         );
@@ -558,7 +745,8 @@ mod tests {
                 &good,
                 false,
                 Some(&previous),
-                true
+                true,
+                0.0
             )
             .bump_generation
         );
@@ -569,7 +757,8 @@ mod tests {
                 &quality(0.1, 0.1),
                 false,
                 Some(&previous),
-                true
+                true,
+                0.0
             )
             .bump_generation
         );
@@ -583,11 +772,365 @@ mod tests {
                 &good,
                 false,
                 Some(&suppressed),
-                true
+                true,
+                0.0
             )
             .bump_generation
         );
         // A brand-new incident has no previous state and cannot renotify.
-        assert!(!decide(&alert(Severity::Critical), &good, false, None, true).bump_generation);
+        assert!(!decide(&alert(Severity::Critical), &good, false, None, true, 0.0).bump_generation);
+    }
+
+    /// One rating, with whatever was notifying when it was given.
+    fn rating(
+        verdict: RatingVerdict,
+        demand: DemandBucket,
+        at_ms: i64,
+        notifying: &[&str],
+    ) -> Rating {
+        Rating {
+            id: format!("rating-{at_ms}"),
+            at_ms,
+            verdict,
+            demand,
+            demand_detail: DemandDetail {
+                cpu_percent: 0.0,
+                cpu_percentile: None,
+                memory_occupancy_pct: 0.0,
+                memory_percentile: None,
+                disk_latency_ms: 0.0,
+                disk_percentile: None,
+                io_bytes_per_sec: 0.0,
+                io_percentile: None,
+            },
+            digest: serde_json::Value::Null,
+            open_incidents: notifying
+                .iter()
+                .map(|kind| OpenIncidentRef {
+                    fingerprint: format!("{kind}:1"),
+                    kind: (*kind).to_string(),
+                    severity: Severity::Warning,
+                    notify: true,
+                    acknowledged: false,
+                })
+                .collect(),
+            during_learning: false,
+            unexplained: verdict == RatingVerdict::Sluggish && notifying.is_empty(),
+        }
+    }
+
+    const DAY_MS: i64 = 86_400_000;
+
+    #[test]
+    fn a_good_rating_while_a_kind_was_notifying_makes_that_kind_stricter() {
+        // Spec test 3: the false-positive path. The user says the machine is
+        // fine while the collector-budget incident is interrupting them, so
+        // that (kind, bucket) has to earn its notification harder next time.
+        let now_ms = 100 * DAY_MS;
+        let one = derive_offsets(
+            &[rating(
+                RatingVerdict::Good,
+                DemandBucket::Moderate,
+                now_ms,
+                &["collectorBudget"],
+            )],
+            now_ms,
+        );
+        assert!((one.lookup("collectorBudget", DemandBucket::Moderate) - 0.05).abs() < 1e-9);
+        // Untouched kinds and buckets stay exactly where they were.
+        assert_eq!(one.lookup("sustainedCpu", DemandBucket::Moderate), 0.0);
+        assert_eq!(one.lookup("collectorBudget", DemandBucket::Heavy), 0.0);
+
+        // An `acceptable` rating is the same signal.
+        let acceptable = derive_offsets(
+            &[rating(
+                RatingVerdict::Acceptable,
+                DemandBucket::Moderate,
+                now_ms,
+                &["collectorBudget"],
+            )],
+            now_ms,
+        );
+        assert!((acceptable.lookup("collectorBudget", DemandBucket::Moderate) - 0.05).abs() < 1e-9);
+    }
+
+    #[test]
+    fn repeated_false_positives_cap_the_offset_at_fifteen_hundredths() {
+        // Spec test 3's tail: three ratings reach the bound and no number of
+        // further ratings pushes past it.
+        let now_ms = 100 * DAY_MS;
+        let of = |count: usize| {
+            let ratings: Vec<Rating> = (0..count)
+                .map(|index| {
+                    rating(
+                        RatingVerdict::Good,
+                        DemandBucket::Moderate,
+                        now_ms - index as i64,
+                        &["collectorBudget"],
+                    )
+                })
+                .collect();
+            derive_offsets(&ratings, now_ms).lookup("collectorBudget", DemandBucket::Moderate)
+        };
+        assert!((of(2) - 0.10).abs() < 1e-6);
+        assert!((of(3) - 0.15).abs() < 1e-6);
+        assert!((of(9) - 0.15).abs() < 1e-6, "the bound is a bound");
+    }
+
+    #[test]
+    fn one_rating_moves_a_kind_one_step_however_many_incidents_of_it_were_open() {
+        // A rating is one piece of evidence about one (kind, bucket). Two
+        // open incidents of the same kind is that one kind being wrong once,
+        // not twice.
+        let now_ms = 100 * DAY_MS;
+        let mut rating = rating(
+            RatingVerdict::Good,
+            DemandBucket::Heavy,
+            now_ms,
+            &["sustainedCpu"],
+        );
+        let mut second = rating.open_incidents[0].clone();
+        second.fingerprint = "sustainedCpu:2".into();
+        rating.open_incidents.push(second);
+        let offsets = derive_offsets(&[rating], now_ms);
+        assert!((offsets.lookup("sustainedCpu", DemandBucket::Heavy) - 0.05).abs() < 1e-9);
+    }
+
+    #[test]
+    fn an_acknowledged_incident_is_not_a_false_positive() {
+        // The spec's false-positive trigger is "notifying (notify true, not
+        // acknowledged)". An incident the user has already dealt with is not
+        // the thing they are calling fine.
+        let now_ms = 100 * DAY_MS;
+        let mut only = rating(
+            RatingVerdict::Good,
+            DemandBucket::Light,
+            now_ms,
+            &["diskLatency"],
+        );
+        only.open_incidents[0].acknowledged = true;
+        assert_eq!(
+            derive_offsets(&[only], now_ms).lookup("diskLatency", DemandBucket::Light),
+            0.0
+        );
+    }
+
+    #[test]
+    fn a_sluggish_rating_with_nothing_notifying_relaxes_the_whole_bucket() {
+        // Spec test 4: the false-negative path. The detectors missed what the
+        // user felt, so every kind in that bucket gets more permissive --
+        // including kinds no rating has ever named.
+        let now_ms = 100 * DAY_MS;
+        let offsets = derive_offsets(
+            &[rating(
+                RatingVerdict::Sluggish,
+                DemandBucket::Heavy,
+                now_ms,
+                &[],
+            )],
+            now_ms,
+        );
+        assert!((offsets.lookup("sustainedCpu", DemandBucket::Heavy) + 0.05).abs() < 1e-9);
+        assert!((offsets.lookup("neverSeenBefore", DemandBucket::Heavy) + 0.05).abs() < 1e-9);
+        // Its own bucket only.
+        assert_eq!(offsets.lookup("sustainedCpu", DemandBucket::Light), 0.0);
+        assert_eq!(offsets.lookup("sustainedCpu", DemandBucket::Moderate), 0.0);
+    }
+
+    #[test]
+    fn a_sluggish_rating_while_notifying_confirms_and_changes_nothing() {
+        // Spec test's confirmation path: the system was right, so the policy
+        // stays exactly where it is.
+        let now_ms = 100 * DAY_MS;
+        let offsets = derive_offsets(
+            &[rating(
+                RatingVerdict::Sluggish,
+                DemandBucket::Heavy,
+                now_ms,
+                &["sustainedCpu"],
+            )],
+            now_ms,
+        );
+        assert_eq!(offsets.lookup("sustainedCpu", DemandBucket::Heavy), 0.0);
+        assert_eq!(offsets.lookup("diskLatency", DemandBucket::Heavy), 0.0);
+        assert!(offsets.entries().is_empty());
+    }
+
+    #[test]
+    fn a_sixty_day_old_rating_contributes_a_quarter_of_a_step() {
+        // Spec test 6: a 30-day half-life means two half-lives at 60 days.
+        let now_ms = 100 * DAY_MS;
+        let offsets = derive_offsets(
+            &[rating(
+                RatingVerdict::Good,
+                DemandBucket::Light,
+                now_ms - 60 * DAY_MS,
+                &["collectorBudget"],
+            )],
+            now_ms,
+        );
+        assert!(
+            (offsets.lookup("collectorBudget", DemandBucket::Light) - 0.0125).abs() < 1e-9,
+            "0.05 x 0.5^(60/30) = 0.0125, got {}",
+            offsets.lookup("collectorBudget", DemandBucket::Light)
+        );
+        // Thirty days is exactly half.
+        let half = derive_offsets(
+            &[rating(
+                RatingVerdict::Good,
+                DemandBucket::Light,
+                now_ms - 30 * DAY_MS,
+                &["collectorBudget"],
+            )],
+            now_ms,
+        );
+        assert!((half.lookup("collectorBudget", DemandBucket::Light) - 0.025).abs() < 1e-9);
+    }
+
+    #[test]
+    fn learning_period_ratings_never_move_the_policy() {
+        // The policy a learning-period rating would adjust is not yet in
+        // effect, so the rating is recorded and inert.
+        let now_ms = 100 * DAY_MS;
+        let mut inert = rating(
+            RatingVerdict::Good,
+            DemandBucket::Heavy,
+            now_ms,
+            &["collectorBudget"],
+        );
+        inert.during_learning = true;
+        let mut also_inert = rating(RatingVerdict::Sluggish, DemandBucket::Heavy, now_ms, &[]);
+        also_inert.during_learning = true;
+        let offsets = derive_offsets(&[inert, also_inert], now_ms);
+        assert_eq!(offsets.lookup("collectorBudget", DemandBucket::Heavy), 0.0);
+        assert_eq!(offsets.lookup("sustainedCpu", DemandBucket::Heavy), 0.0);
+        assert!(offsets.entries().is_empty());
+    }
+
+    #[test]
+    fn a_bucket_wide_relaxation_nets_against_a_kinds_own_tightening() {
+        // The two terms are the same policy dial seen from two directions,
+        // so a kind the user called a false positive and a bucket the user
+        // said felt slow cancel out rather than shadowing each other.
+        let now_ms = 100 * DAY_MS;
+        let offsets = derive_offsets(
+            &[
+                rating(
+                    RatingVerdict::Good,
+                    DemandBucket::Heavy,
+                    now_ms,
+                    &["collectorBudget"],
+                ),
+                rating(RatingVerdict::Sluggish, DemandBucket::Heavy, now_ms, &[]),
+            ],
+            now_ms,
+        );
+        assert!(offsets.lookup("collectorBudget", DemandBucket::Heavy).abs() < 1e-9);
+        assert!((offsets.lookup("sustainedCpu", DemandBucket::Heavy) + 0.05).abs() < 1e-9);
+    }
+
+    #[test]
+    fn effective_offsets_are_reported_for_the_agent_context() {
+        let now_ms = 100 * DAY_MS;
+        let offsets = derive_offsets(
+            &[
+                rating(
+                    RatingVerdict::Good,
+                    DemandBucket::Light,
+                    now_ms,
+                    &["collectorBudget"],
+                ),
+                rating(RatingVerdict::Sluggish, DemandBucket::Heavy, now_ms, &[]),
+            ],
+            now_ms,
+        );
+        let entries = offsets.entries();
+        assert_eq!(entries.len(), 2, "{entries:?}");
+        assert_eq!(entries[0].kind, "collectorBudget");
+        assert_eq!(entries[0].bucket, DemandBucket::Light);
+        assert!((entries[0].offset - 0.05).abs() < 1e-9);
+        assert_eq!(
+            entries[1].kind, ALL_KINDS,
+            "a bucket-wide relaxation names no single kind"
+        );
+        assert_eq!(entries[1].bucket, DemandBucket::Heavy);
+        assert!((entries[1].offset + 0.05).abs() < 1e-9);
+    }
+
+    #[test]
+    fn an_offset_moves_both_notification_floors() {
+        let warning = alert(Severity::Warning);
+        // Exactly on the floors: notifies at zero offset, suppressed once the
+        // user's ratings have made this kind stricter.
+        assert!(decide(&warning, &quality(0.5, 0.5), false, None, false, 0.0).notify);
+        assert!(!decide(&warning, &quality(0.5, 0.5), false, None, false, 0.05).notify);
+        assert!(decide(&warning, &quality(0.55, 0.55), false, None, false, 0.05).notify);
+        // And a relaxation lets a below-floor incident through -- both floors
+        // move, so each one alone still gates.
+        assert!(decide(&warning, &quality(0.4, 0.4), false, None, false, -0.1).notify);
+        assert!(!decide(&warning, &quality(0.4, 0.45), false, None, false, -0.05).notify);
+        assert!(!decide(&warning, &quality(0.45, 0.4), false, None, false, -0.05).notify);
+        // The relaxed Critical floor moves with it too.
+        let critical = alert(Severity::Critical);
+        assert!(decide(&critical, &quality(0.5, 0.25), false, None, false, -0.1).notify);
+        assert!(!decide(&critical, &quality(0.5, 0.25), false, None, false, 0.0).notify);
+    }
+
+    #[test]
+    fn light_bucket_comfort_never_softens_the_heavy_bucket() {
+        // Spec test 5, the deceptive-comfort guard: a month of "it's fine"
+        // ratings given at idle must leave the heavy-load policy exactly as
+        // strict as the day it shipped.
+        let now_ms = 100 * DAY_MS;
+        let comfortable: Vec<Rating> = (0..30)
+            .map(|day| {
+                rating(
+                    RatingVerdict::Good,
+                    DemandBucket::Light,
+                    now_ms - day * DAY_MS,
+                    &["sustainedCpu"],
+                )
+            })
+            .collect();
+        let offsets = derive_offsets(&comfortable, now_ms);
+        assert!(
+            (offsets.lookup("sustainedCpu", DemandBucket::Light) - 0.15).abs() < 1e-9,
+            "the light bucket did learn from them"
+        );
+        assert_eq!(
+            offsets.lookup("sustainedCpu", DemandBucket::Heavy),
+            0.0,
+            "a month of idle comfort must not touch the heavy bucket"
+        );
+
+        // And the decision that matters: a heavy-load incident sitting
+        // exactly on the shipped floors still notifies at full sensitivity.
+        let heavy = alert(Severity::Warning);
+        let on_the_floor = quality(0.5, 0.5);
+        assert!(
+            decide(
+                &heavy,
+                &on_the_floor,
+                false,
+                None,
+                false,
+                offsets.lookup("sustainedCpu", DemandBucket::Heavy)
+            )
+            .notify,
+            "the heavy bucket must still notify at the shipped floors"
+        );
+        // The same incident under the light workload those ratings described
+        // is the one that got stricter.
+        assert!(
+            !decide(
+                &heavy,
+                &on_the_floor,
+                false,
+                None,
+                false,
+                offsets.lookup("sustainedCpu", DemandBucket::Light)
+            )
+            .notify
+        );
     }
 }
