@@ -8659,6 +8659,7 @@ mod tests {
             }],
             available: true,
             detail: String::new(),
+            inventory: None,
         };
         app.connected = true;
         app.live_history.push_back(system.clone());

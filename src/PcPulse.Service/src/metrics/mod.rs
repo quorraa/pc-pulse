@@ -2,6 +2,7 @@ pub mod dumps;
 pub mod forensics;
 mod hardware;
 pub mod interrupts;
+mod inventory;
 pub mod live;
 mod pdh;
 mod win32;
@@ -18,6 +19,7 @@ pub struct MetricCollector {
     pdh: pdh::PdhCollector,
     processes: win32::ProcessCollector,
     hardware: hardware::HardwareSampler,
+    inventory: inventory::InventorySampler,
     last_sample: Instant,
 }
 
@@ -27,6 +29,10 @@ impl MetricCollector {
             pdh: pdh::PdhCollector::new()?,
             processes: win32::ProcessCollector::default(),
             hardware: hardware::HardwareSampler::new(),
+            // Connects once (COM init + ExecQuery per group) on this
+            // startup path and is cached for the process lifetime; see
+            // `metrics::inventory`'s module docs for the re-probe cadence.
+            inventory: inventory::InventorySampler::new(),
             last_sample: Instant::now(),
         })
     }
@@ -69,7 +75,11 @@ impl MetricCollector {
         }
         // Cached internally to one probe pass per five seconds; the PDH
         // frequency reading rides along for free on every pass.
-        let hardware = self.hardware.sample(timestamp_ms, pdh.cpu_frequency_mhz);
+        let mut hardware = self.hardware.sample(timestamp_ms, pdh.cpu_frequency_mhz);
+        // The inventory sampler is its own cache (re-probed at most once a
+        // day), so this is a clone, never a fresh WMI round-trip on the
+        // hot path.
+        hardware.inventory = Some(self.inventory.collect());
         Ok((system, processes, hardware))
     }
 }
