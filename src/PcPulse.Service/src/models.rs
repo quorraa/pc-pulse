@@ -828,6 +828,67 @@ impl OptimizationPlan {
     }
 }
 
+/// Overall performance verdict for a rating record.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum RatingVerdict {
+    Good,
+    Acceptable,
+    Sluggish,
+}
+
+/// Coarse system-demand bucket for a rating record.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum DemandBucket {
+    Light,
+    Moderate,
+    Heavy,
+}
+
+/// Per-resource demand readings behind a rating's `DemandBucket`.
+/// Percentiles are `None` when the historical sketch backing them can't yet
+/// answer (e.g. not enough learned history).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct DemandDetail {
+    pub cpu_percent: f64,
+    pub cpu_percentile: Option<f64>,
+    pub memory_occupancy_pct: f64,
+    pub memory_percentile: Option<f64>,
+    pub disk_latency_ms: f64,
+    pub disk_percentile: Option<f64>,
+    pub io_bytes_per_sec: f64,
+    pub io_percentile: Option<f64>,
+}
+
+/// Reference to an incident open at the time a rating was produced.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenIncidentRef {
+    pub fingerprint: String,
+    pub kind: String,
+    pub severity: Severity,
+    pub notify: bool,
+    pub acknowledged: bool,
+}
+
+/// A point-in-time performance rating: how good/bad the machine felt, how
+/// demanding the workload was, and what was open at the time.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct Rating {
+    pub id: String,
+    pub at_ms: i64,
+    pub verdict: RatingVerdict,
+    pub demand: DemandBucket,
+    pub demand_detail: DemandDetail,
+    pub digest: serde_json::Value,
+    pub open_incidents: Vec<OpenIncidentRef>,
+    pub during_learning: bool,
+    pub unexplained: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "command", rename_all = "camelCase")]
 pub enum PipeRequest {

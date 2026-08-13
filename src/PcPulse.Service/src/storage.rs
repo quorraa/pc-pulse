@@ -2,7 +2,7 @@ use crate::{
     config::Settings,
     models::{
         Alert, DiagnosticLog, Evidence, HistoryResponse, IncidentState, OptimizationPlan,
-        ProcessMetric, SystemMetric,
+        ProcessMetric, Rating, SystemMetric,
     },
 };
 use anyhow::{Context, Result};
@@ -74,7 +74,13 @@ impl Storage {
                scope TEXT PRIMARY KEY,
                payload TEXT NOT NULL,
                updated_ms INTEGER NOT NULL
-             ) WITHOUT ROWID;",
+             ) WITHOUT ROWID;
+             CREATE TABLE IF NOT EXISTS ratings (
+               id TEXT PRIMARY KEY,
+               at_ms INTEGER NOT NULL,
+               payload TEXT NOT NULL
+             ) WITHOUT ROWID;
+             CREATE INDEX IF NOT EXISTS idx_rating_time ON ratings(at_ms DESC);",
         )?;
         // Databases created before the archive feature lack the column; the
         // flag itself also rides in the alert payload (like `acknowledged`),
@@ -456,6 +462,50 @@ impl Storage {
         )
     }
 
+    /// Persist a performance rating, then enforce the 1,000-row cap by
+    /// evicting the oldest rows (by `at_ms`) beyond that count. Ratings are
+    /// deliberately excluded from `prune()`'s retention window -- see there.
+    pub fn save_rating(&self, rating: &Rating) -> Result<()> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow::anyhow!("database lock poisoned"))?;
+        connection.execute(
+            "INSERT INTO ratings(id, at_ms, payload) VALUES (?1, ?2, ?3)
+             ON CONFLICT(id) DO UPDATE SET at_ms=excluded.at_ms, payload=excluded.payload",
+            params![rating.id, rating.at_ms, serde_json::to_string(rating)?],
+        )?;
+        connection.execute(
+            "DELETE FROM ratings WHERE id NOT IN (
+               SELECT id FROM ratings ORDER BY at_ms DESC LIMIT 1000
+             )",
+            [],
+        )?;
+        Ok(())
+    }
+
+    /// Most recent ratings, newest first. Corrupt payload rows (e.g. from a
+    /// future schema this build doesn't understand) are skipped rather than
+    /// failing the whole query, mirroring `BaselineStore::from_rows`.
+    pub fn ratings(&self, limit: usize) -> Result<Vec<Rating>> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow::anyhow!("database lock poisoned"))?;
+        let mut statement = connection
+            .prepare_cached("SELECT payload FROM ratings ORDER BY at_ms DESC LIMIT ?1")?;
+        let rows = statement.query_map(params![limit.min(10_000) as i64], |row| {
+            row.get::<_, String>(0)
+        })?;
+        let mut result = Vec::new();
+        for payload in rows {
+            if let Ok(rating) = serde_json::from_str::<Rating>(&payload?) {
+                result.push(rating);
+            }
+        }
+        Ok(result)
+    }
+
     pub fn recent_history(
         &self,
         from_ms: i64,
@@ -755,5 +805,120 @@ mod tests {
         let logs = storage.diagnostic_logs(0, 10).unwrap();
         assert_eq!(logs.len(), 2);
         assert_eq!(logs[0].timestamp_ms, 200);
+    }
+
+    fn sample_rating(id: &str, at_ms: i64) -> crate::models::Rating {
+        crate::models::Rating {
+            id: id.into(),
+            at_ms,
+            verdict: crate::models::RatingVerdict::Good,
+            demand: crate::models::DemandBucket::Heavy,
+            demand_detail: crate::models::DemandDetail {
+                cpu_percent: 12.5,
+                cpu_percentile: Some(0.4),
+                memory_occupancy_pct: 33.0,
+                memory_percentile: None,
+                disk_latency_ms: 2.0,
+                disk_percentile: Some(0.9),
+                io_bytes_per_sec: 1024.0,
+                io_percentile: None,
+            },
+            digest: serde_json::json!({"summary": "steady"}),
+            open_incidents: vec![crate::models::OpenIncidentRef {
+                fingerprint: "sustainedCpu:1:1".into(),
+                kind: "sustainedCpu".into(),
+                severity: crate::models::Severity::Warning,
+                notify: true,
+                acknowledged: false,
+            }],
+            during_learning: false,
+            unexplained: false,
+        }
+    }
+
+    #[test]
+    fn rating_round_trips_with_pinned_serde_spellings() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = Storage::open(&directory.path().join("history.db")).unwrap();
+        let rating = sample_rating("rating-1", 1_000);
+        storage.save_rating(&rating).unwrap();
+
+        let loaded = storage.ratings(10).unwrap();
+        assert_eq!(loaded, vec![rating.clone()]);
+
+        let payload = serde_json::to_value(&rating).unwrap();
+        assert_eq!(payload["verdict"], "good");
+        assert_eq!(payload["demand"], "heavy");
+    }
+
+    #[test]
+    fn ratings_are_returned_newest_first() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = Storage::open(&directory.path().join("history.db")).unwrap();
+        storage.save_rating(&sample_rating("a", 100)).unwrap();
+        storage.save_rating(&sample_rating("b", 300)).unwrap();
+        storage.save_rating(&sample_rating("c", 200)).unwrap();
+
+        let loaded = storage.ratings(10).unwrap();
+        let ids: Vec<&str> = loaded.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, vec!["b", "c", "a"]);
+    }
+
+    #[test]
+    fn rating_count_is_capped_at_one_thousand_evicting_oldest() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = Storage::open(&directory.path().join("history.db")).unwrap();
+        for at_ms in 0..1_005 {
+            storage
+                .save_rating(&sample_rating(&format!("r{at_ms}"), at_ms))
+                .unwrap();
+        }
+        let loaded = storage.ratings(2_000).unwrap();
+        assert_eq!(loaded.len(), 1_000);
+        // The five oldest (at_ms 0..=4) were evicted; the oldest surviving
+        // row is at_ms == 5.
+        let oldest_surviving = loaded.iter().map(|r| r.at_ms).min().unwrap();
+        assert_eq!(oldest_surviving, 5);
+    }
+
+    #[test]
+    fn ratings_survive_retention_prune() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = Storage::open(&directory.path().join("history.db")).unwrap();
+        let now_ms = 1_000_000_000_000_i64;
+        let old_at_ms = now_ms - 400 * 86_400_000;
+        storage
+            .save_rating(&sample_rating("ancient", old_at_ms))
+            .unwrap();
+
+        storage.prune(&Settings::default(), now_ms).unwrap();
+
+        let loaded = storage.ratings(10).unwrap();
+        assert_eq!(
+            loaded.len(),
+            1,
+            "ratings are excluded from the retention prune job"
+        );
+        assert_eq!(loaded[0].id, "ancient");
+    }
+
+    #[test]
+    fn corrupt_rating_payload_is_skipped_without_panic() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = Storage::open(&directory.path().join("history.db")).unwrap();
+        storage.save_rating(&sample_rating("good", 500)).unwrap();
+        {
+            let connection = storage.connection.lock().unwrap();
+            connection
+                .execute(
+                    "INSERT INTO ratings(id, at_ms, payload) VALUES ('bad', 600, 'not json')",
+                    [],
+                )
+                .unwrap();
+        }
+
+        let loaded = storage.ratings(10).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].id, "good");
     }
 }
