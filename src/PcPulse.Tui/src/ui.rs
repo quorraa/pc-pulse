@@ -1321,15 +1321,25 @@ fn render_rail_keys(frame: &mut Frame<'_>, app: &App, area: Rect) {
         Paragraph::new(lines).style(Style::default().bg(palette().surface)),
         area,
     );
-    // The update badge seats on the rail's last free row, directly above
-    // the bottom status block — persistent chrome, never a status line.
-    // The rail's size floor guarantees slack below the nine bezel keys.
-    if area.height > Page::ALL.len() as u16
-        && let Some(badge) = update_badge_text(app, true)
-    {
+    // The learning and update badges seat on the rail's last free rows,
+    // directly above the bottom status block — persistent chrome, never a
+    // status line. The rail's size floor guarantees slack below the nine
+    // bezel keys; each badge only claims a row when one remains above the
+    // key list, so chrome degrades quietly rather than overlapping it.
+    let badges: Vec<String> = [learning_badge_text(app, true), update_badge_text(app, true)]
+        .into_iter()
+        .flatten()
+        .collect();
+    for (offset, badge) in badges.iter().rev().enumerate() {
+        let Some(row_y) = area.bottom().checked_sub(1 + offset as u16) else {
+            break;
+        };
+        if row_y < area.y + Page::ALL.len() as u16 {
+            break;
+        }
         let row = Rect {
             x: area.x,
-            y: area.bottom().saturating_sub(1),
+            y: row_y,
             width: area.width,
             height: 1,
         };
@@ -1532,6 +1542,41 @@ fn update_badge_text(app: &App, compact: bool) -> Option<String> {
     Some(format!("⇡ v{version}{suffix}"))
 }
 
+/// The chrome learning badge: persistent, unobtrusive, present in all three
+/// profiles for as long as the snapshot reports the machine baseline is
+/// still young. It mirrors `update_badge_text`'s placement so the operator
+/// sees learning progress regardless of what currently occupies the
+/// statusline — the LEARNING segment there only wins when the status line
+/// has nothing else to say, which in practice is rare (connection, sample,
+/// and background messages continuously occupy it).
+fn learning_badge_text(app: &App, compact: bool) -> Option<String> {
+    let snapshot = app.snapshot.as_ref()?;
+    if !snapshot.learning {
+        return None;
+    }
+    let percent = snapshot.learning_percent.unwrap_or(0);
+    let minutes_left = snapshot.learning_minutes_left.unwrap_or(0);
+    let remaining = compact_learning_remaining(minutes_left);
+    if compact {
+        // The rail's 16-column bezel has no room for the full word.
+        Some(format!("◐ {percent}% ~{remaining}"))
+    } else {
+        Some(format!("LEARNING {percent}% · ~{remaining}"))
+    }
+}
+
+/// Compact remaining-time form for the header badge: hours, rounded to the
+/// nearest hour, once the remainder is at least an hour; plain minutes
+/// below that so the last stretch still visibly moves. Shorter than the
+/// statusline's "8h 50m" form to keep the badge unobtrusive.
+fn compact_learning_remaining(minutes_left: u16) -> String {
+    if minutes_left >= 60 {
+        format!("{}h", (minutes_left + 30) / 60)
+    } else {
+        format!("{minutes_left}m")
+    }
+}
+
 fn render_header(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let (status, status_color) = if app.connected {
         let etw = app
@@ -1604,6 +1649,12 @@ fn render_header(frame: &mut Frame<'_>, app: &App, area: Rect) {
         "awaiting first telemetry frame".into()
     };
     let mut header_right = Vec::new();
+    if let Some(badge) = learning_badge_text(app, false) {
+        header_right.push(Span::styled(
+            format!("{badge}   "),
+            Style::default().fg(palette().info).bold(),
+        ));
+    }
     if let Some(badge) = update_badge_text(app, true) {
         header_right.push(Span::styled(
             format!("{badge}   "),
@@ -1874,6 +1925,12 @@ fn render_masthead(frame: &mut Frame<'_>, app: &App, area: Rect) {
         ),
         Style::default().fg(palette().alt).bold(),
     ));
+    if let Some(badge) = learning_badge_text(app, false) {
+        dateline.push(Span::styled(
+            format!(" · {badge}"),
+            Style::default().fg(palette().info).bold(),
+        ));
+    }
     if let Some(badge) = update_badge_text(app, false) {
         dateline.push(Span::styled(
             format!(" · {badge}"),
@@ -8779,6 +8836,121 @@ mod tests {
         let backend = render(&mut app);
         let text = buffer_text(backend.buffer());
         assert!(!text.contains("learning your machine"), "{text}");
+    }
+
+    /// The bug this guards against: the LEARNING statusline segment only
+    /// wins when `app.status` is empty, which in practice is almost never
+    /// -- connection, sample, and background messages continuously occupy
+    /// it, so operators never saw learning progress. The header badge must
+    /// stay visible regardless of what the statusline is currently saying.
+    #[test]
+    fn header_badge_stays_visible_while_the_statusline_is_busy_with_status() {
+        let _theme = theme::test_support::activate(theme::ThemeId::Vitals);
+        let mut app = sample_app();
+        // `sample_app` starts connected with a non-empty status; keep it
+        // that way instead of clearing it, unlike the statusline test above.
+        app.status = "Sampling collector telemetry…".into();
+        app.status_is_error = false;
+        {
+            let snapshot = app.snapshot.as_mut().expect("snapshot");
+            snapshot.learning = true;
+            snapshot.learning_percent = Some(2);
+            snapshot.learning_minutes_left = Some(1_380);
+        }
+        let text = buffer_text(render(&mut app).buffer());
+        assert!(
+            text.contains("Sampling collector telemetry…"),
+            "the statusline still shows the busy status: {text}"
+        );
+        assert!(
+            !text.contains("learning your machine"),
+            "the statusline segment loses to STATUS while it's non-empty: {text}"
+        );
+        assert!(
+            text.contains("LEARNING 2% · ~23h"),
+            "the header badge must carry learning progress even while status churns: {text}"
+        );
+    }
+
+    #[test]
+    fn learning_badge_appears_on_multiple_pages_while_status_is_non_empty() {
+        let _theme = theme::test_support::activate(theme::ThemeId::Vitals);
+        for page in [Page::Overview, Page::Alerts, Page::Settings] {
+            let mut app = sample_app();
+            app.page = page;
+            app.status = "Sampling collector telemetry…".into();
+            {
+                let snapshot = app.snapshot.as_mut().expect("snapshot");
+                snapshot.learning = true;
+                snapshot.learning_percent = Some(40);
+                snapshot.learning_minutes_left = Some(300);
+            }
+            let text = buffer_text(render(&mut app).buffer());
+            assert!(
+                text.contains("LEARNING 40% · ~5h"),
+                "page {page:?} must carry the header learning badge: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn learning_badge_is_absent_when_the_machine_is_not_learning() {
+        let _theme = theme::test_support::activate(theme::ThemeId::Vitals);
+        let mut app = sample_app();
+        let snapshot = app.snapshot.as_mut().expect("snapshot");
+        snapshot.learning = false;
+        snapshot.learning_percent = None;
+        snapshot.learning_minutes_left = None;
+        let text = buffer_text(render(&mut app).buffer());
+        assert!(!text.contains("LEARNING"), "no learning badge when idle: {text}");
+    }
+
+    #[test]
+    fn learning_badge_prints_in_all_three_profiles_when_learning() {
+        // Vitals: the statusline header's right side.
+        {
+            let _theme = theme::test_support::activate(theme::ThemeId::Vitals);
+            let mut app = sample_app();
+            let snapshot = app.snapshot.as_mut().expect("snapshot");
+            snapshot.learning = true;
+            snapshot.learning_percent = Some(63);
+            snapshot.learning_minutes_left = Some(530);
+            let text = buffer_text(render(&mut app).buffer());
+            assert!(text.contains("LEARNING 63% · ~9h"), "vitals header badge: {text}");
+        }
+        // Avionics: the rail's bottom block, stacked above the update badge.
+        // The 16-column bezel has no room for the full word, so this
+        // profile prints the compact glyph form instead.
+        {
+            let _theme = theme::test_support::activate(theme::ThemeId::Avionics);
+            let mut app = sample_app();
+            let snapshot = app.snapshot.as_mut().expect("snapshot");
+            snapshot.learning = true;
+            snapshot.learning_percent = Some(63);
+            snapshot.learning_minutes_left = Some(530);
+            let text = buffer_text(render(&mut app).buffer());
+            assert!(text.contains("◐ 63% ~9h"), "rail badge: {text}");
+        }
+        // Ledger: the masthead dateline.
+        {
+            let _theme = theme::test_support::activate(theme::ThemeId::Ledger);
+            let mut app = sample_app();
+            let snapshot = app.snapshot.as_mut().expect("snapshot");
+            snapshot.learning = true;
+            snapshot.learning_percent = Some(63);
+            snapshot.learning_minutes_left = Some(530);
+            let text = buffer_text(render(&mut app).buffer());
+            assert!(text.contains("LEARNING 63% · ~9h"), "masthead dateline badge: {text}");
+        }
+    }
+
+    #[test]
+    fn compact_learning_remaining_rounds_to_hours_then_falls_back_to_minutes() {
+        assert_eq!(compact_learning_remaining(1_380), "23h");
+        assert_eq!(compact_learning_remaining(530), "9h");
+        assert_eq!(compact_learning_remaining(720), "12h");
+        assert_eq!(compact_learning_remaining(59), "59m");
+        assert_eq!(compact_learning_remaining(0), "0m");
     }
 
     #[test]
