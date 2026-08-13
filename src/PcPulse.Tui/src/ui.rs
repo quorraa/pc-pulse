@@ -9048,7 +9048,7 @@ mod tests {
         arm_both_badges(&mut app);
         let text = buffer_text(render_size(&mut app, 150, 46).buffer());
         assert!(
-            text.contains("v1.18.0"),
+            text.contains(&format!("v{}", env!("CARGO_PKG_VERSION"))),
             "version must render intact: {text}"
         );
         assert!(
@@ -9075,7 +9075,7 @@ mod tests {
         arm_both_badges(&mut app);
         let text = buffer_text(render_size(&mut app, 122, 46).buffer());
         assert!(
-            text.contains("v1.18.0"),
+            text.contains(&format!("v{}", env!("CARGO_PKG_VERSION"))),
             "version must render intact: {text}"
         );
         assert!(
@@ -9102,7 +9102,7 @@ mod tests {
         arm_both_badges(&mut app);
         let text = buffer_text(render_size(&mut app, 150, 46).buffer());
         assert!(
-            text.contains("v1.18.0"),
+            text.contains(&format!("v{}", env!("CARGO_PKG_VERSION"))),
             "version must render intact: {text}"
         );
         assert!(
@@ -9123,7 +9123,7 @@ mod tests {
         arm_both_badges(&mut app);
         let text = buffer_text(render_size(&mut app, 100, 46).buffer());
         assert!(
-            text.contains("v1.18.0"),
+            text.contains(&format!("v{}", env!("CARGO_PKG_VERSION"))),
             "version must render intact: {text}"
         );
         assert!(
