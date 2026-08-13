@@ -1,4 +1,5 @@
 use crate::{
+    baselines::RunningStats,
     config::Settings,
     models::{Alert, Evidence, ProcessMetric, Severity, SystemMetric},
     stats::{TrendPoint, TrendShape, classify_trend},
@@ -13,41 +14,6 @@ const MIB: f64 = 1024.0 * 1024.0;
 /// ~350-500 steady handles on real machines with zero growth. 600 keeps
 /// headroom for detection of genuine leaks without flagging the baseline.
 const COLLECTOR_HANDLE_BUDGET: u32 = 600;
-
-#[derive(Debug, Clone, Default)]
-struct RunningStats {
-    samples: u64,
-    mean: f64,
-    variance: f64,
-}
-
-impl RunningStats {
-    fn observe(&mut self, value: f64) {
-        // An exponentially weighted baseline follows gradual workload changes without
-        // retaining unbounded process history. The first 30 points warm it up.
-        self.samples += 1;
-        if self.samples == 1 {
-            self.mean = value;
-            return;
-        }
-        let alpha = if self.samples < 30 {
-            1.0 / self.samples as f64
-        } else {
-            0.05
-        };
-        let delta = value - self.mean;
-        self.mean += alpha * delta;
-        self.variance = (1.0 - alpha) * (self.variance + alpha * delta * delta);
-    }
-
-    fn deviates(&self, value: f64, sigma: f64, minimum_delta: f64) -> bool {
-        if self.samples < 15 {
-            return true;
-        }
-        let deviation = self.variance.max(0.0).sqrt();
-        value > self.mean + (sigma * deviation).max(minimum_delta)
-    }
-}
 
 #[derive(Debug, Clone, Default)]
 struct ProcessBaseline {

@@ -2,6 +2,7 @@
 
 pub mod alerting;
 pub mod analysis;
+pub mod baselines;
 pub mod config;
 pub mod etw;
 pub mod eventlog;

@@ -65,7 +65,12 @@ impl Storage {
                payload TEXT NOT NULL
              ) WITHOUT ROWID;
              CREATE INDEX IF NOT EXISTS idx_optimization_plan_time
-               ON optimization_plans(generated_at_ms DESC);",
+               ON optimization_plans(generated_at_ms DESC);
+             CREATE TABLE IF NOT EXISTS baselines (
+               scope TEXT PRIMARY KEY,
+               payload TEXT NOT NULL,
+               updated_ms INTEGER NOT NULL
+             ) WITHOUT ROWID;",
         )?;
         // Databases created before the archive feature lack the column; the
         // flag itself also rides in the alert payload (like `acknowledged`),
@@ -89,6 +94,42 @@ impl Storage {
             params![metric.timestamp_ms, serde_json::to_string(metric)?],
         )?;
         Ok(())
+    }
+
+    /// Upsert learned-baseline rows (`(scope, JSON payload)`, from
+    /// `baselines::BaselineStore::to_rows`) at the given persist timestamp.
+    /// Called on the baseline persist cadence and on clean shutdown.
+    pub fn save_baselines(&self, rows: &[(String, String)], now_ms: i64) -> Result<()> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow::anyhow!("database lock poisoned"))?;
+        for (scope, payload) in rows {
+            connection.execute(
+                "INSERT INTO baselines(scope, payload, updated_ms) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(scope) DO UPDATE SET payload = excluded.payload, updated_ms = excluded.updated_ms",
+                params![scope, payload, now_ms],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Load every persisted baseline row, for
+    /// `baselines::BaselineStore::from_rows` to reconstruct from at start.
+    pub fn load_baselines(&self) -> Result<Vec<(String, String)>> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow::anyhow!("database lock poisoned"))?;
+        let mut statement = connection.prepare_cached("SELECT scope, payload FROM baselines")?;
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(row?);
+        }
+        Ok(result)
     }
 
     pub fn insert_processes(&self, processes: &[ProcessMetric], maximum: usize) -> Result<()> {
