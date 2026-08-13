@@ -75,6 +75,7 @@ enum ModeKind {
     Search,
     Chat,
     ConfirmTerminate,
+    RatePerformance,
     EditSetting,
 }
 
@@ -85,6 +86,7 @@ impl From<&InputMode> for ModeKind {
             InputMode::Search(_) => Self::Search,
             InputMode::Chat(_) => Self::Chat,
             InputMode::ConfirmTerminate { .. } => Self::ConfirmTerminate,
+            InputMode::RatePerformance => Self::RatePerformance,
             InputMode::EditSetting { .. } => Self::EditSetting,
         }
     }
@@ -243,8 +245,15 @@ impl MotionSystem {
 
         if next.mode != self.previous.mode {
             match (self.previous.mode, next.mode) {
-                (_, ModeKind::ConfirmTerminate) => self.queue(MotionCue::ModalOpen),
-                (ModeKind::ConfirmTerminate, _) => self.queue(MotionCue::ModalClose),
+                // Both centered modals share the open/close cues; the
+                // rating overlay is the same kind of surface, just not a
+                // destructive one.
+                (_, ModeKind::ConfirmTerminate | ModeKind::RatePerformance) => {
+                    self.queue(MotionCue::ModalOpen);
+                }
+                (ModeKind::ConfirmTerminate | ModeKind::RatePerformance, _) => {
+                    self.queue(MotionCue::ModalClose);
+                }
                 (_, ModeKind::Search | ModeKind::EditSetting) => {
                     self.queue(MotionCue::InputOpen);
                 }

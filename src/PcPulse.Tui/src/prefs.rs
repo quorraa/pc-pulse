@@ -68,6 +68,11 @@ pub struct UiPrefs {
     /// When the last release check completed (Unix ms); launches within the
     /// 20-hour cadence window skip the check entirely.
     pub last_update_check_ms: i64,
+    /// When the performance-rating nudge was last shown (Unix ms). The
+    /// nudge is at most once a day, so this is the whole of its memory;
+    /// `0` — what pre-ratings files and a fresh install carry — means it
+    /// has never been shown.
+    pub last_rating_nudge_ms: i64,
     /// Source path of the video clip painted behind the UI; empty means no
     /// background has been set yet.
     pub background_video: String,
@@ -97,6 +102,7 @@ impl Default for UiPrefs {
             refresh_fps: 0,
             update_checks: true,
             last_update_check_ms: 0,
+            last_rating_nudge_ms: 0,
             background_video: String::new(),
             background_enabled: true,
             background_dim: DEFAULT_BACKGROUND_DIM,
@@ -259,6 +265,7 @@ mod tests {
             refresh_fps: 30,
             update_checks: false,
             last_update_check_ms: 1_800_000_000_000,
+            last_rating_nudge_ms: 1_800_000_000_001,
             background_video: "C:\\clips\\demo.pulseclip".to_string(),
             background_enabled: false,
             background_dim: 45,
@@ -273,6 +280,7 @@ mod tests {
         assert!(raw.contains("refreshFps"));
         assert!(raw.contains("updateChecks"));
         assert!(raw.contains("lastUpdateCheckMs"));
+        assert!(raw.contains("lastRatingNudgeMs"));
         assert!(raw.contains("backgroundVideo"));
         assert!(raw.contains("backgroundEnabled"));
         assert!(raw.contains("backgroundDim"));
@@ -403,6 +411,28 @@ mod tests {
         let reloaded = store.load();
         assert!(!reloaded.update_checks);
         assert_eq!(reloaded.last_update_check_ms, 1_755_000_000_123);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn pre_ratings_prefs_files_have_never_been_nudged() {
+        // A file written before performance ratings existed carries no
+        // nudge stamp; the default must read as "never shown" so the first
+        // qualifying heavy hour actually asks.
+        let old = r#"{"theme":"ledger","effects":false,"analyzerTimeoutSecs":120,"updateChecks":true,"lastUpdateCheckMs":5}"#;
+        let prefs: UiPrefs = serde_json::from_str(old).unwrap();
+        assert_eq!(prefs.last_rating_nudge_ms, 0);
+        assert_eq!(prefs.theme, ThemeId::Ledger, "untouched fields survive");
+
+        // And a stamp survives the round trip through disk.
+        let (store, path) = scratch_store("rating-nudge");
+        store
+            .save(&UiPrefs {
+                last_rating_nudge_ms: 1_755_000_000_321,
+                ..UiPrefs::default()
+            })
+            .unwrap();
+        assert_eq!(store.load().last_rating_nudge_ms, 1_755_000_000_321);
         let _ = fs::remove_file(path);
     }
 

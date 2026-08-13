@@ -901,6 +901,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
         render_footer(frame, app, regions.footer);
     }
     render_modal(frame, app);
+    render_rating_overlay(frame, app);
     render_help_overlay(frame, app, regions.body);
     // Last, once the page has drawn: the video can only tell chrome from
     // content by reading what the page left in the buffer. `current_pixels`
@@ -1453,6 +1454,10 @@ fn rail_mode_line(app: &App) -> Line<'static> {
             format!(" PID {pid}? "),
             Style::default().fg(palette().bg).bg(palette().crit).bold(),
         ),
+        InputMode::RatePerformance => Line::styled(
+            " HOW DOES IT FEEL? ",
+            Style::default().fg(palette().bg).bg(palette().alt).bold(),
+        ),
         InputMode::EditSetting { .. } => Line::styled(
             " EDITING ",
             Style::default().fg(palette().bg).bg(palette().warn).bold(),
@@ -1477,6 +1482,9 @@ fn rail_input_line(app: &App) -> Line<'static> {
                 Page::Hardware => "r sample",
             };
             return Line::styled(format!(" {hints}"), Style::default().fg(palette().faint));
+        }
+        InputMode::RatePerformance => {
+            return Line::styled(" g · a · s · Esc", Style::default().fg(palette().alt));
         }
         InputMode::Search(value) | InputMode::Chat(value) => (value.clone(), palette().ok),
         InputMode::ConfirmTerminate { typed, .. } => (typed.clone(), palette().crit),
@@ -2106,6 +2114,16 @@ fn render_folio(frame: &mut Frame<'_>, app: &App, area: Rect) {
             ),
             Span::styled(typed.clone(), Style::default().fg(palette().text).bold()),
             Span::styled("█", Style::default().fg(palette().crit)),
+        ],
+        InputMode::RatePerformance => vec![
+            Span::styled(
+                " HOW DOES IT FEEL?» ",
+                Style::default().fg(palette().alt).bold(),
+            ),
+            Span::styled(
+                "g good · a acceptable · s sluggish · Esc cancel",
+                Style::default().fg(palette().muted),
+            ),
         ],
         InputMode::EditSetting { field, typed } => vec![
             Span::styled(" EDIT» ", Style::default().fg(palette().warn).bold()),
@@ -4525,10 +4543,27 @@ fn render_alerts(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         .highlight_symbol("▌ ")
         .highlight_spacing(HighlightSpacing::Always);
     frame.render_stateful_widget(table, inset(sections[0]), &mut app.alert_state);
-    render_alert_detail(frame, app.selected_alert(), inset(sections[1]));
+    // Resolved before the detail pane borrows the selected finding, since
+    // the lookup needs the whole app (the live demand bucket and the
+    // derived offsets) and the finding only lends its kind to it.
+    let rating_offset = app
+        .selected_alert()
+        .map(|alert| alert.kind.clone())
+        .and_then(|kind| app.rating_offset_for(&kind));
+    render_alert_detail(
+        frame,
+        app.selected_alert(),
+        rating_offset,
+        inset(sections[1]),
+    );
 }
 
-fn render_alert_detail(frame: &mut Frame<'_>, alert: Option<&Alert>, area: Rect) {
+fn render_alert_detail(
+    frame: &mut Frame<'_>,
+    alert: Option<&Alert>,
+    rating_offset: Option<f64>,
+    area: Rect,
+) {
     let Some(alert) = alert else {
         frame.render_widget(
             Paragraph::new("No findings in the selected retention window.")
@@ -4602,6 +4637,18 @@ fn render_alert_detail(frame: &mut Frame<'_>, alert: Option<&Alert>, area: Rect)
         ),
         detail_line("User impact", format!("{:.2}", alert.quality.user_impact)),
         detail_line("Novelty", format!("{:.2}", alert.quality.novelty)),
+    ];
+    // What the user's own ratings have done to this kind's notification
+    // floors under the load the machine is under right now. Absent entirely
+    // when nothing has moved — an untouched policy is the normal case and
+    // deserves no line.
+    if let Some(offset) = rating_offset {
+        lines.push(Line::styled(
+            format!("  policy adjusted by your ratings: {offset:+.2}"),
+            Style::default().fg(palette().alt),
+        ));
+    }
+    lines.extend([
         Line::raw(""),
         Line::styled("▸ DIAGNOSIS", Style::default().fg(palette().alt).bold()),
         Line::raw(alert.explanation.clone()),
@@ -4610,7 +4657,7 @@ fn render_alert_detail(frame: &mut Frame<'_>, alert: Option<&Alert>, area: Rect)
             "▸ SIGNAL EVIDENCE",
             Style::default().fg(palette().info).bold(),
         ),
-    ];
+    ]);
     for evidence in &alert.evidence {
         lines.push(Line::from(vec![
             Span::styled(
@@ -6264,7 +6311,7 @@ fn render_setting_detail(
 /// to sit on one line at ≥100 terminal columns; anything that still must
 /// wrap does so through [`help_lines`]' hanging indent, so the two-column
 /// grid never sheds orphan full-width words.
-const HELP_GLOBAL: [(&str, &str); 12] = [
+const HELP_GLOBAL: [(&str, &str); 13] = [
     ("1–8", "jump to a page"),
     ("Tab / Shift-Tab", "next / previous page"),
     ("j / k, ↑ / ↓", "move selection"),
@@ -6275,6 +6322,10 @@ const HELP_GLOBAL: [(&str, &str); 12] = [
     ("m", "toggle motion effects"),
     ("t", "cycle presentation profile"),
     ("u", "download and install a newer release when the header shows one"),
+    (
+        "f",
+        "rate how the machine feels (g good / a acceptable / s sluggish) — tunes what is worth interrupting you for, under the current load only",
+    ),
     ("q / Ctrl-C", "quit"),
     ("?", "keys overlay on any page"),
 ];
@@ -6395,6 +6446,16 @@ fn render_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
             ),
             Span::raw(typed),
             Span::styled("█", Style::default().fg(palette().crit)),
+        ]),
+        InputMode::RatePerformance => Line::from(vec![
+            Span::styled(
+                " HOW DOES IT FEEL?  ",
+                Style::default().fg(palette().bg).bg(palette().alt).bold(),
+            ),
+            Span::styled(
+                "  g good · a acceptable · s sluggish · Esc cancel",
+                Style::default().fg(palette().muted),
+            ),
         ]),
         InputMode::EditSetting { field, typed } => Line::from(vec![
             Span::styled(
@@ -6518,7 +6579,7 @@ fn learning_status_text(percent: u8, minutes_left: u16) -> String {
 /// broadsheet folio line.
 fn page_hints(page: Page) -> &'static str {
     match page {
-        Page::Overview => "2 hunt  ·  4 incidents  ·  r sample",
+        Page::Overview => "2 hunt  ·  4 incidents  ·  f rate  ·  r sample",
         Page::Processes => "/ query  ·  o rank  ·  g agents  ·  x terminate",
         Page::Tree => "j/k trace  ·  r rebuild  ·  x terminate",
         Page::Alerts => {
@@ -6608,6 +6669,63 @@ fn render_modal(frame: &mut Frame<'_>, app: &App) {
                 )
                 .title(" ! DESTRUCTIVE GATE ")
                 .title_style(Style::default().fg(palette().crit).bold())
+                .padding(Padding::uniform(1)),
+        ),
+        area,
+    );
+}
+
+/// The `f` overlay: a centered three-choice modal, drawn on the same rect
+/// and with the same grammar as the destructive gate above — one place the
+/// eye already knows to look — but in the alt accent, because nothing here
+/// is destructive and the machine is asking rather than warning.
+fn render_rating_overlay(frame: &mut Frame<'_>, app: &App) {
+    if !matches!(app.mode, InputMode::RatePerformance) {
+        return;
+    }
+    let area = modal_region(frame.area());
+    frame.render_widget(Clear, area);
+    let choice = |key: &'static str, label: &'static str, note: &'static str, accent: Color| {
+        Line::from(vec![
+            Span::styled(
+                format!(" {key} "),
+                Style::default().fg(palette().bg).bg(accent).bold(),
+            ),
+            Span::raw("  "),
+            Span::styled(label, Style::default().fg(palette().text).bold()),
+            Span::styled(format!("  {note}"), Style::default().fg(palette().muted)),
+        ])
+    };
+    let text = vec![
+        Line::styled(
+            "How does this machine feel right now?",
+            Style::default().fg(palette().alt).bold(),
+        ),
+        Line::raw(""),
+        choice("g", "good", "no complaints", palette().ok),
+        choice("a", "acceptable", "fine enough", palette().info),
+        choice("s", "sluggish", "something is off", palette().warn),
+        // No blank line before this one: the modal rect is the shared
+        // 62x11, which leaves exactly seven rows inside the border and
+        // padding, and this closing note wraps onto two of them.
+        Line::styled(
+            "Tunes what is worth interrupting you for, under this load only · Esc cancel",
+            Style::default().fg(palette().muted),
+        ),
+    ];
+    frame.render_widget(
+        Paragraph::new(text).wrap(Wrap { trim: false }).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Double)
+                .border_style(Style::default().fg(palette().alt))
+                .style(
+                    Style::default()
+                        .fg(palette().text)
+                        .bg(palette().surface_raised),
+                )
+                .title(" ◈ PERFORMANCE RATING ")
+                .title_style(Style::default().fg(palette().alt).bold())
                 .padding(Padding::uniform(1)),
         ),
         area,
@@ -9436,8 +9554,116 @@ mod tests {
             learning: false,
             learning_percent: None,
             learning_minutes_left: None,
+            // Deliberately unreported: every deterministic render (gallery,
+            // demo, snapshot tests) must be free of live demand context, so
+            // the rating nudge can never fire into a recorded frame and the
+            // incidents pane shows no offset line.
+            demand: None,
+            heavy_minutes_trailing_hour: None,
         });
         app
+    }
+
+    #[test]
+    fn the_rating_overlay_offers_all_three_choices_over_the_page() {
+        let _theme = theme::test_support::activate(theme::ThemeId::Vitals);
+        let mut app = sample_app();
+        app.alerts = vec![sample_alert("sustainedCpu", Severity::Critical)];
+        app.page = Page::Alerts;
+        app.mode = crate::app::InputMode::RatePerformance;
+        let backend = render(&mut app);
+        let text = buffer_text(backend.buffer());
+        assert!(
+            text.contains("How does this machine feel"),
+            "the overlay must ask the question"
+        );
+        for choice in ["good", "acceptable", "sluggish"] {
+            assert!(text.contains(choice), "missing the {choice} choice");
+        }
+        assert!(text.contains("Esc cancel"), "the way out must be printed");
+    }
+
+    #[test]
+    fn incident_detail_shows_the_rating_offset_only_where_it_is_in_force() {
+        use pcpulse_service::models::{
+            DemandBucket, DemandDetail, OpenIncidentRef, Rating, RatingVerdict,
+        };
+        let _theme = theme::test_support::activate(theme::ThemeId::Vitals);
+        const LINE: &str = "policy adjusted by your ratings: +0.05";
+        let at_ms = 1_800_000_000_000;
+        let mut app = sample_app();
+        app.page = Page::Alerts;
+        app.alerts = vec![sample_alert("sustainedCpu", Severity::Critical)];
+        app.alert_state.select(Some(0));
+
+        // Nothing rated yet: an untouched policy earns no line at all.
+        let backend = render(&mut app);
+        assert!(!buffer_text(backend.buffer()).contains("policy adjusted"));
+
+        // One `good` while sustainedCpu was notifying, under heavy load.
+        app.rating_offsets = pcpulse_service::quality::derive_offsets(
+            &[Rating {
+                id: "rating-1".into(),
+                at_ms,
+                verdict: RatingVerdict::Good,
+                demand: DemandBucket::Heavy,
+                demand_detail: DemandDetail {
+                    cpu_percent: 0.0,
+                    cpu_percentile: None,
+                    memory_occupancy_pct: 0.0,
+                    memory_percentile: None,
+                    disk_latency_ms: 0.0,
+                    disk_percentile: None,
+                    io_bytes_per_sec: 0.0,
+                    io_percentile: None,
+                },
+                digest: serde_json::Value::Null,
+                open_incidents: vec![OpenIncidentRef {
+                    fingerprint: "sustainedCpu:1".into(),
+                    kind: "sustainedCpu".into(),
+                    severity: Severity::Warning,
+                    notify: true,
+                    acknowledged: false,
+                }],
+                during_learning: false,
+                unexplained: false,
+            }],
+            at_ms,
+        );
+
+        // Read under the bucket the machine is actually in: light load
+        // leaves the heavy bucket's adjustment out of sight, because it is
+        // not the one in force.
+        app.snapshot.as_mut().expect("snapshot").demand = Some(DemandBucket::Light);
+        let backend = render(&mut app);
+        assert!(
+            !buffer_text(backend.buffer()).contains("policy adjusted"),
+            "a heavy-bucket offset must not surface under light load"
+        );
+
+        app.snapshot.as_mut().expect("snapshot").demand = Some(DemandBucket::Heavy);
+        let backend = render(&mut app);
+        assert!(
+            buffer_text(backend.buffer()).contains(LINE),
+            "missing {LINE:?} in the detail pane"
+        );
+    }
+
+    #[test]
+    fn deterministic_fixtures_never_grow_a_rating_nudge() {
+        // The gallery and the README demo are recorded frame by frame; a
+        // statusline that could sprout a nudge would make them irreproducible.
+        for mut app in [gallery_app(), demo_app()] {
+            let snapshot = app.snapshot.clone().expect("snapshot");
+            assert_eq!(
+                snapshot.heavy_minutes_trailing_hour, None,
+                "fixtures must carry no live demand context"
+            );
+            assert_eq!(snapshot.demand, None);
+            let before = app.status.clone();
+            app.maybe_nudge_for_rating(&snapshot, 1_800_000_000_000);
+            assert_eq!(app.status, before, "a recorded frame must never be nudged");
+        }
     }
 
     fn render(app: &mut App) -> TestBackend {

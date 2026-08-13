@@ -37,6 +37,19 @@ use std::{
 
 pub struct AppState {
     pub snapshot: RwLock<Snapshot>,
+    /// The machine baseline the sampling loop is actually working with,
+    /// republished after every sample folds in.
+    ///
+    /// Baselines are persisted only every five minutes, so anything reading
+    /// them back from storage is up to that stale. For a rating that
+    /// matters twice: its demand bucket could disagree with the bucket the
+    /// engine is scoring incidents against right now, and — once per
+    /// machine, forever — a rating given inside that window at the 24-hour
+    /// crossing would be stamped `during_learning` and so contribute
+    /// nothing to the notification policy it was meant to teach. Seeded from
+    /// storage at startup so the window before the first sample is covered
+    /// too.
+    pub baseline: RwLock<crate::baselines::MachineBaseline>,
     pub settings: RwLock<Settings>,
     pub storage: Arc<Storage>,
     pub alerts: Mutex<AlertEngine>,
@@ -301,18 +314,20 @@ impl AppState {
     fn assemble_rating(&self, verdict: RatingVerdict) -> Result<Rating> {
         let now_ms = Utc::now().timestamp_millis();
 
-        // Baselines are periodically persisted by the sampling loop
-        // (`save_baselines`, every five minutes and at shutdown); reloading
-        // them here rather than threading a live copy through `AppState`
-        // keeps the pipe handler independent of the sampling loop's
-        // lifetime, at the cost of a bound this stale.
-        let baselines =
-            crate::baselines::BaselineStore::restore(self.storage.load_baselines()?, now_ms);
+        // The live baseline the sampling loop republished on its last
+        // sample, not the copy storage happens to hold (see
+        // [`AppState::baseline`]): the bucket this rating is filed under and
+        // the learning state that decides whether it counts at all must
+        // agree with what the engine is scoring incidents against right now.
+        let machine = self
+            .baseline
+            .read()
+            .map_err(|_| anyhow!("baseline lock poisoned"))?
+            .clone();
         let demand_window =
             self.storage
                 .recent_history(now_ms - RATING_DEMAND_WINDOW_MS, now_ms, 10_000, 1)?;
-        let (demand, demand_detail) =
-            ratings::demand_bucket(&demand_window.system, &baselines.machine);
+        let (demand, demand_detail) = ratings::demand_bucket(&demand_window.system, &machine);
 
         let snapshot = self
             .snapshot
@@ -358,8 +373,8 @@ impl AppState {
             .iter()
             .any(|incident| incident.notify && !incident.acknowledged);
 
-        let learning = baselines.machine.is_learning();
-        let learning_percent = learning.then(|| baselines.machine.learning_progress_pct());
+        let learning = machine.is_learning();
+        let learning_percent = learning.then(|| machine.learning_progress_pct());
         let digest_history = self.storage.recent_history(
             now_ms - RATING_DIGEST_WINDOW_MS,
             now_ms,
@@ -480,8 +495,15 @@ pub fn run(data_dir: &Path, stop: crossbeam_channel::Receiver<()>) -> Result<()>
     // that outlived the restart reattaches to its incident (same id, occurrences
     // continuing) rather than presenting as a brand-new finding.
     let reopen_seed = storage.recent_resolved_alerts(started_at_ms - QUIET_PERIOD_MS)?;
+    // Learned per-machine and per-executable norms, carried across restarts.
+    // A machine with nothing persisted starts its learning period now rather
+    // than dating an empty baseline to the epoch. Restored once here and
+    // handed to the sampling loop, so the pipe handler's live copy is right
+    // from the first request rather than from the first sample.
+    let baselines = BaselineStore::restore(storage.load_baselines()?, started_at_ms);
     let state = Arc::new(AppState {
         snapshot: RwLock::new(Snapshot::default()),
+        baseline: RwLock::new(baselines.machine.clone()),
         settings: RwLock::new(settings),
         storage,
         alerts: Mutex::new(AlertEngine::new(reopen_seed)),
@@ -503,7 +525,7 @@ pub fn run(data_dir: &Path, stop: crossbeam_channel::Receiver<()>) -> Result<()>
                 eprintln!("named-pipe server stopped: {error:#}");
             }
         })?;
-    let result = sampling_loop(&state, stop);
+    let result = sampling_loop(&state, baselines, stop);
     pipe_stop.store(true, Ordering::Release);
     pipe::wake();
     let _ = pipe_worker.join();
@@ -539,7 +561,47 @@ fn build_calibration<'a>(recent: &[SystemMetric], baselines: &'a BaselineStore) 
     }
 }
 
-fn sampling_loop(state: &Arc<AppState>, stop: crossbeam_channel::Receiver<()>) -> Result<()> {
+/// Trailing window the nudge's heavy-minutes figure is taken over
+/// (spec UX: "the trailing hour contained >= 10 minutes in the heavy
+/// bucket").
+const HEAVY_MINUTES_WINDOW_MS: i64 = 3_600_000;
+
+/// Fold one sample's demand into the trailing-hour heavy-minutes ring and
+/// answer how much of that hour was heavy.
+///
+/// `marks` holds the minute index (`timestamp_ms / 60_000`) of every minute
+/// in the window that contained at least one heavy sample. Counting minutes
+/// rather than samples is what keeps the figure independent of
+/// `sample_interval_ms`, which the user can change: at a half-second cadence
+/// ten heavy *samples* is five seconds, and would otherwise trip a gate that
+/// is supposed to mean ten minutes of real load. Timestamps are
+/// monotonic, so the ring stays sorted and duplicate minutes can be
+/// recognized by looking at the back alone.
+fn observe_heavy_minute(
+    marks: &mut VecDeque<i64>,
+    demand: crate::models::DemandBucket,
+    timestamp_ms: i64,
+) -> u16 {
+    if demand == crate::models::DemandBucket::Heavy {
+        let minute = timestamp_ms.div_euclid(60_000);
+        if marks.back() != Some(&minute) {
+            marks.push_back(minute);
+        }
+    }
+    while marks
+        .front()
+        .is_some_and(|minute| timestamp_ms - minute * 60_000 > HEAVY_MINUTES_WINDOW_MS)
+    {
+        marks.pop_front();
+    }
+    marks.len().min(u16::MAX as usize) as u16
+}
+
+fn sampling_loop(
+    state: &Arc<AppState>,
+    mut baselines: BaselineStore,
+    stop: crossbeam_channel::Receiver<()>,
+) -> Result<()> {
     let mut etw = match EtwCollector::start() {
         Ok(collector) => Some(collector),
         Err(error) => {
@@ -563,13 +625,6 @@ fn sampling_loop(state: &Arc<AppState>, stop: crossbeam_channel::Receiver<()>) -
     // timestamp comparison, and triage headers are read once per new dump.
     let mut dumps = DumpEngine::new(WindowsDumpSource);
     let mut event_logs = EventLogCollector::default();
-    // Learned per-machine and per-executable norms, carried across restarts.
-    // A machine with nothing persisted starts its learning period now rather
-    // than dating an empty baseline to the epoch.
-    let mut baselines = BaselineStore::restore(
-        state.storage.load_baselines()?,
-        Utc::now().timestamp_millis(),
-    );
     let mut next_system_write = Instant::now();
     let mut next_process_write = Instant::now();
     let mut next_prune = Instant::now();
@@ -580,6 +635,9 @@ fn sampling_loop(state: &Arc<AppState>, stop: crossbeam_channel::Receiver<()>) -
     // rather than count, since the sample cadence is a setting the user can
     // change.
     let mut recent_samples: VecDeque<SystemMetric> = VecDeque::new();
+    // Which minutes of the trailing hour were heavy; see
+    // [`observe_heavy_minute`]. Feeds the client's rating nudge.
+    let mut heavy_minutes: VecDeque<i64> = VecDeque::new();
     loop {
         let started = Instant::now();
         let settings = state
@@ -611,14 +669,22 @@ fn sampling_loop(state: &Arc<AppState>, stop: crossbeam_channel::Receiver<()>) -
         {
             recent_samples.pop_front();
         }
-        // How much the machine baseline knows, decided before this sample is
-        // folded into it: an incident is judged against what was learned
-        // before it, never against itself.
+        // Built against the baseline as it stands *before* this sample is
+        // folded into it, so an incident is judged by what was learned
+        // before it and never against itself. That ordering is about
+        // baseline maturity alone — the demand window this same call
+        // classifies deliberately includes the sample just taken, because
+        // "how loaded is this machine right now" must not lag a sample
+        // behind the reading being judged.
         let calibration = build_calibration(recent_samples.make_contiguous(), &baselines);
         // Copied out so the snapshot block below can reuse this sample's
-        // learning state without `calibration`'s `&baselines` borrow living
-        // past the mutable baseline updates that follow the evaluation.
+        // learning state and demand bucket without `calibration`'s
+        // `&baselines` borrow living past the mutable baseline updates that
+        // follow the evaluation.
         let learning = calibration.learning;
+        let demand = calibration.demand;
+        let heavy_minutes_trailing_hour =
+            observe_heavy_minute(&mut heavy_minutes, demand, timestamp_ms);
         let learning_progress_pct = baselines.machine.learning_progress_pct();
         let learning_remaining_ms = baselines.machine.learning_remaining_ms();
         let (mut evaluation, quarantine) = {
@@ -659,6 +725,17 @@ fn sampling_loop(state: &Arc<AppState>, stop: crossbeam_channel::Receiver<()>) -
                 continue;
             }
             baselines.observe_process(process, timestamp_ms);
+        }
+        // Republish what the loop now knows about the machine, so a rating
+        // arriving over the pipe before the next five-minute save reads this
+        // sample's learning state and sketches rather than storage's older
+        // copy. See [`AppState::baseline`].
+        {
+            let mut live = state
+                .baseline
+                .write()
+                .map_err(|_| anyhow!("baseline lock poisoned"))?;
+            live.clone_from(&baselines.machine);
         }
         forensics.observe(&evaluation.active, timestamp_ms);
         forensics.decorate(&mut evaluation.active);
@@ -707,6 +784,11 @@ fn sampling_loop(state: &Arc<AppState>, stop: crossbeam_channel::Receiver<()>) -
                     .div_ceil(60_000)
                     .min(u16::MAX as u64) as u16
             });
+            // The demand context clients read: the bucket the rating
+            // offsets are looked up under, and how much of the trailing
+            // hour was heavy enough to be worth asking about.
+            snapshot.demand = Some(demand);
+            snapshot.heavy_minutes_trailing_hour = Some(heavy_minutes_trailing_hour);
         }
         if Instant::now() >= next_system_write {
             state.storage.insert_system(&system)?;
@@ -918,6 +1000,7 @@ mod tests {
     fn test_state(directory: &tempfile::TempDir) -> AppState {
         AppState {
             snapshot: RwLock::new(Snapshot::default()),
+            baseline: RwLock::new(crate::baselines::MachineBaseline::new(0)),
             settings: RwLock::new(Settings::default()),
             storage: Arc::new(Storage::open(&directory.path().join("history.db")).unwrap()),
             alerts: Mutex::new(AlertEngine::default()),
@@ -1092,9 +1175,10 @@ mod tests {
         }
     }
 
-    /// A matured (non-learning) baseline, persisted the same way the
-    /// sampling loop persists one, so `assemble_rating`'s
-    /// `BaselineStore::restore(storage.load_baselines()?, ..)` picks it up.
+    /// A matured (non-learning) baseline published the same way the sampling
+    /// loop publishes one, so `assemble_rating`'s live `state.baseline`
+    /// handle picks it up. Persisted as well, mirroring the loop's
+    /// five-minute save.
     fn seed_matured_baseline(state: &AppState) {
         let mut store = crate::baselines::BaselineStore::new(0);
         store.machine.observed_ms = crate::baselines::LEARNING_PERIOD_MS;
@@ -1102,6 +1186,7 @@ mod tests {
             .storage
             .save_baselines(&store.to_rows(), Utc::now().timestamp_millis())
             .unwrap();
+        state.baseline.write().unwrap().clone_from(&store.machine);
     }
 
     #[test]
@@ -1322,6 +1407,93 @@ mod tests {
             disk_write_bytes_per_sec: value * 1_000.0,
             ..SystemMetric::default()
         }
+    }
+
+    #[test]
+    fn heavy_minutes_counts_distinct_heavy_minutes_over_a_trailing_hour() {
+        // The nudge gate is "at least ten minutes of the trailing hour were
+        // heavy". Samples arrive at whatever cadence the user has configured,
+        // so heaviness is counted in distinct wall-clock minutes rather than
+        // in samples -- a machine sampling twice a second must not reach ten
+        // "minutes" in five seconds.
+        let mut marks = VecDeque::new();
+        let mut minutes = 0;
+        for index in 0..24 {
+            minutes = observe_heavy_minute(&mut marks, DemandBucket::Heavy, index * 30_000);
+        }
+        assert_eq!(
+            minutes, 12,
+            "24 half-minute heavy samples cover 12 distinct minutes"
+        );
+
+        // Light and moderate samples add nothing; only the window moves.
+        assert_eq!(
+            observe_heavy_minute(&mut marks, DemandBucket::Light, 12 * 60_000),
+            12
+        );
+        assert_eq!(
+            observe_heavy_minute(&mut marks, DemandBucket::Moderate, 13 * 60_000),
+            12
+        );
+
+        // The window is trailing: a minute exactly one hour old still counts,
+        // and one past that has aged out.
+        assert_eq!(
+            observe_heavy_minute(&mut marks, DemandBucket::Light, 3_600_000),
+            12,
+            "the minute at t=0 is exactly one hour old and still counts"
+        );
+        assert_eq!(
+            observe_heavy_minute(&mut marks, DemandBucket::Light, 3_600_001),
+            11,
+            "one millisecond later the oldest minute has aged out"
+        );
+        assert_eq!(
+            observe_heavy_minute(&mut marks, DemandBucket::Light, 4_320_000),
+            0,
+            "an hour after the last heavy minute nothing is left"
+        );
+    }
+
+    #[test]
+    fn a_rating_taken_as_the_baseline_matures_is_not_stamped_during_learning() {
+        // The sampling loop persists baselines every five minutes, so what
+        // storage holds can be up to that stale. If a rating read its
+        // learning state from storage, the one rating given inside that
+        // window at the 24-hour crossing would be permanently -- and
+        // wrongly -- stamped `during_learning`, which makes it inert for the
+        // notification policy forever. The rating reads the live handle the
+        // sampling loop publishes each sample instead.
+        let directory = tempfile::tempdir().unwrap();
+        let state = test_state(&directory);
+        let now_ms = Utc::now().timestamp_millis();
+
+        // Storage still holds the last periodic save: a baseline that had
+        // not yet matured.
+        let learning_store = crate::baselines::BaselineStore::new(now_ms);
+        assert!(learning_store.machine.is_learning());
+        state
+            .storage
+            .save_baselines(&learning_store.to_rows(), now_ms)
+            .unwrap();
+
+        // The live handle -- what the loop is actually working with -- has
+        // since crossed maturity.
+        let mut matured = crate::baselines::MachineBaseline::new(0);
+        matured.observed_ms = crate::baselines::LEARNING_PERIOD_MS;
+        assert!(!matured.is_learning());
+        *state.baseline.write().unwrap() = matured;
+
+        let rating: Rating = match state.handle(PipeRequest::AddRating {
+            verdict: RatingVerdict::Good,
+        }) {
+            PipeResponse::Ok { data } => serde_json::from_value(data).unwrap(),
+            PipeResponse::Error { code, message } => panic!("addRating failed: {code} {message}"),
+        };
+        assert!(
+            !rating.during_learning,
+            "a rating given after the live baseline matured must not be inert"
+        );
     }
 
     #[test]

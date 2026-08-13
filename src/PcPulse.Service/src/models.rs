@@ -459,6 +459,21 @@ pub struct Snapshot {
     /// alongside `learning_percent`.
     #[serde(default)]
     pub learning_minutes_left: Option<u16>,
+    /// How demanding the workload is right now — the bucket the user's
+    /// rating offsets are read against, computed here because the machine
+    /// baseline the classification needs lives service-side. `None` in
+    /// snapshots from services that predate performance ratings, which is
+    /// how a client tells "light" from "not reported": the incidents pane
+    /// shows no rating-offset line at all rather than guessing a bucket.
+    #[serde(default)]
+    pub demand: Option<DemandBucket>,
+    /// Minutes of the trailing hour spent in the heavy demand bucket.
+    /// Counted in distinct wall-clock minutes, not in samples, so the
+    /// figure does not move with the configured sample cadence. The client's
+    /// rating nudge waits for ten of them: labels given under real load are
+    /// the ones worth asking for. `None` alongside [`Self::demand`].
+    #[serde(default)]
+    pub heavy_minutes_trailing_hour: Option<u16>,
 }
 
 impl Default for Snapshot {
@@ -473,6 +488,8 @@ impl Default for Snapshot {
             learning: false,
             learning_percent: None,
             learning_minutes_left: None,
+            demand: None,
+            heavy_minutes_trailing_hour: None,
         }
     }
 }
@@ -1289,6 +1306,38 @@ mod tests {
                 confirmation_required_for_mutations: true,
             },
         }
+    }
+
+    #[test]
+    fn pre_ratings_snapshots_gain_the_demand_fields_as_absent() {
+        // Both fields are additive: a snapshot serialized by a service that
+        // predates them must still deserialize, with the demand context
+        // simply unknown rather than fabricated as Light/zero.
+        let wire = serde_json::to_string(&Snapshot {
+            demand: Some(DemandBucket::Heavy),
+            heavy_minutes_trailing_hour: Some(17),
+            ..Snapshot::default()
+        })
+        .unwrap();
+        assert!(wire.contains("\"demand\":\"heavy\""), "wire: {wire}");
+        assert!(
+            wire.contains("\"heavyMinutesTrailingHour\":17"),
+            "wire: {wire}"
+        );
+        let back: Snapshot = serde_json::from_str(&wire).unwrap();
+        assert_eq!(back.demand, Some(DemandBucket::Heavy));
+        assert_eq!(back.heavy_minutes_trailing_hour, Some(17));
+
+        // A snapshot from a service that predates the fields carries neither
+        // key; it must still deserialize, with the demand context simply
+        // unknown rather than fabricated as Light/zero.
+        let mut older: serde_json::Value = serde_json::from_str(&wire).unwrap();
+        let object = older.as_object_mut().unwrap();
+        object.remove("demand");
+        object.remove("heavyMinutesTrailingHour");
+        let snapshot: Snapshot = serde_json::from_value(older).unwrap();
+        assert_eq!(snapshot.demand, None);
+        assert_eq!(snapshot.heavy_minutes_trailing_hour, None);
     }
 
     #[test]

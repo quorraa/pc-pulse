@@ -132,6 +132,8 @@ The tray helper's balloon filter is: an alert pops when `notify == true`, it is 
 {"command":"getRatings","limit":50}
 ```
 
+`getSnapshot`'s top-level payload gained two additive fields so a client can decide *when to ask* and *what the policy currently says* without deriving either itself: `demand: "light" | "moderate" | "heavy" | null` — the bucket the machine is in right now, the same classification a rating would be filed under — and `heavyMinutesTrailingHour: number | null`, how many distinct minutes of the last hour were heavy. Both are `null` from services that predate ratings, and `null` means *not reported*, never "light"/"zero": a client must not nudge, or display a policy offset, on an unknown bucket. Heaviness is counted in wall-clock minutes rather than in samples, so the figure does not move when `sampleIntervalMs` changes.
+
 **Ratings never modify baselines, detector thresholds, or severities.** They only ever adjust the notification policy's floors, per alert kind and demand bucket, bounded to ±0.15 and decaying with a 30-day half-life — the same guarantee `getAgentContext`'s `ratingOffsets`/`limitations` fields already document. `protocolVersion` is unchanged (still 1): both commands are additive, and a pre-1.19 service answers them with the ordinary unknown-command `invalidRequest` error.
 
 ## Hardware inventory

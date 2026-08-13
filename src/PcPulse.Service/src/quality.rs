@@ -66,9 +66,11 @@ const MS_PER_DAY: f64 = 86_400_000.0;
 
 /// The `kind` an offset carries when it applies to *every* kind in its
 /// bucket -- what an unexplained `sluggish` rating produces, since the user
-/// felt something no detector named. Only ever emitted for display
-/// ([`PolicyOffsets::entries`]); [`PolicyOffsets::lookup`] folds it into the
-/// answer for whatever kind is asked about.
+/// felt something no detector named. Purely internal: it is never emitted
+/// as its own row ([`PolicyOffsets::entries`] reports per-kind offsets
+/// only, to keep a reader from counting the bucket-wide term twice), and
+/// [`PolicyOffsets::lookup`] folds it into the answer for whatever kind is
+/// asked about.
 pub const ALL_KINDS: &str = "*";
 
 /// Tolerance for "is this accumulated/effective offset actually nonzero"
@@ -174,7 +176,10 @@ impl PolicyOffsets {
 /// must leave the heavy bucket exactly as strict as the day it shipped.
 ///
 /// Each qualifying rating contributes one [`RATING_OFFSET_STEP`], weighted by
-/// a 30-day half-life on its age, and the sum is bounded at lookup:
+/// a 30-day half-life on its age. Each term is bounded to
+/// +/-[`RATING_OFFSET_BOUND`] as it accumulates here -- so contrary feedback
+/// moves the dial on the next rating rather than first having to work off a
+/// runaway sum -- and [`PolicyOffsets::lookup`] bounds their *net* again:
 ///
 /// - `good`/`acceptable` while a kind was notifying (notify true and not
 ///   acknowledged) -- a false positive: that kind gets **stricter** in that
