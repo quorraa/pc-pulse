@@ -125,15 +125,16 @@ fn memory_occupancy_pct(memory_used_bytes: u64, memory_total_bytes: u64) -> f64 
 /// Classify one sample against the machine baseline, returning both the
 /// bucket it falls in and the raw/percentile readings behind that call.
 ///
-/// The machine baseline (`baselines.rs`, Task 1's scope) tracks percentile
-/// sketches for memory occupancy and disk latency only -- it has no CPU or
-/// IO-rate sketch. So `cpu_percentile` and `io_percentile` are always `None`
-/// here: there is no sketch to ask, and this module never fabricates an
-/// answer. In practice that leaves memory-occupancy percentile as the only
-/// channel that can ever feed the learned composite; CPU/IO only influence
-/// the bucket via the pre-learning fixed fallback below. A future baseline
-/// task adding CPU/IO sketches would light those channels up without any
-/// change to this function's shape.
+/// The machine baseline (`baselines.rs`) tracks percentile sketches for CPU,
+/// memory occupancy, disk latency, and disk IO rate. Any one of those
+/// degrades to `None` on its own -- independently of the others -- whenever
+/// its sketch hasn't yet seen 5 observations (`PercentileSketch::quantile`);
+/// this module never fabricates a percentile for a channel that can't
+/// answer yet. `io_bytes_per_sec` here is disk read + write throughput only
+/// -- `SystemMetric::network_bytes_per_sec` is deliberately excluded, since
+/// it already has its own separate meaning elsewhere (interrupt/DPC
+/// root-cause analysis) and the spec's "IO" composite channel means disk
+/// IO.
 fn classify_sample(
     sample: &crate::models::SystemMetric,
     machine: &MachineBaseline,
@@ -141,10 +142,10 @@ fn classify_sample(
     let memory_pct = memory_occupancy_pct(sample.memory_used_bytes, sample.memory_total_bytes);
     let io_bytes_per_sec = sample.disk_read_bytes_per_sec + sample.disk_write_bytes_per_sec;
 
+    let cpu_percentile = percentile_rank(&machine.cpu_percent, sample.cpu_percent);
     let memory_percentile = percentile_rank(&machine.memory_occupancy_pct, memory_pct);
     let disk_percentile = percentile_rank(&machine.disk_latency_ms, sample.disk_latency_ms);
-    let cpu_percentile: Option<f64> = None;
-    let io_percentile: Option<f64> = None;
+    let io_percentile = percentile_rank(&machine.io_bytes_per_sec, io_bytes_per_sec);
 
     let detail = DemandDetail {
         cpu_percent: sample.cpu_percent,
@@ -437,6 +438,44 @@ mod tests {
         machine
     }
 
+    // Like `system_sample`, but drives all four demand channels (CPU,
+    // memory, disk latency, disk IO) off the same value, so a baseline
+    // seeded from a spread of these has a real, non-degenerate sketch on
+    // every channel at once -- needed for tests where more than one
+    // channel's percentile matters simultaneously.
+    fn full_sample(value: f64) -> SystemMetric {
+        SystemMetric {
+            cpu_percent: value,
+            memory_used_bytes: (value * 10_000_000_000.0) as u64,
+            memory_total_bytes: 1_000_000_000_000,
+            disk_latency_ms: value,
+            disk_read_bytes_per_sec: value * 1_000.0,
+            disk_write_bytes_per_sec: value * 1_000.0,
+            ..SystemMetric::default()
+        }
+    }
+
+    fn seeded_full_baseline() -> MachineBaseline {
+        let mut machine = MachineBaseline::new(0);
+        for i in 0..2_000 {
+            let value = (i % 100) as f64;
+            machine.observe(&full_sample(value), 400, i as i64 * 5_000);
+        }
+        machine
+    }
+
+    fn seeded_cpu_baseline() -> MachineBaseline {
+        let mut machine = MachineBaseline::new(0);
+        // Same seeding shape as `seeded_memory_baseline`, but varying CPU
+        // instead, with memory held at a low constant so a heavy verdict
+        // driven off this baseline can only be coming from the CPU channel.
+        for i in 0..2_000 {
+            let cpu = (i % 100) as f64;
+            machine.observe(&system_sample(cpu, 10.0), 400, i as i64 * 5_000);
+        }
+        machine
+    }
+
     #[test]
     fn empty_slice_is_light_with_all_none_detail() {
         let machine = MachineBaseline::new(0);
@@ -448,6 +487,19 @@ mod tests {
         assert_eq!(detail.io_percentile, None);
         assert_eq!(detail.cpu_percent, 0.0);
         assert_eq!(detail.memory_occupancy_pct, 0.0);
+    }
+
+    #[test]
+    fn majority_bucket_breaks_exact_ties_toward_the_more_severe_bucket() {
+        // 5 heavy / 5 moderate: heavy wins the tie.
+        let mut ties = vec![DemandBucket::Heavy; 5];
+        ties.extend(vec![DemandBucket::Moderate; 5]);
+        assert_eq!(majority_bucket(&ties), DemandBucket::Heavy);
+
+        // 5 moderate / 5 light: moderate wins the tie.
+        let mut ties = vec![DemandBucket::Moderate; 5];
+        ties.extend(vec![DemandBucket::Light; 5]);
+        assert_eq!(majority_bucket(&ties), DemandBucket::Moderate);
     }
 
     #[test]
@@ -478,11 +530,36 @@ mod tests {
     }
 
     #[test]
+    fn a_mature_cpu_sketch_drives_heavy_through_the_learned_path() {
+        let machine = seeded_cpu_baseline();
+        let cpu_p95 = machine.cpu_percent.quantile(0.95).unwrap();
+        // Memory stays at the baseline's own low constant, so nothing here
+        // could accidentally trip the memory channel or the pre-learning
+        // fixed fallback into a false-positive heavy verdict.
+        let sample = system_sample(cpu_p95, 10.0);
+        let recent = vec![sample; 10];
+        let (bucket, detail) = demand_bucket(&recent, &machine);
+        assert_eq!(bucket, DemandBucket::Heavy);
+        assert!(detail.cpu_percentile.unwrap() >= 90.0);
+        // Proof this took the learned path and not the `None`-composite
+        // fallback: every channel's sketch is mature here, so the composite
+        // itself is `Some(..)` and the fallback branch is never reached.
+        assert!(detail.memory_percentile.is_some());
+        assert!(detail.disk_percentile.is_some());
+        assert!(detail.io_percentile.is_some());
+    }
+
+    #[test]
     fn sustained_bucket_uses_the_trailing_window_majority() {
-        let machine = seeded_memory_baseline();
+        // All four channels now have real (non-degenerate) sketches, so the
+        // baseline here varies CPU, disk latency, and IO alongside memory --
+        // otherwise a "light" sample sitting at a channel's own constant-zero
+        // baseline would score as that channel's 50th percentile instead of
+        // its 0th, contaminating the composite.
+        let machine = seeded_full_baseline();
         let p95 = machine.memory_occupancy_pct.quantile(0.95).unwrap();
-        let heavy_sample = system_sample(0.0, p95);
-        let light_sample = system_sample(0.0, 0.0);
+        let heavy_sample = full_sample(p95);
+        let light_sample = full_sample(0.0);
         // 6 heavy samples, 4 light samples: heavy is the majority.
         let mut recent = vec![heavy_sample.clone(); 6];
         recent.extend(vec![light_sample.clone(); 4]);
@@ -498,6 +575,11 @@ mod tests {
 
     #[test]
     fn fresh_baseline_degrades_percentiles_to_none_and_falls_back_to_fixed_cutoffs() {
+        // A brand-new machine baseline: every sketch (including the CPU and
+        // IO ones fed in `MachineBaseline::observe`) genuinely has zero
+        // observations, so every channel's `percentile_rank` call returns
+        // `None` on its own merits, not because the sketch structurally
+        // doesn't exist.
         let machine = MachineBaseline::new(0);
 
         // CPU >= 80 alone triggers the heavy fallback.
@@ -505,6 +587,8 @@ mod tests {
         assert_eq!(bucket, DemandBucket::Heavy);
         assert_eq!(detail.cpu_percentile, None);
         assert_eq!(detail.memory_percentile, None);
+        assert_eq!(detail.disk_percentile, None);
+        assert_eq!(detail.io_percentile, None);
 
         // Memory >= 90 alone also triggers the heavy fallback.
         let (bucket, _) = demand_bucket(&[system_sample(5.0, 95.0)], &machine);

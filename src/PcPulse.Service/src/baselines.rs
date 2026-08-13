@@ -122,6 +122,23 @@ pub struct MachineBaseline {
     pub interrupt_rate: PercentileSketch,
     pub disk_latency_ms: PercentileSketch,
     pub process_count: PercentileSketch,
+    /// CPU percent sketch, added for the ratings feature's demand-bucket
+    /// composite (`ratings::demand_bucket`). `serde(default)` so a store
+    /// persisted before this field existed loads as a fresh, empty sketch
+    /// rather than failing to deserialize -- it simply starts learning from
+    /// here, same as any other new signal.
+    #[serde(default)]
+    pub cpu_percent: PercentileSketch,
+    /// Disk IO rate sketch (read + write bytes/sec), same ratings-feature
+    /// motivation and upgrade behavior as `cpu_percent` above. Network
+    /// throughput is deliberately excluded -- the spec's IO composite
+    /// channel is disk IO ("CPU pct, memory-occupancy pct, IO pct"), and
+    /// `SystemMetric::network_bytes_per_sec` already has its own separate
+    /// meaning elsewhere in the codebase (interrupt/DPC root-cause
+    /// analysis); conflating the two would blur what "IO" means in a
+    /// stored rating.
+    #[serde(default)]
+    pub io_bytes_per_sec: PercentileSketch,
     /// Wall-clock instant the baseline was first created. Retained for
     /// provenance only: learning is measured in observed time, not wall age,
     /// because a machine that sleeps for nine hours has learned nothing
@@ -153,6 +170,8 @@ impl MachineBaseline {
             interrupt_rate: PercentileSketch::new(),
             disk_latency_ms: PercentileSketch::new(),
             process_count: PercentileSketch::new(),
+            cpu_percent: PercentileSketch::new(),
+            io_bytes_per_sec: PercentileSketch::new(),
             started_ms: now_ms,
             observed_ms: 0,
             last_observed_ms: None,
@@ -175,6 +194,9 @@ impl MachineBaseline {
         self.interrupt_rate.observe(system.interrupt_rate);
         self.disk_latency_ms.observe(system.disk_latency_ms);
         self.process_count.observe(process_count as f64);
+        self.cpu_percent.observe(system.cpu_percent);
+        self.io_bytes_per_sec
+            .observe(system.disk_read_bytes_per_sec + system.disk_write_bytes_per_sec);
     }
 
     /// Credit the gap since the previous sample, capped, and re-anchor.
