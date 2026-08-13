@@ -464,6 +464,11 @@ impl AlertEngine {
                     occurrence_count: 1,
                     resolved_at_ms: None,
                     archived: false,
+                    fingerprint: String::new(),
+                    state: crate::models::IncidentState::Open,
+                    quality: crate::models::AlertQuality::default(),
+                    notify: true,
+                    notify_generation: 0,
                 };
                 changed.push(alert.clone());
                 self.active.insert(candidate.key, alert);

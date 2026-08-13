@@ -135,11 +135,54 @@ pub enum Severity {
     Critical,
 }
 
+/// Lifecycle state of an incident (the durable identity behind a
+/// fingerprint), independent of the per-sample `Alert.resolved_at_ms`.
+/// Absent in alerts persisted before incident lifecycle tracking existed;
+/// the default treats them as open, matching prior behavior.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum IncidentState {
+    #[default]
+    Open,
+    Reopened,
+    Resolved,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Evidence {
     pub label: String,
     pub value: String,
+}
+
+/// Calibration signals the alert engine used to decide whether an incident
+/// was worth notifying about. `Default` treats an alert as fully trusted
+/// (all `1.0`) — correct for pre-calibration records, since the engine only
+/// overwrites this for live incidents it is actively scoring.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AlertQuality {
+    pub confidence: f64,
+    pub persistence: f64,
+    pub corroboration: f64,
+    pub user_impact: f64,
+    pub novelty: f64,
+}
+
+impl Default for AlertQuality {
+    fn default() -> Self {
+        Self {
+            confidence: 1.0,
+            persistence: 1.0,
+            corroboration: 1.0,
+            user_impact: 1.0,
+            novelty: 1.0,
+        }
+    }
+}
+
+fn default_notify() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -166,6 +209,30 @@ pub struct Alert {
     /// keeps old JSON deserializing and the protocol version is unchanged.
     #[serde(default)]
     pub archived: bool,
+    /// Stable identity for the underlying incident, shared across the
+    /// reopen/resolve cycle. Absent in alerts persisted before incident
+    /// fingerprints existed; the default empty string keeps old JSON
+    /// deserializing and the protocol version is unchanged.
+    #[serde(default)]
+    pub fingerprint: String,
+    /// Lifecycle state of the incident this alert represents. Absent in
+    /// pre-upgrade alerts; the default keeps old JSON deserializing.
+    #[serde(default)]
+    pub state: IncidentState,
+    /// Calibration signals behind the `notify` decision. Absent in
+    /// pre-upgrade alerts; the default keeps old JSON deserializing.
+    #[serde(default)]
+    pub quality: AlertQuality,
+    /// Whether this alert should surface a notification. Absent in
+    /// pre-upgrade alerts; the default is `true` so old records keep
+    /// notifying exactly like they did before quality gating existed.
+    #[serde(default = "default_notify")]
+    pub notify: bool,
+    /// Monotonic counter bumped whenever this incident's notification
+    /// eligibility is recomputed (e.g. on reopen). Absent in pre-upgrade
+    /// alerts; the default `0` keeps old JSON deserializing.
+    #[serde(default)]
+    pub notify_generation: u32,
 }
 
 /// One ACPI thermal zone reading, converted from decikelvin to Celsius.
@@ -771,12 +838,8 @@ mod tests {
         assert_eq!(restored, sample);
     }
 
-    #[test]
-    fn alert_without_archived_field_still_deserializes() {
-        // An alert persisted (or served) by a pre-archive service has no
-        // `archived` key; it must parse as unarchived, and the flag must
-        // ride the wire in camelCase for current alerts.
-        let alert = Alert {
+    fn test_alert() -> Alert {
+        Alert {
             id: "a-1".into(),
             kind: "sustainedCpu".into(),
             severity: Severity::Warning,
@@ -791,7 +854,23 @@ mod tests {
             acknowledged: false,
             occurrence_count: 1,
             resolved_at_ms: None,
+            archived: false,
+            fingerprint: String::new(),
+            state: IncidentState::Open,
+            quality: AlertQuality::default(),
+            notify: true,
+            notify_generation: 0,
+        }
+    }
+
+    #[test]
+    fn alert_without_archived_field_still_deserializes() {
+        // An alert persisted (or served) by a pre-archive service has no
+        // `archived` key; it must parse as unarchived, and the flag must
+        // ride the wire in camelCase for current alerts.
+        let alert = Alert {
             archived: true,
+            ..test_alert()
         };
         let mut old = serde_json::to_value(&alert).unwrap();
         assert!(
@@ -801,6 +880,35 @@ mod tests {
         let restored: Alert = serde_json::from_value(old).unwrap();
         assert!(!restored.archived);
         assert!(serde_json::to_string(&alert).unwrap().contains("\"archived\":true"));
+    }
+
+    #[test]
+    fn pre_upgrade_alert_json_gains_compatible_defaults() {
+        // A verbatim pre-upgrade payload shape (no fingerprint/state/quality/notify).
+        let old = r#"{"id":"abc","kind":"sustainedCpu","severity":"warning",
+            "firstSeenMs":1,"lastSeenMs":2,"processId":10,"processName":"x.exe",
+            "title":"t","explanation":"e","evidence":[],"recommendation":"r",
+            "acknowledged":false,"occurrenceCount":3,"resolvedAtMs":null}"#;
+        let alert: Alert = serde_json::from_str(old).unwrap();
+        assert!(alert.notify, "old records must behave like today");
+        assert_eq!(alert.notify_generation, 0);
+        assert_eq!(alert.fingerprint, "");
+        assert!(matches!(alert.state, IncidentState::Open));
+        assert!((alert.quality.confidence - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn new_fields_serialize_as_camel_case() {
+        let alert = Alert {
+            fingerprint: "dpcInterrupt".into(),
+            notify: false,
+            notify_generation: 2,
+            ..test_alert()
+        };
+        let json = serde_json::to_string(&alert).unwrap();
+        assert!(json.contains("\"fingerprint\":\"dpcInterrupt\""));
+        assert!(json.contains("\"notifyGeneration\":2"));
+        assert!(json.contains("\"state\":\"open\""));
     }
 
     #[test]
