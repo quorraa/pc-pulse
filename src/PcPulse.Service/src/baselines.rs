@@ -583,6 +583,59 @@ mod tests {
     }
 
     #[test]
+    fn a_store_persisted_before_the_cpu_and_io_sketches_existed_upgrades_with_fresh_sketches() {
+        // A row exactly like the ones this machine has on disk right now,
+        // mid-learning: real observed_ms and real sketch data, but written
+        // before `cpu_percent`/`io_bytes_per_sec` existed on `MachineBaseline`
+        // -- so those two keys are simply absent from the payload.
+        let mut legacy = MachineBaseline::new(0);
+        let mut now = 0;
+        for i in 0..500 {
+            legacy.observe(&sample_system_metric(50.0 + (i % 10) as f64), 400, now);
+            now += 60_000;
+        }
+        let observed_before = legacy.observed_ms;
+        let memory_p95_before = legacy.memory_occupancy_pct.quantile(0.95).unwrap();
+
+        let mut payload: serde_json::Value = serde_json::to_value(&legacy).unwrap();
+        let object = payload.as_object_mut().unwrap();
+        assert!(
+            object.remove("cpu_percent").is_some(),
+            "field name on the wire"
+        );
+        assert!(
+            object.remove("io_bytes_per_sec").is_some(),
+            "field name on the wire"
+        );
+
+        let rows = vec![("machine".to_string(), payload.to_string())];
+        let restored = BaselineStore::restore(rows, now);
+
+        // (a) Restoration succeeds with fresh, empty sketches for both new
+        // fields -- too few observations to answer any quantile yet.
+        assert_eq!(restored.machine.cpu_percent.quantile(0.5), None);
+        assert_eq!(restored.machine.io_bytes_per_sec.quantile(0.5), None);
+
+        // (b) observed_ms / learning progress are unaffected by the missing
+        // keys -- this is not a legacy-observed-time payload.
+        assert_eq!(restored.machine.observed_ms, observed_before);
+        assert_eq!(
+            restored.machine.learning_progress_pct(),
+            legacy.learning_progress_pct()
+        );
+
+        // (c) The other sketches' data survived intact.
+        assert_eq!(
+            restored
+                .machine
+                .memory_occupancy_pct
+                .quantile(0.95)
+                .unwrap(),
+            memory_p95_before
+        );
+    }
+
+    #[test]
     fn process_baselines_bucket_by_age_and_survive_round_trip() {
         let mut store = BaselineStore::new(0);
         // Young process observations must not pollute the mature bucket.
