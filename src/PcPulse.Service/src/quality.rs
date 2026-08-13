@@ -7,6 +7,7 @@
 //! still evaluated, still visible in history and the agent context, with its
 //! scores attached so the suppression is explainable.
 
+use crate::baselines::BaselineStore;
 use crate::models::{Alert, AlertQuality, Severity};
 
 /// Breach duration, in sustained windows, at which persistence saturates.
@@ -55,23 +56,33 @@ pub const LEARNING_CONFIDENCE_FLOOR: f64 = 0.6;
 /// What the runtime knows about the machine's learned baselines when it asks
 /// the engine to evaluate a sample.
 ///
-/// `Default` is a fully matured, non-learning machine: the pre-calibration
-/// behavior, so a caller with no baseline store (tests, a future embedder)
-/// gates on persistence and detector confidence alone rather than silently
-/// suppressing everything.
+/// `Default` is a fully matured, non-learning machine with no per-name norms:
+/// the pre-calibration behavior, so a caller with no baseline store (tests, a
+/// future embedder) gates on persistence and detector confidence alone rather
+/// than silently suppressing everything.
 #[derive(Debug, Clone, Copy)]
-pub struct Calibration {
+pub struct Calibration<'a> {
     /// Machine baseline age < 24 h; raises the notification floor.
     pub learning: bool,
     /// Machine baseline age as a fraction of the learning period, 0-1.
     pub baseline_maturity: f64,
+    /// The learned per-executable-name, age-bucketed norms a detector may
+    /// judge a process against. Borrowed rather than owned because the
+    /// runtime holds the store across the whole sampling loop and feeds it in
+    /// *before* this sample is folded into it -- an incident is judged
+    /// against what was learned before it, never against itself.
+    ///
+    /// `None` means "no norms available", which every consuming gate must
+    /// treat as passing open, exactly as an unknown name does.
+    pub names: Option<&'a BaselineStore>,
 }
 
-impl Default for Calibration {
+impl Default for Calibration<'_> {
     fn default() -> Self {
         Self {
             learning: false,
             baseline_maturity: 1.0,
+            names: None,
         }
     }
 }

@@ -1,10 +1,11 @@
 use crate::{
-    baselines::RunningStats,
+    baselines::{AgeBucketStats, RunningStats},
     config::Settings,
     models::{Alert, Evidence, IncidentState, ProcessMetric, Severity, SystemMetric},
     quality::{Calibration, QualityInputs, decide, score},
     stats::{TrendPoint, TrendShape, classify_trend},
 };
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet, VecDeque};
 use uuid::Uuid;
 
@@ -26,6 +27,47 @@ const EXIT_RATIO: f64 = 0.85;
 /// incident. Also the window `runtime` seeds the engine's reopen memory from,
 /// so a condition that outlives a service restart reattaches.
 pub const QUIET_PERIOD_MS: i64 = 6 * 3_600_000;
+/// How far back the handle/thread growth *shape* window reaches. It is a
+/// separate, longer series from the five-minute per-process ring the raw
+/// deltas are measured against: telling a leak from a burst is a question
+/// about half an hour of behavior, while "how many handles appeared since a
+/// minute ago" is not.
+const GROWTH_WINDOW_MS: i64 = 30 * 60_000;
+/// The shortest span that window will pronounce on. Below it the series has
+/// no shape worth naming, so the detector says nothing at all -- the same
+/// four-to-five-minute floor the collector's own growth trend has always
+/// used, kept short enough that a ten-minute excursion is still classified
+/// while it is happening rather than only in hindsight.
+const GROWTH_MIN_SPAN_MS: i64 = 5 * 60_000;
+/// How long an unbroken monotonic climb must persist before a growth finding
+/// escalates from history-only `Info` to a notifiable `Warning` (spec: growth
+/// persistence 30 min). Before that the finding is recorded, scored, and
+/// visible -- it is simply not yet distinguishable from a burst, and the
+/// field case proves bursts are the common one.
+const GROWTH_PERSISTENCE_MS: i64 = 30 * 60_000;
+/// Per-segment step, as a fraction of the detector's entry threshold, that
+/// the shape test needs to call a segment "higher than the last".
+///
+/// A tenth of the entry threshold per segment is deliberately small: the
+/// shape test's job is to answer "is this still climbing?", and the
+/// consequence of answering no is that an open incident auto-resolves. A
+/// large step would read a slow leak as a plateau and silently close it,
+/// which is the expensive mistake; a small one only costs a slower close on
+/// a genuinely finished excursion. It is still far above the handful of
+/// handles a steady process jitters by.
+const GROWTH_STEP_FRACTION: f64 = 0.1;
+/// A process joins the long-window watch list once a raw growth delta reaches
+/// a quarter (the reciprocal of this divisor) of its entry threshold, so the
+/// shape window is already filling by the time the raw gate trips -- a window
+/// that only started at the threshold would have nothing to say for its first
+/// five minutes.
+const GROWTH_WATCH_DIVISOR: u32 = 4;
+/// How many processes may carry a long window at once. Thirty minutes of
+/// samples is a few hundred points per process; a cap keeps a machine where
+/// hundreds of processes all drift upward from turning the shape window into
+/// a memory budget problem. Processes already holding an open growth incident
+/// are never displaced, because they were watched before the cap could bind.
+const GROWTH_WATCH_CAP: usize = 32;
 
 #[derive(Debug, Clone, Default)]
 struct ProcessBaseline {
@@ -42,6 +84,49 @@ struct ProcessPoint {
     working_set_bytes: u64,
     handles: u32,
     threads: u32,
+}
+
+/// One sample of the long growth window. Deliberately narrower than
+/// [`ProcessPoint`]: the only thing thirty minutes of retention is paying for
+/// is the handle and thread counts.
+#[derive(Debug, Clone, Copy)]
+struct GrowthPoint {
+    timestamp_ms: i64,
+    handles: u32,
+    threads: u32,
+}
+
+/// What a growth incident's window shape says about whether it may close.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GrowthFate {
+    /// The excursion is over -- the process either stopped taking more
+    /// (`Plateau`: stabilized, so not a leak) or gave back what it took
+    /// (`Returning`). Close the incident now, silently.
+    AutoResolve,
+    /// The process is still climbing, or has released only a token part of
+    /// what it took and is still sitting on the rest
+    /// ([`TrendShape::PartialRelease`]). Whatever the raw delta reads this
+    /// sample, the incident stays open.
+    StaysOpen,
+    /// The window has nothing to say yet; the ordinary exit-threshold
+    /// hysteresis decides, exactly as it does for every other detector.
+    Undecided,
+}
+
+/// The safety-critical half of Phase D's burst-versus-leak discrimination.
+///
+/// `PartialRelease` is the variant that must never be folded into
+/// `Returning`: it means the process handed back some of what it took and is
+/// still holding the remainder (its `remaining` field is how much), so
+/// closing on it would report a live leak as recovered. `stats`'s
+/// `RETURNING_TOLERANCE_FRACTION` exists to keep the two apart for exactly
+/// this consumer.
+fn growth_fate(shape: TrendShape) -> GrowthFate {
+    match shape {
+        TrendShape::Plateau | TrendShape::Returning => GrowthFate::AutoResolve,
+        TrendShape::Monotonic { .. } | TrendShape::PartialRelease { .. } => GrowthFate::StaysOpen,
+        TrendShape::Inconclusive => GrowthFate::Undecided,
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -168,6 +253,20 @@ pub struct AlertEngine {
     notify_memory: HashMap<String, NotifyMemory>,
     baselines: HashMap<(u32, i64), ProcessBaseline>,
     history: HashMap<(u32, i64), VecDeque<ProcessPoint>>,
+    /// The thirty-minute handle/thread series, kept only for processes that
+    /// are showing a growth signal or already hold a growth incident. Every
+    /// other process keeps just the five-minute `history` ring, which is what
+    /// stops the longer window from costing memory on all few hundred
+    /// processes on the machine.
+    growth_history: HashMap<(u32, i64), VecDeque<GrowthPoint>>,
+    /// This sample's window shape per growth key, rebuilt from scratch every
+    /// evaluation. A process that stopped being watched -- or exited -- simply
+    /// has no entry, and its incident falls back to hysteresis.
+    growth_shapes: HashMap<String, TrendShape>,
+    /// When each growth key's current unbroken monotonic run began. This, not
+    /// the incident's age, is what the `Info` -> `Warning` escalation is
+    /// measured from: the question is how long the climb has held its shape.
+    monotonic_since: HashMap<String, i64>,
     pool_baseline: RunningStats,
 }
 
@@ -211,7 +310,7 @@ impl AlertEngine {
         system: &SystemMetric,
         processes: &[ProcessMetric],
         settings: &Settings,
-        calibration: Calibration,
+        calibration: Calibration<'_>,
     ) -> Evaluation {
         let mut candidates = Vec::new();
         // The pre-evaluation state of every open incident, which the
@@ -227,6 +326,14 @@ impl AlertEngine {
         // open there is no exit threshold to test.
         let track_exits = !self.active.is_empty();
         let mut readings: HashMap<String, f64> = HashMap::new();
+        // The shape window describes this sample only, so it is rebuilt from
+        // scratch: a key that no process produced this time round has no
+        // shape, which is exactly what an exited process should look like.
+        self.growth_shapes.clear();
+        // Every growth key this sample produced. The monotonic-run bookkeeping
+        // is pruned to it, so a climb belonging to a process that has exited
+        // does not outlive the process.
+        let mut watched_growth_keys: HashSet<String> = HashSet::new();
         self.resolved_memory.retain(|_, remembered| {
             system.timestamp_ms - remembered.resolved_at_ms <= QUIET_PERIOD_MS
         });
@@ -326,27 +433,155 @@ impl AlertEngine {
                         "Check the app for a long-running task or leak. Restart it only after saving work; update or repair it if growth returns.",
                     ).with_entry(settings.memory_growth_mb * MIB));
                 }
-                if handle_growth >= settings.handle_growth {
+                // Handle and thread growth are the two detectors that cannot
+                // be judged from a single delta: a burst that opens 800
+                // handles and gives them all back reads identically to a leak
+                // for the first ten minutes. So they get a second, longer
+                // window whose *shape* answers the question the delta cannot,
+                // and it is kept only for processes that are actually moving.
+                let handle_key = process_key("handleGrowth", process);
+                let thread_key = process_key("threadGrowth", process);
+                let watched = handle_growth.saturating_mul(GROWTH_WATCH_DIVISOR)
+                    >= settings.handle_growth
+                    || thread_growth.saturating_mul(GROWTH_WATCH_DIVISOR) >= settings.thread_growth
+                    || self.active.contains_key(&handle_key)
+                    || self.active.contains_key(&thread_key);
+                // Read before the entry below borrows the map: a process that
+                // is already watched keeps its window whatever the cap says,
+                // and only a new one has to find room.
+                let watch_slot_free = self.growth_history.len() < GROWTH_WATCH_CAP;
+                let window = if watched {
+                    match self.growth_history.entry(identity) {
+                        Entry::Occupied(existing) => {
+                            let ring = existing.into_mut();
+                            ring.push_back(GrowthPoint {
+                                timestamp_ms: process.timestamp_ms,
+                                handles: process.handle_count,
+                                threads: process.thread_count,
+                            });
+                            Some(ring)
+                        }
+                        Entry::Vacant(slot) => watch_slot_free.then(|| {
+                            // Seed from the five-minute ring rather than
+                            // starting empty. Those points are already
+                            // paid for, they include the current sample,
+                            // and they are what gives the window a
+                            // pre-excursion baseline to measure a return
+                            // against -- without them the first third of
+                            // the window is the climb itself, and a
+                            // process that hands everything back never
+                            // looks like it came home.
+                            slot.insert(
+                                history
+                                    .iter()
+                                    .map(|point| GrowthPoint {
+                                        timestamp_ms: point.timestamp_ms,
+                                        handles: point.handles,
+                                        threads: point.threads,
+                                    })
+                                    .collect(),
+                            )
+                        }),
+                    }
+                } else {
+                    self.growth_history.remove(&identity);
+                    None
+                };
+                let (handle_shape, thread_shape) = match window {
+                    Some(ring) => {
+                        let cutoff = process.timestamp_ms - GROWTH_WINDOW_MS;
+                        while ring
+                            .front()
+                            .is_some_and(|point| point.timestamp_ms < cutoff)
+                        {
+                            ring.pop_front();
+                        }
+                        (
+                            Some(growth_shape(
+                                ring,
+                                |point| f64::from(point.handles),
+                                growth_step(settings.handle_growth),
+                            )),
+                            Some(growth_shape(
+                                ring,
+                                |point| f64::from(point.threads),
+                                growth_step(settings.thread_growth),
+                            )),
+                        )
+                    }
+                    None => (None, None),
+                };
+                for (key, shape) in [(&handle_key, handle_shape), (&thread_key, thread_shape)] {
+                    watched_growth_keys.insert(key.clone());
+                    match shape {
+                        Some(shape) => {
+                            self.growth_shapes.insert(key.clone(), shape);
+                            if matches!(shape, TrendShape::Monotonic { .. }) {
+                                self.monotonic_since
+                                    .entry(key.clone())
+                                    .or_insert(system.timestamp_ms);
+                            } else {
+                                self.monotonic_since.remove(key);
+                            }
+                        }
+                        None => {
+                            self.monotonic_since.remove(key);
+                        }
+                    }
+                }
+
+                if handle_growth >= settings.handle_growth
+                    && matches!(handle_shape, Some(TrendShape::Monotonic { .. }))
+                    && name_baseline_admits(
+                        &calibration,
+                        process,
+                        system.timestamp_ms,
+                        |stats| &stats.handles,
+                        f64::from(process.handle_count),
+                        settings.baseline_sigma,
+                        f64::from(settings.handle_growth) / 2.0,
+                    )
+                {
+                    let climbed_ms = monotonic_run_ms(
+                        self.monotonic_since.get(&handle_key),
+                        system.timestamp_ms,
+                    );
                     candidates.push(process_candidate(
                         process,
                         "handleGrowth",
-                        Severity::Warning,
+                        growth_severity(climbed_ms),
                         settings.sustained_samples,
                         "Handle count is growing",
-                        format!("{} is opening handles faster than it releases them.", process.name),
+                        format!("{} is opening handles faster than it releases them, and has been climbing rather than bursting.", process.name),
                         vec![
                             evidence("New handles", handle_growth.to_string()),
                             evidence("Current handles", process.handle_count.to_string()),
                             evidence("Window", format!("{window_seconds:.0} seconds")),
+                            evidence("Climbing for", format!("{} minutes", climbed_ms / 60_000)),
                         ],
                         "Inspect the process and its plug-ins. A confirmed restart is safer than force-ending it; update the app if the pattern repeats.",
                     ).with_entry(f64::from(settings.handle_growth)));
                 }
-                if thread_growth >= settings.thread_growth {
+                if thread_growth >= settings.thread_growth
+                    && matches!(thread_shape, Some(TrendShape::Monotonic { .. }))
+                    && name_baseline_admits(
+                        &calibration,
+                        process,
+                        system.timestamp_ms,
+                        |stats| &stats.threads,
+                        f64::from(process.thread_count),
+                        settings.baseline_sigma,
+                        f64::from(settings.thread_growth) / 2.0,
+                    )
+                {
+                    let climbed_ms = monotonic_run_ms(
+                        self.monotonic_since.get(&thread_key),
+                        system.timestamp_ms,
+                    );
                     candidates.push(process_candidate(
                         process,
                         "threadGrowth",
-                        Severity::Warning,
+                        growth_severity(climbed_ms),
                         settings.sustained_samples,
                         "Thread count is growing",
                         format!("{} is creating threads without returning to its normal range.", process.name),
@@ -354,6 +589,7 @@ impl AlertEngine {
                             evidence("New threads", thread_growth.to_string()),
                             evidence("Current threads", process.thread_count.to_string()),
                             evidence("Window", format!("{window_seconds:.0} seconds")),
+                            evidence("Climbing for", format!("{} minutes", climbed_ms / 60_000)),
                         ],
                         "Pause the triggering workload and inspect extensions or child processes. Restart only with confirmation.",
                     ).with_entry(f64::from(settings.thread_growth)));
@@ -748,12 +984,31 @@ impl AlertEngine {
             .cloned()
             .collect();
         for key in resolved_keys {
-            if !self.condition_cleared(&key, &readings, system.timestamp_ms) {
-                continue;
+            // A growth incident closes on the shape of its window, not on the
+            // raw delta having dipped: the delta goes quiet the instant a leak
+            // pauses, while the window still knows the process is sitting on
+            // everything it took.
+            let fate = self.growth_shapes.get(&key).copied().map(growth_fate);
+            match fate {
+                Some(GrowthFate::StaysOpen) => continue,
+                Some(GrowthFate::AutoResolve) => {}
+                Some(GrowthFate::Undecided) | None => {
+                    if !self.condition_cleared(&key, &readings, system.timestamp_ms) {
+                        continue;
+                    }
+                }
             }
             if let Some(mut alert) = self.active.remove(&key) {
                 alert.resolved_at_ms = Some(system.timestamp_ms);
                 alert.state = IncidentState::Resolved;
+                if fate == Some(GrowthFate::AutoResolve) {
+                    // Silent auto-resolve: the excursion is over, so there is
+                    // nothing left to interrupt anyone about. The resolution
+                    // row is still recorded -- history keeps the whole
+                    // excursion, occurrence count included -- it just carries
+                    // notify = false through the transition.
+                    alert.notify = false;
+                }
                 self.resolved_memory.insert(
                     key.clone(),
                     ResolvedIncident {
@@ -865,6 +1120,11 @@ impl AlertEngine {
         self.pool_baseline.observe(pool_total);
         self.baselines.retain(|key, _| live_keys.contains(key));
         self.history.retain(|key, _| live_keys.contains(key));
+        self.growth_history.retain(|key, _| live_keys.contains(key));
+        // A monotonic run belongs to a window; when the window goes, so does
+        // the run, or an exited process would leave its climb behind forever.
+        self.monotonic_since
+            .retain(|key, _| watched_growth_keys.contains(key));
 
         let mut active: Vec<Alert> = self.active.values().cloned().collect();
         active.sort_by_key(|alert| std::cmp::Reverse(alert.first_seen_ms));
@@ -997,6 +1257,77 @@ fn mean_working_set<'a>(points: impl Iterator<Item = &'a ProcessPoint>) -> (f64,
     }
 }
 
+/// Classify the long growth window on one of its two dimensions.
+fn growth_shape(
+    window: &VecDeque<GrowthPoint>,
+    value: impl Fn(&GrowthPoint) -> f64,
+    min_step: f64,
+) -> TrendShape {
+    let points: Vec<TrendPoint> = window
+        .iter()
+        .map(|point| TrendPoint {
+            at_ms: point.timestamp_ms,
+            value: value(point),
+        })
+        .collect();
+    classify_trend(&points, GROWTH_MIN_SPAN_MS, min_step)
+}
+
+/// The per-segment step the shape test uses for a detector whose entry
+/// threshold is `threshold`. Floored at one whole handle or thread, because
+/// these are counts: a step below one can never be cleared, which would make
+/// every series `Inconclusive`.
+fn growth_step(threshold: u32) -> f64 {
+    (f64::from(threshold) * GROWTH_STEP_FRACTION).max(1.0)
+}
+
+/// How long a growth key's current monotonic run has lasted.
+fn monotonic_run_ms(since: Option<&i64>, now_ms: i64) -> i64 {
+    since.map_or(0, |since| (now_ms - since).max(0))
+}
+
+/// A climb is only worth interrupting someone about once it has held its
+/// shape for the spec's thirty minutes of growth persistence. Before that it
+/// is recorded at `Info` -- the same history-only band the collector budget
+/// uses inside its tolerance band -- because for the first half hour a leak
+/// and a burst are the same picture, and bursts are the common one.
+fn growth_severity(monotonic_run_ms: i64) -> Severity {
+    if monotonic_run_ms >= GROWTH_PERSISTENCE_MS {
+        Severity::Warning
+    } else {
+        Severity::Info
+    }
+}
+
+/// Whether a process's reading stands out against the learned norm for
+/// *processes of its name at its age*.
+///
+/// The gate passes open in three cases, all of them "we have nothing to
+/// compare against": no baseline store at all, a name the store has never
+/// seen, and -- through `RunningStats::deviates` -- a bucket with fewer than
+/// fifteen observations. That last one is the existing young-process
+/// convention, reused deliberately: a norm learned from a handful of samples
+/// is not a norm, and suppressing a finding on the strength of one would be
+/// worse than the false positive it saves.
+fn name_baseline_admits(
+    calibration: &Calibration<'_>,
+    process: &ProcessMetric,
+    now_ms: i64,
+    pick: impl Fn(&AgeBucketStats) -> &RunningStats,
+    value: f64,
+    sigma: f64,
+    minimum_delta: f64,
+) -> bool {
+    let Some(store) = calibration.names else {
+        return true;
+    };
+    let age_ms = (now_ms - process.started_at_ms).max(0);
+    let Some(stats) = store.name_stats(&process.name, age_ms) else {
+        return true;
+    };
+    pick(stats).deviates(value, sigma, minimum_delta)
+}
+
 /// The engine key (and so the alert fingerprint) for a per-process detector.
 fn process_key(kind: &str, process: &ProcessMetric) -> String {
     format!("{kind}:{}:{}", process.pid, process.started_at_ms)
@@ -1056,6 +1387,7 @@ fn evidence(label: impl Into<String>, value: impl Into<String>) -> Evidence {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::baselines::BaselineStore;
     use crate::models::IncidentState;
 
     fn process(timestamp_ms: i64, cpu: f64, memory_mb: u64) -> ProcessMetric {
@@ -1805,6 +2137,7 @@ mod tests {
             Calibration {
                 learning: true,
                 baseline_maturity: 0.2,
+                ..Calibration::default()
             },
         );
         let scored: Vec<&Alert> = evaluations
@@ -1881,5 +2214,515 @@ mod tests {
             });
         }
         assert!(collector_working_set_growth(&history).is_none());
+    }
+
+    // ---- Handle / thread growth discrimination --------------------------
+
+    /// Growth fixtures run at a 30-second cadence. The shape window these
+    /// detectors read is thirty minutes wide, so the default two-second
+    /// cadence would need thousands of samples per fixture to say anything.
+    fn growth_settings() -> Settings {
+        Settings {
+            sustained_samples: 3,
+            sample_interval_ms: 30_000,
+            // The shipped 500-handle entry threshold assumes the two-second
+            // cadence; the field case (+800 handles over ten minutes) is a
+            // 400-handle delta across the raw comparison window. The fixtures
+            // state a threshold that delta can cross, because what is under
+            // test is the shape and baseline discrimination on top of the raw
+            // gate, not the raw number itself.
+            handle_growth: 200,
+            thread_growth: 20,
+            ..Settings::default()
+        }
+    }
+
+    /// Fixtures start three hours in so the process sits in the per-name
+    /// baseline's mature age bucket, the same bucket the training helpers
+    /// below fill.
+    const GROWTH_START_MS: i64 = 3 * 3_600_000;
+
+    fn flat(value: u32, samples: usize) -> Vec<u32> {
+        vec![value; samples]
+    }
+
+    /// `samples` values walking from just after `from` to exactly `to`.
+    fn ramp(from: u32, to: u32, samples: usize) -> Vec<u32> {
+        let span = i64::from(to) - i64::from(from);
+        (1..=samples)
+            .map(|index| (i64::from(from) + span * index as i64 / samples as i64) as u32)
+            .collect()
+    }
+
+    fn growth_process(timestamp_ms: i64, name: &str, handles: u32, threads: u32) -> ProcessMetric {
+        let mut value = process(timestamp_ms, 1.0, 20);
+        value.name = name.into();
+        value.handle_count = handles;
+        value.thread_count = threads;
+        value
+    }
+
+    fn drive_growth(
+        engine: &mut AlertEngine,
+        settings: &Settings,
+        name: &str,
+        handles: &[u32],
+        threads: &[u32],
+        calibration: Calibration<'_>,
+    ) -> Vec<Evaluation> {
+        handles
+            .iter()
+            .zip(threads.iter())
+            .enumerate()
+            .map(|(index, (handles, threads))| {
+                let timestamp_ms =
+                    GROWTH_START_MS + index as i64 * settings.sample_interval_ms as i64;
+                let system = SystemMetric {
+                    timestamp_ms,
+                    ..SystemMetric::default()
+                };
+                engine.evaluate(
+                    &system,
+                    &[growth_process(timestamp_ms, name, *handles, *threads)],
+                    settings,
+                    calibration,
+                )
+            })
+            .collect()
+    }
+
+    /// [`drive_growth`] with the thread count pinned flat, for the handle
+    /// fixtures.
+    fn drive_handles(
+        engine: &mut AlertEngine,
+        settings: &Settings,
+        name: &str,
+        trajectory: &[u32],
+        calibration: Calibration<'_>,
+    ) -> Vec<Evaluation> {
+        let threads = flat(4, trajectory.len());
+        drive_growth(engine, settings, name, trajectory, &threads, calibration)
+    }
+
+    /// Train a per-name baseline by replaying a handle trajectory into the
+    /// store the way the runtime does, at the same age bucket the fixtures
+    /// run in.
+    fn trained_baseline(name: &str, trajectory: &[u32]) -> BaselineStore {
+        let mut store = BaselineStore::new(0);
+        for (index, handles) in trajectory.iter().enumerate() {
+            let at_ms = GROWTH_START_MS + index as i64 * 30_000;
+            store.observe_process(&growth_process(at_ms, name, *handles, 4), at_ms);
+        }
+        store
+    }
+
+    /// Every version of every alert of `kind` this run produced, active or
+    /// changed, in evaluation order.
+    fn seen_of_kind<'a>(evaluations: &'a [Evaluation], kind: &str) -> Vec<&'a Alert> {
+        evaluations
+            .iter()
+            .flat_map(|evaluation| evaluation.active.iter().chain(evaluation.changed.iter()))
+            .filter(|alert| alert.kind == kind)
+            .collect()
+    }
+
+    /// The field case: a process that opens 800 handles over ten minutes,
+    /// holds them, then gives them all back. It is a real excursion and is
+    /// recorded as one from the first sustained sample to the last, but it is
+    /// never worth interrupting the user for, and it closes itself without a
+    /// word once the window flattens.
+    #[test]
+    fn burst_and_release_never_notifies_but_is_recorded() {
+        let settings = growth_settings();
+        let mut engine = AlertEngine::default();
+        // Ten minutes of climb, then a long hold, then the handles come back.
+        // The hold runs past the thirty-minute window on purpose: the point
+        // of the test is that the incident closes itself on the *plateau*,
+        // before the release, because a process that stopped taking more has
+        // already stopped being a leak.
+        let mut trajectory = flat(300, 10);
+        let climb_ends = trajectory.len() + 20;
+        trajectory.extend(ramp(300, 1100, 20));
+        trajectory.extend(flat(1100, 60));
+        let plateau_ends = trajectory.len();
+        trajectory.extend(ramp(1100, 300, 10));
+        trajectory.extend(flat(300, 20));
+        let evaluations = drive_handles(
+            &mut engine,
+            &settings,
+            "burst.exe",
+            &trajectory,
+            Calibration::default(),
+        );
+
+        let seen = seen_of_kind(&evaluations, "handleGrowth");
+        assert!(
+            !seen.is_empty(),
+            "the excursion must be recorded as an incident"
+        );
+        assert!(
+            seen.iter().all(|alert| !alert.notify),
+            "a burst-and-release must never be worth a notification"
+        );
+        assert!(
+            seen.iter().all(|alert| alert.notify_generation == 0),
+            "nothing about a burst-and-release earns a notification generation"
+        );
+
+        // The incident is in the evaluation output for every sample between
+        // the one that opened it and the one that closed it -- suppression is
+        // a notification decision, never a recording decision.
+        let live: Vec<bool> = evaluations
+            .iter()
+            .map(|evaluation| {
+                evaluation
+                    .active
+                    .iter()
+                    .any(|alert| alert.kind == "handleGrowth")
+            })
+            .collect();
+        let opened_at = live.iter().position(|live| *live).expect("it opens");
+        let closed_at = live.iter().rposition(|live| *live).expect("it opens");
+        assert!(
+            live[opened_at..=closed_at].iter().all(|live| *live),
+            "the incident is recorded continuously across the excursion"
+        );
+
+        let resolved_at = evaluations
+            .iter()
+            .position(|evaluation| {
+                evaluation
+                    .changed
+                    .iter()
+                    .any(|alert| alert.kind == "handleGrowth" && alert.resolved_at_ms.is_some())
+            })
+            .expect("the excursion auto-resolves once its window stops climbing");
+        assert!(
+            (climb_ends..plateau_ends).contains(&resolved_at),
+            "the incident closes on the plateau, while the process is still \
+             holding every handle it took -- not only once it hands them back \
+             (sample {resolved_at}, plateau {climb_ends}..{plateau_ends})"
+        );
+        let resolution = evaluations[resolved_at]
+            .changed
+            .iter()
+            .find(|alert| alert.kind == "handleGrowth" && alert.resolved_at_ms.is_some())
+            .expect("the resolution row is recorded");
+        assert_eq!(resolution.state, IncidentState::Resolved);
+        assert!(
+            !resolution.notify,
+            "the resolution transition stays silent: notify is false"
+        );
+        assert!(
+            resolution.occurrence_count >= 5,
+            "occurrence_count reflects the excursion, not one sample: {}",
+            resolution.occurrence_count
+        );
+        assert!(
+            engine.active.is_empty(),
+            "nothing is left open once the handles come back"
+        );
+    }
+
+    /// A genuine leak: a monotonic climb that keeps going, on a process whose
+    /// own mature baseline says this is not how it behaves.
+    #[test]
+    fn a_monotonic_leak_against_baseline_notifies_once_and_updates_thereafter() {
+        let settings = growth_settings();
+        let store = trained_baseline("leaky.exe", &flat(300, 60));
+        let mut engine = AlertEngine::default();
+        let mut trajectory = flat(300, 10);
+        // Ninety samples at a thirty-second cadence: forty-five minutes of
+        // unbroken climb, comfortably past the thirty minutes of monotonic
+        // persistence a notifiable leak has to show.
+        trajectory.extend(ramp(300, 3900, 90));
+        let climb_ends = trajectory.len();
+        // Then it stops. Even a leak that has already been notified about
+        // closes without a second word once it stops taking more.
+        trajectory.extend(flat(3900, 80));
+        let evaluations = drive_handles(
+            &mut engine,
+            &settings,
+            "leaky.exe",
+            &trajectory,
+            Calibration {
+                names: Some(&store),
+                ..Calibration::default()
+            },
+        );
+
+        let timeline: Vec<Option<(bool, u32, u32, i64)>> = evaluations
+            .iter()
+            .map(|evaluation| {
+                evaluation
+                    .active
+                    .iter()
+                    .find(|alert| alert.kind == "handleGrowth")
+                    .map(|alert| {
+                        (
+                            alert.notify,
+                            alert.notify_generation,
+                            alert.occurrence_count,
+                            alert.last_seen_ms,
+                        )
+                    })
+            })
+            .collect();
+        let first_notify = timeline
+            .iter()
+            .position(|entry| entry.is_some_and(|(notify, ..)| notify))
+            .expect("a sustained monotonic leak eventually notifies");
+        assert!(
+            first_notify < climb_ends,
+            "the climb itself is what notifies"
+        );
+        assert!(
+            timeline[..first_notify]
+                .iter()
+                .all(|entry| entry.is_none_or(|(notify, ..)| !notify)),
+            "the climb is recorded silently until it has persisted long enough"
+        );
+        assert!(
+            timeline[first_notify..climb_ends]
+                .iter()
+                .all(|entry| entry.is_some_and(|(notify, ..)| notify)),
+            "once it is worth saying, it stays said"
+        );
+        assert!(
+            timeline
+                .iter()
+                .flatten()
+                .all(|(_, generation, ..)| *generation == 0),
+            "continued growth must not re-pop: the generation stays stable"
+        );
+
+        // And when the leak stops, the incident closes itself without a
+        // second notification -- the resolution transition carries notify
+        // false even though the incident had been notifying right up to it.
+        let resolution = evaluations
+            .iter()
+            .flat_map(|evaluation| &evaluation.changed)
+            .find(|alert| alert.kind == "handleGrowth" && alert.resolved_at_ms.is_some())
+            .expect("a leak that stops growing auto-resolves");
+        assert_eq!(resolution.state, IncidentState::Resolved);
+        assert!(
+            !resolution.notify,
+            "silent auto-resolve: the resolution row never asks to interrupt"
+        );
+        assert_eq!(
+            resolution.notify_generation, 0,
+            "and it does not spend a generation on the way out"
+        );
+
+        let after: Vec<(u32, i64)> = timeline[first_notify..climb_ends]
+            .iter()
+            .flatten()
+            .map(|(_, _, occurrences, last_seen)| (*occurrences, *last_seen))
+            .collect();
+        assert!(after.len() >= 3, "the leak keeps being observed");
+        assert!(
+            after.windows(2).all(|pair| pair[1].0 > pair[0].0),
+            "continued growth updates occurrence_count"
+        );
+        assert!(
+            after.windows(2).all(|pair| pair[1].1 > pair[0].1),
+            "continued growth updates last_seen"
+        );
+        assert_eq!(
+            evaluations
+                .iter()
+                .flat_map(|evaluation| &evaluation.changed)
+                .filter(|alert| alert.kind == "handleGrowth")
+                .map(|alert| alert.id.clone())
+                .collect::<HashSet<String>>()
+                .len(),
+            1,
+            "one climb is one incident"
+        );
+    }
+
+    /// A process that bursts 500 handles as a matter of routine is judged
+    /// against its own norm, not against the raw threshold.
+    #[test]
+    fn a_known_bursty_process_is_judged_against_its_own_norm() {
+        let settings = growth_settings();
+        let mut training = Vec::new();
+        for _ in 0..6 {
+            training.extend(flat(300, 10));
+            training.extend(ramp(300, 800, 20));
+            training.extend(flat(800, 10));
+            training.extend(ramp(800, 300, 10));
+        }
+        let store = trained_baseline("bursty.exe", &training);
+
+        let mut burst = flat(300, 10);
+        burst.extend(ramp(300, 800, 20));
+        burst.extend(flat(800, 20));
+
+        let mut known = AlertEngine::default();
+        let known_run = drive_handles(
+            &mut known,
+            &settings,
+            "bursty.exe",
+            &burst,
+            Calibration {
+                names: Some(&store),
+                ..Calibration::default()
+            },
+        );
+        assert!(
+            seen_of_kind(&known_run, "handleGrowth").is_empty(),
+            "a burst this process makes routinely is not an incident"
+        );
+
+        // The identical burst under a name the store has never seen has no
+        // norm to be judged against, so the baseline gate passes open and the
+        // other gates decide.
+        let mut stranger = AlertEngine::default();
+        let stranger_run = drive_handles(
+            &mut stranger,
+            &settings,
+            "stranger.exe",
+            &burst,
+            Calibration {
+                names: Some(&store),
+                ..Calibration::default()
+            },
+        );
+        assert!(
+            !seen_of_kind(&stranger_run, "handleGrowth").is_empty(),
+            "the same burst on an unknown name still passes the baseline gate"
+        );
+    }
+
+    /// The safety-critical distinction between the three ways a growth window
+    /// can stop climbing. Only a process that has actually given the
+    /// resources back -- or stopped taking more -- lets its incident close;
+    /// one still sitting on what it took keeps the incident open.
+    #[test]
+    fn only_a_finished_excursion_auto_resolves() {
+        assert_eq!(growth_fate(TrendShape::Plateau), GrowthFate::AutoResolve);
+        assert_eq!(growth_fate(TrendShape::Returning), GrowthFate::AutoResolve);
+        assert_eq!(
+            growth_fate(TrendShape::PartialRelease { remaining: 949.0 }),
+            GrowthFate::StaysOpen,
+            "a process that grew 1000 and gave back 51 still holds the leak"
+        );
+        assert_eq!(
+            growth_fate(TrendShape::Monotonic {
+                total_growth: 1_000.0
+            }),
+            GrowthFate::StaysOpen
+        );
+        assert_eq!(
+            growth_fate(TrendShape::Inconclusive),
+            GrowthFate::Undecided,
+            "an empty window decides nothing; hysteresis still applies"
+        );
+    }
+
+    /// The same distinction end to end: an identical 1000-handle climb, one
+    /// giving back 51 handles and one giving back all of them.
+    #[test]
+    fn a_token_release_keeps_the_incident_open_but_a_full_one_closes_it() {
+        let settings = growth_settings();
+        let climb = {
+            let mut trajectory = flat(300, 10);
+            trajectory.extend(ramp(300, 1300, 20));
+            trajectory
+        };
+
+        let mut token = climb.clone();
+        token.extend(flat(1249, 30));
+        let mut token_engine = AlertEngine::default();
+        let token_run = drive_handles(
+            &mut token_engine,
+            &settings,
+            "sticky.exe",
+            &token,
+            Calibration::default(),
+        );
+        assert!(
+            !seen_of_kind(&token_run, "handleGrowth").is_empty(),
+            "the climb opens an incident"
+        );
+        assert!(
+            token_run
+                .iter()
+                .flat_map(|evaluation| &evaluation.changed)
+                .all(|alert| alert.kind != "handleGrowth" || alert.resolved_at_ms.is_none()),
+            "giving back 51 of 1000 handles resolves nothing: the incident stays open"
+        );
+        assert!(!token_engine.active.is_empty(), "the incident stays open");
+
+        let mut full = climb;
+        full.extend(flat(300, 30));
+        let mut full_engine = AlertEngine::default();
+        let full_run = drive_handles(
+            &mut full_engine,
+            &settings,
+            "tidy.exe",
+            &full,
+            Calibration::default(),
+        );
+        let resolution = full_run
+            .iter()
+            .flat_map(|evaluation| &evaluation.changed)
+            .find(|alert| alert.kind == "handleGrowth" && alert.resolved_at_ms.is_some())
+            .expect("handing every handle back closes the incident");
+        assert!(
+            !resolution.notify,
+            "and it closes silently, like every growth auto-resolve"
+        );
+    }
+
+    /// Threads take the same three gates as handles.
+    #[test]
+    fn thread_growth_takes_the_same_gates_as_handles() {
+        let settings = growth_settings();
+        let mut engine = AlertEngine::default();
+        let mut threads = flat(20, 10);
+        threads.extend(ramp(20, 320, 40));
+        let handles = flat(300, threads.len());
+        let evaluations = drive_growth(
+            &mut engine,
+            &settings,
+            "spawner.exe",
+            &handles,
+            &threads,
+            Calibration::default(),
+        );
+        assert!(
+            !seen_of_kind(&evaluations, "threadGrowth").is_empty(),
+            "a monotonic thread climb opens a threadGrowth incident"
+        );
+
+        // A thread count that jumps once and holds is a pool, not a leak. The
+        // step does cross the window's segment boundaries on its way through,
+        // so it can be recorded while it does -- but it never holds a
+        // monotonic shape for thirty minutes, so it never escalates past
+        // history-only, and it closes itself once the step settles into the
+        // window's earlier segments.
+        let mut engine = AlertEngine::default();
+        let mut threads = flat(20, 10);
+        threads.extend(flat(320, 40));
+        let evaluations = drive_growth(
+            &mut engine,
+            &settings,
+            "pooled.exe",
+            &handles,
+            &threads,
+            Calibration::default(),
+        );
+        assert!(
+            seen_of_kind(&evaluations, "threadGrowth")
+                .iter()
+                .all(|alert| alert.severity == Severity::Info && !alert.notify),
+            "a one-time step to a bigger thread pool never becomes a notifiable leak"
+        );
+        assert!(
+            engine.active.is_empty(),
+            "and it closes itself once the step clears the window"
+        );
     }
 }

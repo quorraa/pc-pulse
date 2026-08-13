@@ -418,6 +418,7 @@ fn sampling_loop(state: &Arc<AppState>, stop: crossbeam_channel::Receiver<()>) -
         let calibration = Calibration {
             learning: baselines.machine.is_learning(timestamp_ms),
             baseline_maturity: baselines.machine.maturity(timestamp_ms),
+            names: Some(&baselines),
         };
         let mut evaluation = state
             .alerts
