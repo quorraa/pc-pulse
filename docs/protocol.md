@@ -35,7 +35,7 @@ Errors do not disclose stack traces:
 | `archiveAlert` | `alert_id`, `archived` | Archive-flag result; `archived: false` recovers a finding |
 | `terminateProcess` | `pid`, `confirmed` | Termination result |
 | `addRating` | `verdict` | Stores and returns a server-assembled performance rating |
-| `getRatings` | `limit` | Rating history, newest first; transport-safe limit is clamped to 100 |
+| `getRatings` | `limit` | Rating history, newest first; transport-safe limit is clamped to 200 (`POLICY_OFFSET_RATINGS`, the same history bound the notification policy is derived from) |
 
 ## The `live` channel
 

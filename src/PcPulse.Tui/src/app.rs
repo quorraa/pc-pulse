@@ -1220,6 +1220,12 @@ pub struct App {
     /// copy — so a stale or empty history costs a line of text, never a
     /// notification decision.
     pub rating_offsets: PolicyOffsets,
+    /// The rating history the offsets above were derived from, newest
+    /// first, kept so the incidents page can annotate its history region
+    /// with what the operator actually told the machine. Display only, and
+    /// empty until the first `getRatings` answers (an older collector never
+    /// fills it).
+    pub ratings: Vec<Rating>,
     /// The '?' keys overlay: `Some(scroll)` while open. Deliberately not an
     /// [`InputMode`] variant — the effects layer diffs `InputMode` through
     /// its own `ModeKind`, and the overlay is chrome, not an input state.
@@ -1374,6 +1380,7 @@ impl App {
             timeline_hours: 3,
             mode: InputMode::Normal,
             rating_offsets: PolicyOffsets::default(),
+            ratings: Vec::new(),
             help_overlay: None,
             client_prefs: UiPrefs::default(),
             background: None,
@@ -1546,6 +1553,10 @@ impl App {
                 }
                 WorkerEvent::Ratings(Ok(ratings)) => {
                     self.rating_offsets = derive_offsets(&ratings, Utc::now().timestamp_millis());
+                    // Kept whole: the offsets are the policy, these are the
+                    // records the incidents page annotates its history
+                    // region with. Newest first, as the service serves it.
+                    self.ratings = ratings;
                 }
                 // A service that predates ratings answers `getRatings` with
                 // the ordinary unknown-command error. Nobody asked for this

@@ -263,7 +263,14 @@ impl AppState {
                 Ok(serde_json::to_value(rating)?)
             }
             PipeRequest::GetRatings { limit } => {
-                Ok(serde_json::to_value(self.storage.ratings(limit.min(100))?)?)
+                // Clamped to the same bound the policy itself is derived
+                // from: the TUI reads this to show the offsets it believes
+                // are in force, and a transport bound below
+                // `POLICY_OFFSET_RATINGS` would let that figure drift from
+                // the one the engine applies once the table grows past it.
+                Ok(serde_json::to_value(
+                    self.storage.ratings(limit.min(POLICY_OFFSET_RATINGS))?,
+                )?)
             }
         }
     }
@@ -1350,11 +1357,12 @@ mod tests {
     }
 
     #[test]
-    fn get_ratings_returns_newest_first_clamped_to_100() {
+    fn get_ratings_returns_newest_first_clamped_to_the_policy_bound() {
         let directory = tempfile::tempdir().unwrap();
         let state = test_state(&directory);
         let base_ms = Utc::now().timestamp_millis();
-        for index in 0..120 {
+        let stored = POLICY_OFFSET_RATINGS + 20;
+        for index in 0..stored as i64 {
             state
                 .storage
                 .save_rating(&Rating {
@@ -1385,14 +1393,42 @@ mod tests {
             PipeResponse::Ok { data } => serde_json::from_value(data).unwrap(),
             PipeResponse::Error { code, message } => panic!("getRatings failed: {code} {message}"),
         };
-        assert_eq!(ratings.len(), 100, "must clamp to 100 however high the ask");
+        assert_eq!(
+            ratings.len(),
+            POLICY_OFFSET_RATINGS,
+            "must clamp to the policy bound however high the ask"
+        );
         assert_eq!(
             ratings[0].id,
-            "rating-119",
+            format!("rating-{}", stored - 1),
             "newest first: {:?}",
             ratings.iter().map(|r| &r.id).take(3).collect::<Vec<_>>()
         );
-        assert_eq!(ratings[99].id, "rating-20");
+        assert_eq!(
+            ratings[POLICY_OFFSET_RATINGS - 1].id,
+            format!("rating-{}", stored - POLICY_OFFSET_RATINGS)
+        );
+
+        // The clamp is a ceiling, not a floor: the display and the engine
+        // both ask for exactly `POLICY_OFFSET_RATINGS`, and that ask must
+        // come back whole -- otherwise the incidents pane's offset figure
+        // is derived from less history than the policy applies.
+        let response = state.handle(PipeRequest::GetRatings {
+            limit: POLICY_OFFSET_RATINGS,
+        });
+        let ratings: Vec<Rating> = match response {
+            PipeResponse::Ok { data } => serde_json::from_value(data).unwrap(),
+            PipeResponse::Error { code, message } => panic!("getRatings failed: {code} {message}"),
+        };
+        assert_eq!(ratings.len(), POLICY_OFFSET_RATINGS);
+
+        // A smaller ask is still honored verbatim.
+        let response = state.handle(PipeRequest::GetRatings { limit: 5 });
+        let ratings: Vec<Rating> = match response {
+            PipeResponse::Ok { data } => serde_json::from_value(data).unwrap(),
+            PipeResponse::Error { code, message } => panic!("getRatings failed: {code} {message}"),
+        };
+        assert_eq!(ratings.len(), 5);
     }
 
     /// Drives all four demand channels (CPU, memory, disk latency, disk IO)

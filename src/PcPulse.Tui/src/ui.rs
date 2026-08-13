@@ -8,8 +8,8 @@ use crate::{
     theme::{self, LayoutKind, palette},
 };
 use pcpulse_service::models::{
-    Alert, HardwareMetrics, IncidentState, OptimizationPlan, PlanAction, PlanRisk, ProcessMetric,
-    Severity, SystemMetric,
+    Alert, DemandBucket, HardwareMetrics, IncidentState, OptimizationPlan, PlanAction, PlanRisk,
+    ProcessMetric, RatingVerdict, Severity, SystemMetric,
 };
 use ratatui::{
     Frame,
@@ -383,7 +383,10 @@ fn mouse_body_click(
             let sections =
                 Layout::horizontal([Constraint::Percentage(42), Constraint::Percentage(58)])
                     .split(body);
-            let table = inset(sections[0]);
+            // The same split the renderer makes: with the ratings strip
+            // drawn the table is shorter than its column, and a click below
+            // it must not resolve to a row that is no longer there.
+            let table = inset(alert_list_regions(app, sections[0]).0);
             if button == MouseButton::Left
                 && point.1 == table.y.saturating_add(1)
                 && let Some(sort) = alert_sort_at(table, point.0)
@@ -4542,7 +4545,11 @@ fn render_alerts(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         .row_highlight_style(row_highlight_style())
         .highlight_symbol("▌ ")
         .highlight_spacing(HighlightSpacing::Always);
-    frame.render_stateful_widget(table, inset(sections[0]), &mut app.alert_state);
+    let (list_area, annotations_area) = alert_list_regions(app, sections[0]);
+    frame.render_stateful_widget(table, inset(list_area), &mut app.alert_state);
+    if let Some(annotations) = annotations_area {
+        render_rating_annotations(frame, app, inset(annotations), now_ms);
+    }
     // Resolved before the detail pane borrows the selected finding, since
     // the lookup needs the whole app (the live demand bucket and the
     // derived offsets) and the finding only lends its kind to it.
@@ -4555,6 +4562,92 @@ fn render_alerts(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         app.selected_alert(),
         rating_offset,
         inset(sections[1]),
+    );
+}
+
+/// How many rating records the incidents page annotates its history region
+/// with. The records are an aside, not the subject of the page, so the
+/// strip stays short however long the history grows.
+const RATING_ANNOTATION_ROWS: usize = 10;
+
+/// The incidents list column split into the findings table and, beneath it,
+/// the rating-annotation strip -- `None` when there is nothing to annotate
+/// with, or when the column is too short to spare the rows. Shared by the
+/// renderer and the mouse hit-test so a click can never land on a table row
+/// the renderer no longer draws.
+fn alert_list_regions(app: &App, section: Rect) -> (Rect, Option<Rect>) {
+    let rows = app.ratings.len().min(RATING_ANNOTATION_ROWS);
+    if rows == 0 {
+        return (section, None);
+    }
+    // +2 for the panel's own border rows.
+    let strip = rows as u16 + 2;
+    // The findings themselves always win the column: below this the
+    // annotations simply do not appear.
+    const FINDINGS_FLOOR: u16 = 8;
+    if section.height < strip.saturating_add(FINDINGS_FLOOR) {
+        return (section, None);
+    }
+    let split = Layout::vertical([Constraint::Min(FINDINGS_FLOOR), Constraint::Length(strip)])
+        .split(section);
+    (split[0], Some(split[1]))
+}
+
+/// What the operator has told the machine, as muted one-line annotations
+/// under the findings list: verdict, the load it was given under, and how
+/// long ago. Newest first, exactly as the service serves the history.
+fn render_rating_annotations(frame: &mut Frame<'_>, app: &App, area: Rect, now_ms: i64) {
+    let lines = app
+        .ratings
+        .iter()
+        .take(RATING_ANNOTATION_ROWS)
+        .map(|rating| {
+            let verdict = match rating.verdict {
+                RatingVerdict::Good => "good",
+                RatingVerdict::Acceptable => "acceptable",
+                RatingVerdict::Sluggish => "sluggish",
+            };
+            let bucket = match rating.demand {
+                DemandBucket::Light => "light",
+                DemandBucket::Moderate => "moderate",
+                DemandBucket::Heavy => "heavy",
+            };
+            // `format::age` says "--" when it cannot place the record
+            // against the current snapshot; a bare "-- ago" would read as a
+            // bug, so the clause is dropped instead.
+            let age = format::age(rating.at_ms, now_ms);
+            let when = if age == "--" {
+                "just now".to_string()
+            } else {
+                format!("{age} ago")
+            };
+            let mut spans = vec![
+                Span::styled("◦ ", Style::default().fg(palette().faint)),
+                Span::styled(
+                    format!("rated {verdict}"),
+                    Style::default().fg(palette().muted),
+                ),
+                Span::styled(
+                    format!(" · {bucket} load · {when}"),
+                    Style::default().fg(palette().faint),
+                ),
+            ];
+            if rating.unexplained {
+                // The analyzer's cue: the machine had nothing open that
+                // explains what the operator felt. Marked, not shouted.
+                spans.push(Span::styled(
+                    " ⚑ unexplained",
+                    Style::default().fg(palette().alt),
+                ));
+            }
+            Line::from(spans)
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(
+        Paragraph::new(lines)
+            .style(Style::default().fg(palette().muted).bg(palette().surface))
+            .block(accent_panel(" ◦ YOUR RATINGS ", palette().faint)),
+        area,
     );
 }
 
@@ -9649,6 +9742,133 @@ mod tests {
         );
     }
 
+    /// One rating record stamped `at_ms`, with no open incidents attached:
+    /// the annotations read nothing but the verdict, the bucket, the age
+    /// and the unexplained flag.
+    fn sample_rating(
+        verdict: pcpulse_service::models::RatingVerdict,
+        demand: DemandBucket,
+        at_ms: i64,
+        unexplained: bool,
+    ) -> pcpulse_service::models::Rating {
+        use pcpulse_service::models::{DemandDetail, Rating};
+        Rating {
+            id: format!("rating-{at_ms}"),
+            at_ms,
+            verdict,
+            demand,
+            demand_detail: DemandDetail {
+                cpu_percent: 0.0,
+                cpu_percentile: None,
+                memory_occupancy_pct: 0.0,
+                memory_percentile: None,
+                disk_latency_ms: 0.0,
+                disk_percentile: None,
+                io_bytes_per_sec: 0.0,
+                io_percentile: None,
+            },
+            digest: serde_json::Value::Null,
+            open_incidents: Vec::new(),
+            during_learning: false,
+            unexplained,
+        }
+    }
+
+    #[test]
+    fn rating_annotations_read_verdict_bucket_and_age_under_the_findings_list() {
+        let _theme = theme::test_support::activate(theme::ThemeId::Vitals);
+        let mut app = sample_app();
+        app.page = Page::Alerts;
+        app.alerts = vec![sample_alert("sustainedCpu", Severity::Critical)];
+        app.alert_state.select(Some(0));
+        let now_ms = app.snapshot.as_ref().expect("snapshot").system.timestamp_ms;
+
+        // Nothing rated yet: the region stays exactly as it was.
+        let before = buffer_text(render(&mut app).buffer());
+        assert!(
+            !before.contains("YOUR RATINGS"),
+            "an unrated machine earns no annotation strip"
+        );
+        assert!(
+            before.contains("Sustained pressure"),
+            "the findings themselves must render"
+        );
+
+        app.ratings = vec![
+            sample_rating(
+                RatingVerdict::Good,
+                DemandBucket::Light,
+                now_ms - 7_200_000,
+                false,
+            ),
+            sample_rating(
+                RatingVerdict::Sluggish,
+                DemandBucket::Heavy,
+                now_ms - 86_400_000,
+                true,
+            ),
+        ];
+        let text = buffer_text(render(&mut app).buffer());
+        assert!(text.contains("YOUR RATINGS"), "missing the strip: {text}");
+        assert!(
+            text.contains("rated good · light load · 2h 0m ago"),
+            "missing the newest annotation: {text}"
+        );
+        assert!(
+            text.contains("rated sluggish · heavy load · 1d 0h ago"),
+            "missing the older annotation: {text}"
+        );
+        assert!(
+            text.contains("unexplained"),
+            "an unexplained rating must carry its marker: {text}"
+        );
+        // The incidents rows themselves are untouched by the annotations.
+        assert!(
+            text.contains("Sustained pressure"),
+            "the findings list must survive the strip: {text}"
+        );
+        assert!(text.contains("SEV") && text.contains("FINDING"));
+    }
+
+    #[test]
+    fn the_rating_strip_never_crowds_the_findings_out_of_a_short_column() {
+        let _theme = theme::test_support::activate(theme::ThemeId::Vitals);
+        let mut app = sample_app();
+        app.page = Page::Alerts;
+        app.alerts = vec![sample_alert("sustainedCpu", Severity::Critical)];
+        app.alert_state.select(Some(0));
+        let now_ms = app.snapshot.as_ref().expect("snapshot").system.timestamp_ms;
+        app.ratings = (0..20)
+            .map(|index| {
+                sample_rating(
+                    RatingVerdict::Good,
+                    DemandBucket::Light,
+                    now_ms - 60_000 * (index + 1),
+                    false,
+                )
+            })
+            .collect();
+
+        // Ten at most, however long the history is.
+        let text = buffer_text(render(&mut app).buffer());
+        assert_eq!(
+            text.matches("rated good").count(),
+            RATING_ANNOTATION_ROWS,
+            "the strip is capped at ten records: {text}"
+        );
+
+        // And on a column with no room to spare it yields entirely.
+        let text = buffer_text(render_size(&mut app, 150, 24).buffer());
+        assert!(
+            !text.contains("YOUR RATINGS"),
+            "a short column keeps the findings, not the aside: {text}"
+        );
+        assert!(
+            text.contains("FINDING"),
+            "the findings table keeps the whole column: {text}"
+        );
+    }
+
     #[test]
     fn deterministic_fixtures_never_grow_a_rating_nudge() {
         // The gallery and the README demo are recorded frame by frame; a
@@ -9660,6 +9880,13 @@ mod tests {
                 "fixtures must carry no live demand context"
             );
             assert_eq!(snapshot.demand, None);
+            // Nor a rating history: the incidents page's annotation strip
+            // is drawn from `ratings`, and a fixture that carried any would
+            // put a wall-clock age into a recorded frame.
+            assert!(
+                app.ratings.is_empty(),
+                "fixtures must carry no rating records"
+            );
             let before = app.status.clone();
             app.maybe_nudge_for_rating(&snapshot, 1_800_000_000_000);
             assert_eq!(app.status, before, "a recorded frame must never be nudged");
