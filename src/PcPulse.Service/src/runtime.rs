@@ -13,11 +13,12 @@ use crate::{
         live::LiveEngine,
     },
     models::{
-        DiagnosticLogResponse, DiagnosticLogStatus, PipeRequest, PipeResponse, ProcessMetric,
-        ProcessNode, Snapshot,
+        DiagnosticLogResponse, DiagnosticLogStatus, OpenIncidentRef, PipeRequest, PipeResponse,
+        ProcessMetric, ProcessNode, Rating, RatingVerdict, Snapshot, SystemMetric,
     },
     pipe,
-    quality::Calibration,
+    quality::{Calibration, derive_offsets},
+    ratings,
     storage::Storage,
 };
 use anyhow::{Result, anyhow};
@@ -36,6 +37,19 @@ use std::{
 
 pub struct AppState {
     pub snapshot: RwLock<Snapshot>,
+    /// The machine baseline the sampling loop is actually working with,
+    /// republished after every sample folds in.
+    ///
+    /// Baselines are persisted only every five minutes, so anything reading
+    /// them back from storage is up to that stale. For a rating that
+    /// matters twice: its demand bucket could disagree with the bucket the
+    /// engine is scoring incidents against right now, and — once per
+    /// machine, forever — a rating given inside that window at the 24-hour
+    /// crossing would be stamped `during_learning` and so contribute
+    /// nothing to the notification policy it was meant to teach. Seeded from
+    /// storage at startup so the window before the first sample is covered
+    /// too.
+    pub baseline: RwLock<crate::baselines::MachineBaseline>,
     pub settings: RwLock<Settings>,
     pub storage: Arc<Storage>,
     pub alerts: Mutex<AlertEngine>,
@@ -147,6 +161,12 @@ impl AppState {
                     logs,
                     log_status: status,
                     alerts,
+                    rating_offsets: self
+                        .alerts
+                        .lock()
+                        .map_err(|_| anyhow!("alert lock poisoned"))?
+                        .rating_offsets()
+                        .entries(),
                 });
                 self.remember_context(&context)?;
                 Ok(serde_json::to_value(context)?)
@@ -232,6 +252,19 @@ impl AppState {
                 crate::metrics::terminate_process(pid, confirmed)?;
                 Ok(json!({ "terminated": true, "pid": pid }))
             }
+            PipeRequest::AddRating { verdict } => {
+                let rating = self.assemble_rating(verdict)?;
+                self.storage.save_rating(&rating)?;
+                // The rating just landed is the single source of truth for
+                // the notification policy's offsets -- re-derive the
+                // engine's cache from it immediately, so the very next
+                // evaluation already honors what the user just said.
+                self.refresh_rating_offsets()?;
+                Ok(serde_json::to_value(rating)?)
+            }
+            PipeRequest::GetRatings { limit } => {
+                Ok(serde_json::to_value(self.storage.ratings(limit.min(100))?)?)
+            }
         }
     }
 }
@@ -243,7 +276,147 @@ struct IssuedContext {
     evidence_refs: HashSet<String>,
 }
 
+/// How much rating history the notification policy is derived from. Ratings
+/// decay with a 30-day half-life, so anything past the newest couple hundred
+/// is arithmetically inaudible long before it is dropped -- and the bound
+/// keeps a machine with a thousand stored ratings from re-deriving the whole
+/// table on every new one.
+///
+/// Public because the TUI derives the *same* offsets for display and must
+/// read exactly as much history as the engine does: two independently
+/// chosen bounds could show the operator a figure the policy is not
+/// applying. One constant, one tie, checked by the compiler.
+pub const POLICY_OFFSET_RATINGS: usize = 200;
+
+/// Trailing window a rating's demand bucket is classified against (Global
+/// Constraints: "trailing 10 min composite").
+const RATING_DEMAND_WINDOW_MS: i64 = 10 * 60_000;
+/// Trailing window a rating's digest rolls up (mirrors the agent context's
+/// own rollup window default).
+const RATING_DIGEST_WINDOW_MS: i64 = 3_600_000;
+
 impl AppState {
+    /// Re-derive the notify-floor offsets from the rating history and hand
+    /// them to the engine. Called once at startup and again whenever a new
+    /// rating lands, because the ratings table is the single source of truth
+    /// and [`derive_offsets`] is a pure function over it -- there is no
+    /// second store to keep in step, only this cache to refresh.
+    pub fn refresh_rating_offsets(&self) -> Result<()> {
+        let ratings = self.storage.ratings(POLICY_OFFSET_RATINGS)?;
+        let offsets = derive_offsets(&ratings, Utc::now().timestamp_millis());
+        self.alerts
+            .lock()
+            .map_err(|_| anyhow!("alert lock poisoned"))?
+            .observe_rating_offsets(offsets);
+        Ok(())
+    }
+
+    /// Assemble a full [`Rating`] server-side from just the user's verdict.
+    /// The pipe handler itself stays a thin shell (save + refresh-offsets +
+    /// serialize); this is where the record's context comes from, factored
+    /// out so it is exercised directly by handler-level tests without
+    /// needing the pipe wire format in the loop.
+    fn assemble_rating(&self, verdict: RatingVerdict) -> Result<Rating> {
+        let now_ms = Utc::now().timestamp_millis();
+
+        // The live baseline the sampling loop republished on its last
+        // sample, not the copy storage happens to hold (see
+        // [`AppState::baseline`]): the bucket this rating is filed under and
+        // the learning state that decides whether it counts at all must
+        // agree with what the engine is scoring incidents against right now.
+        let machine = self
+            .baseline
+            .read()
+            .map_err(|_| anyhow!("baseline lock poisoned"))?
+            .clone();
+        let demand_window =
+            self.storage
+                .recent_history(now_ms - RATING_DEMAND_WINDOW_MS, now_ms, 10_000, 1)?;
+        let (demand, demand_detail) = ratings::demand_bucket(&demand_window.system, &machine);
+
+        let snapshot = self
+            .snapshot
+            .read()
+            .map_err(|_| anyhow!("snapshot lock poisoned"))?
+            .clone();
+        let settings = self
+            .settings
+            .read()
+            .map_err(|_| anyhow!("settings lock poisoned"))?
+            .clone();
+        let log_status = self
+            .log_status
+            .lock()
+            .map_err(|_| anyhow!("diagnostic-log status lock poisoned"))?
+            .clone();
+
+        // Open incidents come from the live snapshot's active alerts, same
+        // as the agent context: archived findings are the user filing them
+        // away, so they stop counting as "open" for both the record and the
+        // unexplained/false-positive judgment below.
+        let active_incidents: Vec<crate::models::Alert> = snapshot
+            .active_alerts
+            .iter()
+            .filter(|alert| !alert.archived)
+            .cloned()
+            .collect();
+        let open_incidents: Vec<OpenIncidentRef> = active_incidents
+            .iter()
+            .map(|alert| OpenIncidentRef {
+                fingerprint: alert.fingerprint.clone(),
+                kind: alert.kind.clone(),
+                severity: alert.severity,
+                notify: alert.notify,
+                acknowledged: alert.acknowledged,
+            })
+            .collect();
+        // Mirrors `quality::derive_offsets`'s own "notifying" test: a
+        // rating's own unexplained/false-positive judgment must agree with
+        // the notion of "notifying" the offsets it later feeds are derived
+        // from.
+        let notifying = open_incidents
+            .iter()
+            .any(|incident| incident.notify && !incident.acknowledged);
+
+        let learning = machine.is_learning();
+        let learning_percent = learning.then(|| machine.learning_progress_pct());
+        let digest_history = self.storage.recent_history(
+            now_ms - RATING_DIGEST_WINDOW_MS,
+            now_ms,
+            10_000,
+            20_000,
+        )?;
+        let collector_health = format!(
+            "diagnosticLogs enabled={} lastError={}",
+            log_status.enabled,
+            log_status.last_error.as_deref().unwrap_or("none")
+        );
+        let digest = ratings::build_digest(ratings::DigestSource {
+            history: digest_history,
+            snapshot: &snapshot,
+            settings: &settings,
+            incidents: active_incidents,
+            learning,
+            learning_percent,
+            collector_health,
+        });
+
+        Ok(Rating {
+            id: uuid::Uuid::new_v4().to_string(),
+            at_ms: now_ms,
+            verdict,
+            demand,
+            demand_detail,
+            digest,
+            open_incidents,
+            during_learning: learning,
+            // Spec truth table: sluggish + nothing notifying -> true;
+            // sluggish + something notifying -> false (the system already
+            // called it); good/acceptable -> always false.
+            unexplained: verdict == RatingVerdict::Sluggish && !notifying,
+        })
+    }
+
     fn remember_context(&self, context: &crate::models::AgentContext) -> Result<()> {
         let evidence_refs = context
             .process_suspects
@@ -327,8 +500,15 @@ pub fn run(data_dir: &Path, stop: crossbeam_channel::Receiver<()>) -> Result<()>
     // that outlived the restart reattaches to its incident (same id, occurrences
     // continuing) rather than presenting as a brand-new finding.
     let reopen_seed = storage.recent_resolved_alerts(started_at_ms - QUIET_PERIOD_MS)?;
+    // Learned per-machine and per-executable norms, carried across restarts.
+    // A machine with nothing persisted starts its learning period now rather
+    // than dating an empty baseline to the epoch. Restored once here and
+    // handed to the sampling loop, so the pipe handler's live copy is right
+    // from the first request rather than from the first sample.
+    let baselines = BaselineStore::restore(storage.load_baselines()?, started_at_ms);
     let state = Arc::new(AppState {
         snapshot: RwLock::new(Snapshot::default()),
+        baseline: RwLock::new(baselines.machine.clone()),
         settings: RwLock::new(settings),
         storage,
         alerts: Mutex::new(AlertEngine::new(reopen_seed)),
@@ -337,6 +517,9 @@ pub fn run(data_dir: &Path, stop: crossbeam_channel::Receiver<()>) -> Result<()>
         settings_path,
         live: LiveEngine::windows(),
     });
+    // What the user's past ratings have made of the notification policy. Read
+    // once here so the first evaluation after a restart already honors it.
+    state.refresh_rating_offsets()?;
     let pipe_stop = Arc::new(AtomicBool::new(false));
     let pipe_state = Arc::clone(&state);
     let pipe_stop_worker = Arc::clone(&pipe_stop);
@@ -347,14 +530,83 @@ pub fn run(data_dir: &Path, stop: crossbeam_channel::Receiver<()>) -> Result<()>
                 eprintln!("named-pipe server stopped: {error:#}");
             }
         })?;
-    let result = sampling_loop(&state, stop);
+    let result = sampling_loop(&state, baselines, stop);
     pipe_stop.store(true, Ordering::Release);
     pipe::wake();
     let _ = pipe_worker.join();
     result
 }
 
-fn sampling_loop(state: &Arc<AppState>, stop: crossbeam_channel::Receiver<()>) -> Result<()> {
+/// Trailing window the sampling loop keeps for `Calibration.demand`. Same
+/// value as [`RATING_DEMAND_WINDOW_MS`] (both are the Global Constraints'
+/// "trailing 10 min composite"), named separately because the two live in
+/// different call paths -- one recomputed every sample, the other read once
+/// per rating from stored history -- and are free to diverge later.
+const DEMAND_WINDOW_MS: i64 = 10 * 60_000;
+
+/// Assemble one sample's [`Calibration`] from the sampling loop's live
+/// state. Factored out of `sampling_loop` -- which drives real OS
+/// collectors and process/kernel state and so cannot be exercised as a unit
+/// test -- specifically so the wiring from the trailing sample window to
+/// `Calibration.demand` is a plain, testable function rather than buried in
+/// the loop body. That wiring point carried a `TODO(ratings)` through Task
+/// 4 (this module always passed `Calibration::default().demand`, i.e.
+/// `Light`, regardless of load); pinning it here means a regression back to
+/// the default is a unit-test failure, not something only visible on a
+/// running, loaded machine.
+fn build_calibration<'a>(recent: &[SystemMetric], baselines: &'a BaselineStore) -> Calibration<'a> {
+    Calibration {
+        learning: baselines.machine.is_learning(),
+        baseline_maturity: baselines.machine.maturity(),
+        names: Some(baselines),
+        // How demanding the workload is right now: the bucket the user's
+        // rating offsets are read against, so a rating only ever adjusts
+        // the policy under the load it was given at.
+        demand: ratings::demand_bucket(recent, &baselines.machine).0,
+    }
+}
+
+/// Trailing window the nudge's heavy-minutes figure is taken over
+/// (spec UX: "the trailing hour contained >= 10 minutes in the heavy
+/// bucket").
+const HEAVY_MINUTES_WINDOW_MS: i64 = 3_600_000;
+
+/// Fold one sample's demand into the trailing-hour heavy-minutes ring and
+/// answer how much of that hour was heavy.
+///
+/// `marks` holds the minute index (`timestamp_ms / 60_000`) of every minute
+/// in the window that contained at least one heavy sample. Counting minutes
+/// rather than samples is what keeps the figure independent of
+/// `sample_interval_ms`, which the user can change: at a half-second cadence
+/// ten heavy *samples* is five seconds, and would otherwise trip a gate that
+/// is supposed to mean ten minutes of real load. Timestamps are
+/// monotonic, so the ring stays sorted and duplicate minutes can be
+/// recognized by looking at the back alone.
+fn observe_heavy_minute(
+    marks: &mut VecDeque<i64>,
+    demand: crate::models::DemandBucket,
+    timestamp_ms: i64,
+) -> u16 {
+    if demand == crate::models::DemandBucket::Heavy {
+        let minute = timestamp_ms.div_euclid(60_000);
+        if marks.back() != Some(&minute) {
+            marks.push_back(minute);
+        }
+    }
+    while marks
+        .front()
+        .is_some_and(|minute| timestamp_ms - minute * 60_000 > HEAVY_MINUTES_WINDOW_MS)
+    {
+        marks.pop_front();
+    }
+    marks.len().min(u16::MAX as usize) as u16
+}
+
+fn sampling_loop(
+    state: &Arc<AppState>,
+    mut baselines: BaselineStore,
+    stop: crossbeam_channel::Receiver<()>,
+) -> Result<()> {
     let mut etw = match EtwCollector::start() {
         Ok(collector) => Some(collector),
         Err(error) => {
@@ -378,18 +630,19 @@ fn sampling_loop(state: &Arc<AppState>, stop: crossbeam_channel::Receiver<()>) -
     // timestamp comparison, and triage headers are read once per new dump.
     let mut dumps = DumpEngine::new(WindowsDumpSource);
     let mut event_logs = EventLogCollector::default();
-    // Learned per-machine and per-executable norms, carried across restarts.
-    // A machine with nothing persisted starts its learning period now rather
-    // than dating an empty baseline to the epoch.
-    let mut baselines = BaselineStore::restore(
-        state.storage.load_baselines()?,
-        Utc::now().timestamp_millis(),
-    );
     let mut next_system_write = Instant::now();
     let mut next_process_write = Instant::now();
     let mut next_prune = Instant::now();
     let mut next_event_log_poll = Instant::now();
     let mut next_baseline_save = Instant::now() + Duration::from_secs(5 * 60);
+    // Trailing window feeding `Calibration.demand` (`ratings::demand_bucket`,
+    // Global Constraints: "trailing 10 min composite"). Bounded by timestamp
+    // rather than count, since the sample cadence is a setting the user can
+    // change.
+    let mut recent_samples: VecDeque<SystemMetric> = VecDeque::new();
+    // Which minutes of the trailing hour were heavy; see
+    // [`observe_heavy_minute`]. Feeds the client's rating nudge.
+    let mut heavy_minutes: VecDeque<i64> = VecDeque::new();
     loop {
         let started = Instant::now();
         let settings = state
@@ -412,18 +665,31 @@ fn sampling_loop(state: &Arc<AppState>, stop: crossbeam_channel::Receiver<()>) -
             .map_or_else(crate::etw::EtwSnapshot::default, EtwCollector::snapshot);
         let (system, processes, hardware) =
             collector.collect(timestamp_ms, &settings, &etw_snapshot)?;
-        // How much the machine baseline knows, decided before this sample is
-        // folded into it: an incident is judged against what was learned
-        // before it, never against itself.
-        let calibration = Calibration {
-            learning: baselines.machine.is_learning(),
-            baseline_maturity: baselines.machine.maturity(),
-            names: Some(&baselines),
-        };
+        // Slide the trailing demand window: add this sample, then drop
+        // whatever has aged out of the last ten minutes.
+        recent_samples.push_back(system.clone());
+        while recent_samples
+            .front()
+            .is_some_and(|sample| timestamp_ms - sample.timestamp_ms > DEMAND_WINDOW_MS)
+        {
+            recent_samples.pop_front();
+        }
+        // Built against the baseline as it stands *before* this sample is
+        // folded into it, so an incident is judged by what was learned
+        // before it and never against itself. That ordering is about
+        // baseline maturity alone — the demand window this same call
+        // classifies deliberately includes the sample just taken, because
+        // "how loaded is this machine right now" must not lag a sample
+        // behind the reading being judged.
+        let calibration = build_calibration(recent_samples.make_contiguous(), &baselines);
         // Copied out so the snapshot block below can reuse this sample's
-        // learning state without `calibration`'s `&baselines` borrow living
-        // past the mutable baseline updates that follow the evaluation.
+        // learning state and demand bucket without `calibration`'s
+        // `&baselines` borrow living past the mutable baseline updates that
+        // follow the evaluation.
         let learning = calibration.learning;
+        let demand = calibration.demand;
+        let heavy_minutes_trailing_hour =
+            observe_heavy_minute(&mut heavy_minutes, demand, timestamp_ms);
         let learning_progress_pct = baselines.machine.learning_progress_pct();
         let learning_remaining_ms = baselines.machine.learning_remaining_ms();
         let (mut evaluation, quarantine) = {
@@ -464,6 +730,17 @@ fn sampling_loop(state: &Arc<AppState>, stop: crossbeam_channel::Receiver<()>) -
                 continue;
             }
             baselines.observe_process(process, timestamp_ms);
+        }
+        // Republish what the loop now knows about the machine, so a rating
+        // arriving over the pipe before the next five-minute save reads this
+        // sample's learning state and sketches rather than storage's older
+        // copy. See [`AppState::baseline`].
+        {
+            let mut live = state
+                .baseline
+                .write()
+                .map_err(|_| anyhow!("baseline lock poisoned"))?;
+            live.clone_from(&baselines.machine);
         }
         forensics.observe(&evaluation.active, timestamp_ms);
         forensics.decorate(&mut evaluation.active);
@@ -512,6 +789,11 @@ fn sampling_loop(state: &Arc<AppState>, stop: crossbeam_channel::Receiver<()>) -
                     .div_ceil(60_000)
                     .min(u16::MAX as u64) as u16
             });
+            // The demand context clients read: the bucket the rating
+            // offsets are looked up under, and how much of the trailing
+            // hour was heavy enough to be worth asking about.
+            snapshot.demand = Some(demand);
+            snapshot.heavy_minutes_trailing_hour = Some(heavy_minutes_trailing_hour);
         }
         if Instant::now() >= next_system_write {
             state.storage.insert_system(&system)?;
@@ -633,7 +915,8 @@ fn build_node(
 mod tests {
     use super::*;
     use crate::models::{
-        DiagnosticLogStatus, HistoryResponse, OptimizationPlan, PlanAgent, PlanConstraints,
+        DemandBucket, DemandDetail, DiagnosticLogStatus, HistoryResponse, OpenIncidentRef,
+        OptimizationPlan, PlanAgent, PlanConstraints, Rating, RatingVerdict, Severity,
     };
 
     fn process(pid: u32, parent_pid: u32) -> ProcessMetric {
@@ -662,6 +945,57 @@ mod tests {
     }
 
     #[test]
+    fn stored_ratings_reach_the_engine_and_the_agent_context() {
+        // The engine's copy of the policy offsets is a cache of a pure
+        // function over the ratings table, so a restart -- or any new rating
+        // -- has to be able to rebuild it from storage alone.
+        let directory = tempfile::tempdir().unwrap();
+        let state = test_state(&directory);
+        assert!(
+            state.alerts.lock().unwrap().rating_offsets().is_empty(),
+            "a machine nobody has rated carries no offsets"
+        );
+
+        let now_ms = Utc::now().timestamp_millis();
+        state
+            .storage
+            .save_rating(&Rating {
+                id: "rating-1".into(),
+                at_ms: now_ms,
+                verdict: RatingVerdict::Good,
+                demand: DemandBucket::Heavy,
+                demand_detail: DemandDetail {
+                    cpu_percent: 0.0,
+                    cpu_percentile: None,
+                    memory_occupancy_pct: 0.0,
+                    memory_percentile: None,
+                    disk_latency_ms: 0.0,
+                    disk_percentile: None,
+                    io_bytes_per_sec: 0.0,
+                    io_percentile: None,
+                },
+                digest: serde_json::Value::Null,
+                open_incidents: vec![OpenIncidentRef {
+                    fingerprint: "collectorBudget:1".into(),
+                    kind: "collectorBudget".into(),
+                    severity: Severity::Warning,
+                    notify: true,
+                    acknowledged: false,
+                }],
+                during_learning: false,
+                unexplained: false,
+            })
+            .unwrap();
+        state.refresh_rating_offsets().unwrap();
+
+        let entries = state.alerts.lock().unwrap().rating_offsets().entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].kind, "collectorBudget");
+        assert_eq!(entries[0].bucket, DemandBucket::Heavy);
+        assert!((entries[0].offset - 0.05).abs() < 1e-9);
+    }
+
+    #[test]
     fn builds_parent_child_tree() {
         let tree = build_process_tree(&[process(10, 0), process(11, 10), process(12, 11)]);
         assert_eq!(tree.len(), 1);
@@ -671,6 +1005,7 @@ mod tests {
     fn test_state(directory: &tempfile::TempDir) -> AppState {
         AppState {
             snapshot: RwLock::new(Snapshot::default()),
+            baseline: RwLock::new(crate::baselines::MachineBaseline::new(0)),
             settings: RwLock::new(Settings::default()),
             storage: Arc::new(Storage::open(&directory.path().join("history.db")).unwrap()),
             alerts: Mutex::new(AlertEngine::default()),
@@ -783,6 +1118,7 @@ mod tests {
             logs: Vec::new(),
             log_status: DiagnosticLogStatus::default(),
             alerts: Vec::new(),
+            rating_offsets: Vec::new(),
         });
         state.remember_context(&context).unwrap();
         let mut plan = OptimizationPlan {
@@ -807,5 +1143,395 @@ mod tests {
         assert!(state.validate_plan_context(&plan).is_ok());
         plan.context_id = "substituted".into();
         assert!(state.validate_plan_context(&plan).is_err());
+    }
+
+    fn system_sample_at(cpu_percent: f64, at_ms: i64) -> SystemMetric {
+        SystemMetric {
+            timestamp_ms: at_ms,
+            cpu_percent,
+            memory_used_bytes: 1_000,
+            memory_total_bytes: 1_000_000,
+            ..SystemMetric::default()
+        }
+    }
+
+    fn active_alert(kind: &str, notify: bool, acknowledged: bool) -> crate::models::Alert {
+        crate::models::Alert {
+            id: format!("{kind}-1"),
+            kind: kind.into(),
+            severity: crate::models::Severity::Warning,
+            first_seen_ms: 0,
+            last_seen_ms: 0,
+            process_id: None,
+            process_name: None,
+            title: "t".into(),
+            explanation: "e".into(),
+            evidence: Vec::new(),
+            recommendation: "r".into(),
+            acknowledged,
+            occurrence_count: 1,
+            resolved_at_ms: None,
+            archived: false,
+            fingerprint: format!("{kind}:1"),
+            state: crate::models::IncidentState::Open,
+            quality: crate::models::AlertQuality::default(),
+            notify,
+            notify_generation: 0,
+        }
+    }
+
+    /// A matured (non-learning) baseline published the same way the sampling
+    /// loop publishes one, so `assemble_rating`'s live `state.baseline`
+    /// handle picks it up. Persisted as well, mirroring the loop's
+    /// five-minute save.
+    fn seed_matured_baseline(state: &AppState) {
+        let mut store = crate::baselines::BaselineStore::new(0);
+        store.machine.observed_ms = crate::baselines::LEARNING_PERIOD_MS;
+        state
+            .storage
+            .save_baselines(&store.to_rows(), Utc::now().timestamp_millis())
+            .unwrap();
+        state.baseline.write().unwrap().clone_from(&store.machine);
+    }
+
+    #[test]
+    fn rating_commands_use_the_pinned_serde_spelling() {
+        // The brief pins these two wire spellings explicitly: `"addRating"`
+        // and `"getRatings"`, matching the existing camelCase command
+        // convention (see e.g. `"acknowledgeAlert"`, `"archiveAlert"`).
+        let add = serde_json::to_string(&PipeRequest::AddRating {
+            verdict: RatingVerdict::Good,
+        })
+        .unwrap();
+        assert!(add.contains("\"command\":\"addRating\""), "wire: {add}");
+        let get = serde_json::to_string(&PipeRequest::GetRatings { limit: 10 }).unwrap();
+        assert!(get.contains("\"command\":\"getRatings\""), "wire: {get}");
+    }
+
+    #[test]
+    fn add_rating_assembles_a_populated_record() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = test_state(&directory);
+        let now_ms = Utc::now().timestamp_millis();
+
+        // A fresh (unmatured) baseline degrades every percentile to `None`
+        // and falls back to the fixed cutoffs -- CPU >= 80 alone is heavy --
+        // so seeding just the trailing samples is enough to prove the
+        // bucket/detail actually came from them.
+        for offset in 0..5 {
+            state
+                .storage
+                .insert_system(&system_sample_at(90.0, now_ms - offset * 60_000))
+                .unwrap();
+        }
+        {
+            let mut snapshot = state.snapshot.write().unwrap();
+            snapshot.active_alerts = vec![active_alert("sustainedCpu", true, false)];
+        }
+
+        let response = state.handle(PipeRequest::AddRating {
+            verdict: RatingVerdict::Good,
+        });
+        let rating: Rating = match response {
+            PipeResponse::Ok { data } => serde_json::from_value(data).unwrap(),
+            PipeResponse::Error { code, message } => {
+                panic!("addRating failed: {code} {message}")
+            }
+        };
+
+        assert_eq!(rating.demand, DemandBucket::Heavy, "{rating:?}");
+        assert_eq!(rating.demand_detail.cpu_percent, 90.0);
+        assert_eq!(rating.open_incidents.len(), 1);
+        assert_eq!(rating.open_incidents[0].kind, "sustainedCpu");
+        assert!(rating.open_incidents[0].notify);
+        assert!(
+            !rating.digest.is_null(),
+            "digest must be populated, not a placeholder"
+        );
+        assert!(
+            rating.digest.get("systemRollup").is_some(),
+            "digest missing systemRollup: {}",
+            rating.digest
+        );
+        assert!(!rating.unexplained, "a good rating is never unexplained");
+
+        // Stored, and retrievable via GetRatings.
+        let stored = state.storage.ratings(10).unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].id, rating.id);
+    }
+
+    #[test]
+    fn add_rating_unexplained_truth_table() {
+        // Spec truth table: sluggish + nothing notifying => true;
+        // sluggish + something notifying => false; good/acceptable => always
+        // false, whatever was open.
+        let directory = tempfile::tempdir().unwrap();
+        let state = test_state(&directory);
+
+        let unexplained_for =
+            |state: &AppState, verdict: RatingVerdict, alerts: Vec<crate::models::Alert>| -> bool {
+                {
+                    let mut snapshot = state.snapshot.write().unwrap();
+                    snapshot.active_alerts = alerts;
+                }
+                match state.handle(PipeRequest::AddRating { verdict }) {
+                    PipeResponse::Ok { data } => {
+                        serde_json::from_value::<Rating>(data).unwrap().unexplained
+                    }
+                    PipeResponse::Error { code, message } => {
+                        panic!("addRating failed: {code} {message}")
+                    }
+                }
+            };
+
+        assert!(
+            unexplained_for(&state, RatingVerdict::Sluggish, Vec::new()),
+            "sluggish with nothing notifying must be unexplained"
+        );
+        assert!(
+            !unexplained_for(
+                &state,
+                RatingVerdict::Sluggish,
+                vec![active_alert("sustainedCpu", true, false)]
+            ),
+            "sluggish while something is notifying is explained"
+        );
+        assert!(
+            !unexplained_for(
+                &state,
+                RatingVerdict::Good,
+                vec![active_alert("sustainedCpu", true, false)]
+            ),
+            "good is never unexplained"
+        );
+        assert!(
+            !unexplained_for(&state, RatingVerdict::Acceptable, Vec::new()),
+            "acceptable is never unexplained"
+        );
+        // An acknowledged incident does not count as "notifying" -- mirrors
+        // `quality::derive_offsets`'s own false-positive definition.
+        assert!(
+            unexplained_for(
+                &state,
+                RatingVerdict::Sluggish,
+                vec![active_alert("sustainedCpu", true, true)]
+            ),
+            "an acknowledged incident leaves sluggish unexplained"
+        );
+    }
+
+    #[test]
+    fn add_rating_refreshes_engine_offsets_without_a_separate_call() {
+        // Merge-gate item: the AddRating handler must call
+        // `refresh_rating_offsets()` itself after saving, so the very next
+        // evaluation already honors the rating just given -- the caller
+        // should never have to remember to do it.
+        let directory = tempfile::tempdir().unwrap();
+        let state = test_state(&directory);
+        seed_matured_baseline(&state); // non-learning, so the rating is not inert
+        {
+            let mut snapshot = state.snapshot.write().unwrap();
+            snapshot.active_alerts = vec![active_alert("sustainedCpu", true, false)];
+        }
+        assert!(state.alerts.lock().unwrap().rating_offsets().is_empty());
+
+        match state.handle(PipeRequest::AddRating {
+            verdict: RatingVerdict::Good,
+        }) {
+            PipeResponse::Ok { .. } => {}
+            PipeResponse::Error { code, message } => panic!("addRating failed: {code} {message}"),
+        }
+
+        let entries = state.alerts.lock().unwrap().rating_offsets().entries();
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(entries[0].kind, "sustainedCpu");
+        assert!((entries[0].offset - 0.05).abs() < 1e-9);
+    }
+
+    #[test]
+    fn get_ratings_returns_newest_first_clamped_to_100() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = test_state(&directory);
+        let base_ms = Utc::now().timestamp_millis();
+        for index in 0..120 {
+            state
+                .storage
+                .save_rating(&Rating {
+                    id: format!("rating-{index}"),
+                    at_ms: base_ms + index,
+                    verdict: RatingVerdict::Good,
+                    demand: DemandBucket::Light,
+                    demand_detail: DemandDetail {
+                        cpu_percent: 0.0,
+                        cpu_percentile: None,
+                        memory_occupancy_pct: 0.0,
+                        memory_percentile: None,
+                        disk_latency_ms: 0.0,
+                        disk_percentile: None,
+                        io_bytes_per_sec: 0.0,
+                        io_percentile: None,
+                    },
+                    digest: serde_json::Value::Null,
+                    open_incidents: Vec::new(),
+                    during_learning: false,
+                    unexplained: false,
+                })
+                .unwrap();
+        }
+
+        let response = state.handle(PipeRequest::GetRatings { limit: 1_000 });
+        let ratings: Vec<Rating> = match response {
+            PipeResponse::Ok { data } => serde_json::from_value(data).unwrap(),
+            PipeResponse::Error { code, message } => panic!("getRatings failed: {code} {message}"),
+        };
+        assert_eq!(ratings.len(), 100, "must clamp to 100 however high the ask");
+        assert_eq!(
+            ratings[0].id,
+            "rating-119",
+            "newest first: {:?}",
+            ratings.iter().map(|r| &r.id).take(3).collect::<Vec<_>>()
+        );
+        assert_eq!(ratings[99].id, "rating-20");
+    }
+
+    /// Drives all four demand channels (CPU, memory, disk latency, disk IO)
+    /// off the same value, mirroring `ratings::tests::full_sample`: a
+    /// baseline seeded only on CPU leaves the other channels at a constant
+    /// (degenerate) zero, and a zero-valued sample then reads back as that
+    /// channel's own 50th percentile rather than its 0th -- contaminating
+    /// the composite into Moderate even for a genuinely idle window.
+    fn full_sample_at(value: f64, at_ms: i64) -> SystemMetric {
+        SystemMetric {
+            timestamp_ms: at_ms,
+            cpu_percent: value,
+            memory_used_bytes: (value * 10_000_000_000.0) as u64,
+            memory_total_bytes: 1_000_000_000_000,
+            disk_latency_ms: value,
+            disk_read_bytes_per_sec: value * 1_000.0,
+            disk_write_bytes_per_sec: value * 1_000.0,
+            ..SystemMetric::default()
+        }
+    }
+
+    #[test]
+    fn heavy_minutes_counts_distinct_heavy_minutes_over_a_trailing_hour() {
+        // The nudge gate is "at least ten minutes of the trailing hour were
+        // heavy". Samples arrive at whatever cadence the user has configured,
+        // so heaviness is counted in distinct wall-clock minutes rather than
+        // in samples -- a machine sampling twice a second must not reach ten
+        // "minutes" in five seconds.
+        let mut marks = VecDeque::new();
+        let mut minutes = 0;
+        for index in 0..24 {
+            minutes = observe_heavy_minute(&mut marks, DemandBucket::Heavy, index * 30_000);
+        }
+        assert_eq!(
+            minutes, 12,
+            "24 half-minute heavy samples cover 12 distinct minutes"
+        );
+
+        // Light and moderate samples add nothing; only the window moves.
+        assert_eq!(
+            observe_heavy_minute(&mut marks, DemandBucket::Light, 12 * 60_000),
+            12
+        );
+        assert_eq!(
+            observe_heavy_minute(&mut marks, DemandBucket::Moderate, 13 * 60_000),
+            12
+        );
+
+        // The window is trailing: a minute exactly one hour old still counts,
+        // and one past that has aged out.
+        assert_eq!(
+            observe_heavy_minute(&mut marks, DemandBucket::Light, 3_600_000),
+            12,
+            "the minute at t=0 is exactly one hour old and still counts"
+        );
+        assert_eq!(
+            observe_heavy_minute(&mut marks, DemandBucket::Light, 3_600_001),
+            11,
+            "one millisecond later the oldest minute has aged out"
+        );
+        assert_eq!(
+            observe_heavy_minute(&mut marks, DemandBucket::Light, 4_320_000),
+            0,
+            "an hour after the last heavy minute nothing is left"
+        );
+    }
+
+    #[test]
+    fn a_rating_taken_as_the_baseline_matures_is_not_stamped_during_learning() {
+        // The sampling loop persists baselines every five minutes, so what
+        // storage holds can be up to that stale. If a rating read its
+        // learning state from storage, the one rating given inside that
+        // window at the 24-hour crossing would be permanently -- and
+        // wrongly -- stamped `during_learning`, which makes it inert for the
+        // notification policy forever. The rating reads the live handle the
+        // sampling loop publishes each sample instead.
+        let directory = tempfile::tempdir().unwrap();
+        let state = test_state(&directory);
+        let now_ms = Utc::now().timestamp_millis();
+
+        // Storage still holds the last periodic save: a baseline that had
+        // not yet matured.
+        let learning_store = crate::baselines::BaselineStore::new(now_ms);
+        assert!(learning_store.machine.is_learning());
+        state
+            .storage
+            .save_baselines(&learning_store.to_rows(), now_ms)
+            .unwrap();
+
+        // The live handle -- what the loop is actually working with -- has
+        // since crossed maturity.
+        let mut matured = crate::baselines::MachineBaseline::new(0);
+        matured.observed_ms = crate::baselines::LEARNING_PERIOD_MS;
+        assert!(!matured.is_learning());
+        *state.baseline.write().unwrap() = matured;
+
+        let rating: Rating = match state.handle(PipeRequest::AddRating {
+            verdict: RatingVerdict::Good,
+        }) {
+            PipeResponse::Ok { data } => serde_json::from_value(data).unwrap(),
+            PipeResponse::Error { code, message } => panic!("addRating failed: {code} {message}"),
+        };
+        assert!(
+            !rating.during_learning,
+            "a rating given after the live baseline matured must not be inert"
+        );
+    }
+
+    #[test]
+    fn build_calibration_wires_demand_bucket_from_the_trailing_window() {
+        // Tripwire for the sampling loop's TODO(ratings) wiring point:
+        // this must fail the instant `build_calibration` (the function the
+        // loop actually calls) reverts to `Calibration::default().demand`,
+        // which is always `Light` regardless of load.
+        let mut machine = crate::baselines::MachineBaseline::new(0);
+        for i in 0..2_000 {
+            let value = (i % 100) as f64;
+            machine.observe(
+                &full_sample_at(value, i as i64 * 5_000),
+                400,
+                i as i64 * 5_000,
+            );
+        }
+        let p95 = machine.cpu_percent.quantile(0.95).unwrap();
+        let mut baselines = BaselineStore::new(0);
+        baselines.machine = machine;
+
+        let heavy_window: Vec<SystemMetric> =
+            (0..10).map(|i| full_sample_at(p95, i * 1_000)).collect();
+        let calibration = build_calibration(&heavy_window, &baselines);
+        assert_eq!(
+            calibration.demand,
+            DemandBucket::Heavy,
+            "a genuinely heavy trailing window must not read back as the default Light bucket"
+        );
+
+        let light_window: Vec<SystemMetric> =
+            (0..10).map(|i| full_sample_at(0.0, i * 1_000)).collect();
+        let light_calibration = build_calibration(&light_window, &baselines);
+        assert_eq!(light_calibration.demand, DemandBucket::Light);
     }
 }

@@ -34,6 +34,8 @@ Errors do not disclose stack traces:
 | `acknowledgeAlert` | `alert_id` | Acknowledgment result |
 | `archiveAlert` | `alert_id`, `archived` | Archive-flag result; `archived: false` recovers a finding |
 | `terminateProcess` | `pid`, `confirmed` | Termination result |
+| `addRating` | `verdict` | Stores and returns a server-assembled performance rating |
+| `getRatings` | `limit` | Rating history, newest first; transport-safe limit is clamped to 100 |
 
 ## The `live` channel
 
@@ -89,6 +91,50 @@ A service restart force-resolves any alerts still open at shutdown (marked resol
 The tray helper's balloon filter is: an alert pops when `notify == true`, it is not `acknowledged`, not `archived`, and its `(id, notifyGeneration)` pair has not already been shown. Concretely, a client should track a set of seen `(id, notifyGeneration)` pairs and pop only unseen ones from the active-alert list, exactly mirroring the compatibility default (`notify = true, notifyGeneration = 0`) that makes an old alert behave like it always did.
 
 `notify == false` does **not** mean the incident is hidden or discarded — it means only that this particular sample never earns a tray popup. Every suppressed incident is still a fully recorded finding: it persists to SQLite, appears in `getAlerts` history and the Findings page, and carries its real `quality` scores and evidence like any other alert. Nothing about suppression drops telemetry; it only gates the interruption.
+
+## Performance ratings
+
+`addRating` (service 1.19+) submits a quick in-app performance rating. The client sends only the verdict; the service owns everything else because the data it needs (recent samples, learned baselines, active incidents) already lives there:
+
+```json
+{"command":"addRating","verdict":"good"}
+```
+
+`verdict` is one of `"good"`, `"acceptable"`, `"sluggish"`. The response is the full, server-assembled `Rating` record, also persisted:
+
+```json
+{
+  "id": "...",
+  "atMs": 0,
+  "verdict": "good",
+  "demand": "light",
+  "demandDetail": {
+    "cpuPercent": 0, "cpuPercentile": null,
+    "memoryOccupancyPct": 0, "memoryPercentile": null,
+    "diskLatencyMs": 0, "diskPercentile": null,
+    "ioBytesPerSec": 0, "ioPercentile": null
+  },
+  "digest": {},
+  "openIncidents": [{"fingerprint": "...", "kind": "...", "severity": "warning", "notify": true, "acknowledged": false}],
+  "duringLearning": false,
+  "unexplained": false
+}
+```
+
+- `demand` (`"light" | "moderate" | "heavy"`) is the trailing-10-minute workload bucket the rating was given under, derived from the machine's own learned baselines. A rating is evidence about its own bucket only.
+- `digest` is a compact, redacted (`%USERPROFILE%`-style) snapshot of system/process rollups, active incidents, and learning state at rating time — capped at 32 KB — for a future optimization agent's labeled corpus.
+- `openIncidents` lists what was active (unarchived) when the rating was given.
+- `unexplained` is `true` exactly when `verdict` is `"sluggish"` and nothing was actively notifying — the user felt something no detector named.
+
+`getRatings` returns rating history, newest first:
+
+```json
+{"command":"getRatings","limit":50}
+```
+
+`getSnapshot`'s top-level payload gained two additive fields so a client can decide *when to ask* and *what the policy currently says* without deriving either itself: `demand: "light" | "moderate" | "heavy" | null` — the bucket the machine is in right now, the same classification a rating would be filed under — and `heavyMinutesTrailingHour: number | null`, how many distinct minutes of the last hour were heavy. Both are `null` from services that predate ratings, and `null` means *not reported*, never "light"/"zero": a client must not nudge, or display a policy offset, on an unknown bucket. Heaviness is counted in wall-clock minutes rather than in samples, so the figure does not move when `sampleIntervalMs` changes.
+
+**Ratings never modify baselines, detector thresholds, or severities.** They only ever adjust the notification policy's floors, per alert kind and demand bucket, bounded to ±0.15 and decaying with a 30-day half-life — the same guarantee `getAgentContext`'s `ratingOffsets`/`limitations` fields already document. `protocolVersion` is unchanged (still 1): both commands are additive, and a pre-1.19 service answers them with the ordinary unknown-command `invalidRequest` error.
 
 ## Hardware inventory
 

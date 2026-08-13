@@ -122,6 +122,23 @@ pub struct MachineBaseline {
     pub interrupt_rate: PercentileSketch,
     pub disk_latency_ms: PercentileSketch,
     pub process_count: PercentileSketch,
+    /// CPU percent sketch, added for the ratings feature's demand-bucket
+    /// composite (`ratings::demand_bucket`). `serde(default)` so a store
+    /// persisted before this field existed loads as a fresh, empty sketch
+    /// rather than failing to deserialize -- it simply starts learning from
+    /// here, same as any other new signal.
+    #[serde(default)]
+    pub cpu_percent: PercentileSketch,
+    /// Disk IO rate sketch (read + write bytes/sec), same ratings-feature
+    /// motivation and upgrade behavior as `cpu_percent` above. Network
+    /// throughput is deliberately excluded -- the spec's IO composite
+    /// channel is disk IO ("CPU pct, memory-occupancy pct, IO pct"), and
+    /// `SystemMetric::network_bytes_per_sec` already has its own separate
+    /// meaning elsewhere in the codebase (interrupt/DPC root-cause
+    /// analysis); conflating the two would blur what "IO" means in a
+    /// stored rating.
+    #[serde(default)]
+    pub io_bytes_per_sec: PercentileSketch,
     /// Wall-clock instant the baseline was first created. Retained for
     /// provenance only: learning is measured in observed time, not wall age,
     /// because a machine that sleeps for nine hours has learned nothing
@@ -153,6 +170,8 @@ impl MachineBaseline {
             interrupt_rate: PercentileSketch::new(),
             disk_latency_ms: PercentileSketch::new(),
             process_count: PercentileSketch::new(),
+            cpu_percent: PercentileSketch::new(),
+            io_bytes_per_sec: PercentileSketch::new(),
             started_ms: now_ms,
             observed_ms: 0,
             last_observed_ms: None,
@@ -175,6 +194,9 @@ impl MachineBaseline {
         self.interrupt_rate.observe(system.interrupt_rate);
         self.disk_latency_ms.observe(system.disk_latency_ms);
         self.process_count.observe(process_count as f64);
+        self.cpu_percent.observe(system.cpu_percent);
+        self.io_bytes_per_sec
+            .observe(system.disk_read_bytes_per_sec + system.disk_write_bytes_per_sec);
     }
 
     /// Credit the gap since the previous sample, capped, and re-anchor.
@@ -558,6 +580,59 @@ mod tests {
         );
         assert_eq!(empty.machine.observed_ms, 0);
         assert_eq!(empty.machine.learning_progress_pct(), 0);
+    }
+
+    #[test]
+    fn a_store_persisted_before_the_cpu_and_io_sketches_existed_upgrades_with_fresh_sketches() {
+        // A row exactly like the ones this machine has on disk right now,
+        // mid-learning: real observed_ms and real sketch data, but written
+        // before `cpu_percent`/`io_bytes_per_sec` existed on `MachineBaseline`
+        // -- so those two keys are simply absent from the payload.
+        let mut legacy = MachineBaseline::new(0);
+        let mut now = 0;
+        for i in 0..500 {
+            legacy.observe(&sample_system_metric(50.0 + (i % 10) as f64), 400, now);
+            now += 60_000;
+        }
+        let observed_before = legacy.observed_ms;
+        let memory_p95_before = legacy.memory_occupancy_pct.quantile(0.95).unwrap();
+
+        let mut payload: serde_json::Value = serde_json::to_value(&legacy).unwrap();
+        let object = payload.as_object_mut().unwrap();
+        assert!(
+            object.remove("cpu_percent").is_some(),
+            "field name on the wire"
+        );
+        assert!(
+            object.remove("io_bytes_per_sec").is_some(),
+            "field name on the wire"
+        );
+
+        let rows = vec![("machine".to_string(), payload.to_string())];
+        let restored = BaselineStore::restore(rows, now);
+
+        // (a) Restoration succeeds with fresh, empty sketches for both new
+        // fields -- too few observations to answer any quantile yet.
+        assert_eq!(restored.machine.cpu_percent.quantile(0.5), None);
+        assert_eq!(restored.machine.io_bytes_per_sec.quantile(0.5), None);
+
+        // (b) observed_ms / learning progress are unaffected by the missing
+        // keys -- this is not a legacy-observed-time payload.
+        assert_eq!(restored.machine.observed_ms, observed_before);
+        assert_eq!(
+            restored.machine.learning_progress_pct(),
+            legacy.learning_progress_pct()
+        );
+
+        // (c) The other sketches' data survived intact.
+        assert_eq!(
+            restored
+                .machine
+                .memory_occupancy_pct
+                .quantile(0.95)
+                .unwrap(),
+            memory_p95_before
+        );
     }
 
     #[test]

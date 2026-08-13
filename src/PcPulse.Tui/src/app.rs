@@ -15,9 +15,13 @@ use pcpulse_service::{
     config::Settings,
     models::{
         Alert, DiagnosticLogResponse, DiagnosticLogStatus, HardwareMetrics, HistoryResponse,
-        LiveSample, OptimizationPlan, ProcessMetric, ProcessNode, Severity, Snapshot,
-        SystemMetric,
+        LiveSample, OptimizationPlan, ProcessMetric, ProcessNode, Rating, RatingVerdict, Severity,
+        Snapshot, SystemMetric,
     },
+    quality::{PolicyOffsets, derive_offsets},
+    // The engine's own bound on how much rating history the policy is
+    // derived from; the display side reads exactly as much.
+    runtime::POLICY_OFFSET_RATINGS,
 };
 use ratatui::{
     crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
@@ -65,6 +69,17 @@ const CONVERTING_STATUS: &str = "Converting background…";
 /// Shared for the same reason, and because it is the *only* line a
 /// redundant conversion request is allowed to replace.
 const CHOOSING_STATUS: &str = "Choosing a video…";
+/// The statusline nudge asking for a performance rating. Never a modal:
+/// it takes its turn on the status line and the next message retires it.
+pub const RATING_NUDGE_STATUS: &str = "rate how this machine feels — press f";
+/// What the statusline says once the service has stored a rating.
+pub const RATING_RECORDED_STATUS: &str = "rating recorded — thanks";
+/// The nudge is shown at most once a day (spec UX).
+pub const RATING_NUDGE_INTERVAL_MS: i64 = 24 * 3_600_000;
+/// …and only after the trailing hour held at least this many heavy minutes.
+/// Labels given under real load are the ones the policy can learn from; a
+/// rating at idle teaches nothing about behavior under demand.
+pub const RATING_NUDGE_HEAVY_MINUTES: u16 = 10;
 static CHAT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 fn new_conversation_id() -> String {
@@ -291,6 +306,10 @@ pub enum InputMode {
         process_name: String,
         typed: String,
     },
+    /// The `f` overlay: one keypress to open, one to answer. Carries no
+    /// state — the three choices are the whole of it, and the service owns
+    /// everything else about the record.
+    RatePerformance,
     EditSetting {
         field: SettingField,
         typed: String,
@@ -757,6 +776,13 @@ pub enum WorkerCommand {
         archived: bool,
     },
     Terminate(u32),
+    /// Submit the user's performance rating. The verdict is all the client
+    /// sends; the service assembles the demand context and digest, since
+    /// that is where the data lives.
+    AddRating(RatingVerdict),
+    /// Re-read the rating history the incidents pane derives its displayed
+    /// policy offsets from.
+    RefreshRatings,
     /// One launch-time release check against GitHub; sent only when the
     /// `updateChecks` preference is on and the 20-hour cadence is due.
     CheckUpdate,
@@ -801,6 +827,11 @@ pub enum WorkerEvent {
     CodexAuth(Result<String, String>),
     Chat(Result<ChatResponse, String>),
     Settings(Result<Settings, String>),
+    /// The rating history behind the incidents pane's offset line. `Err`
+    /// means the service predates ratings (or the read failed); it is
+    /// swallowed rather than shown, because nothing the user did asked for
+    /// this fetch.
+    Ratings(Result<Vec<Rating>, String>),
     Action(Result<String, String>),
     /// The launch-time release check: `Ok(Some)` = a newer release with a
     /// downloadable MSI, `Ok(None)` = up to date, `Err` = offline, rate
@@ -973,6 +1004,34 @@ fn worker_loop(commands: Receiver<WorkerCommand>, events: Sender<WorkerEvent>) {
                         let result = client.terminate(pid, true).map(|_| format!("Termination request completed for PID {pid}")).map_err(error_text);
                         let _ = events.send(WorkerEvent::Action(result));
                         next_snapshot = Instant::now();
+                    }
+                    Ok(WorkerCommand::AddRating(verdict)) => {
+                        // One pipe round trip on the worker thread, exactly
+                        // like acknowledge/archive: the overlay has already
+                        // closed and the UI thread never blocks on it.
+                        match client.add_rating(verdict) {
+                            Ok(_) => {
+                                let _ = events.send(WorkerEvent::Action(Ok(
+                                    RATING_RECORDED_STATUS.into(),
+                                )));
+                                // The service re-derived the policy offsets
+                                // when it stored this; re-read them so the
+                                // incidents pane agrees immediately.
+                                let _ = events.send(WorkerEvent::Ratings(
+                                    client
+                                        .ratings(POLICY_OFFSET_RATINGS)
+                                        .map_err(error_text),
+                                ));
+                            }
+                            Err(error) => {
+                                let _ = events.send(WorkerEvent::Action(Err(error_text(error))));
+                            }
+                        }
+                    }
+                    Ok(WorkerCommand::RefreshRatings) => {
+                        let _ = events.send(WorkerEvent::Ratings(
+                            client.ratings(POLICY_OFFSET_RATINGS).map_err(error_text),
+                        ));
                     }
                     Ok(WorkerCommand::CheckUpdate) => {
                         // Fire-and-forget on its own thread so a slow or
@@ -1155,6 +1214,12 @@ pub struct App {
     pub agents_only: bool,
     pub timeline_hours: u32,
     pub mode: InputMode,
+    /// What the user's ratings have made of the notification policy, derived
+    /// client-side from the rating history by the very same pure function
+    /// the service uses. Only ever displayed — the engine applies its own
+    /// copy — so a stale or empty history costs a line of text, never a
+    /// notification decision.
+    pub rating_offsets: PolicyOffsets,
     /// The '?' keys overlay: `Some(scroll)` while open. Deliberately not an
     /// [`InputMode`] variant — the effects layer diffs `InputMode` through
     /// its own `ModeKind`, and the overlay is chrome, not an input state.
@@ -1238,6 +1303,7 @@ impl App {
         let worker = Worker::start();
         let _ = worker.commands.try_send(WorkerCommand::LoadSettings);
         let _ = worker.commands.try_send(WorkerCommand::RefreshAlerts);
+        let _ = worker.commands.try_send(WorkerCommand::RefreshRatings);
         Self::with_worker(worker, true)
     }
 
@@ -1307,6 +1373,7 @@ impl App {
             agents_only: false,
             timeline_hours: 3,
             mode: InputMode::Normal,
+            rating_offsets: PolicyOffsets::default(),
             help_overlay: None,
             client_prefs: UiPrefs::default(),
             background: None,
@@ -1405,6 +1472,7 @@ impl App {
                         self.hardware_history_ms = snapshot.hardware.sampled_at_ms;
                         self.record_hardware(&snapshot.hardware);
                     }
+                    self.maybe_nudge_for_rating(&snapshot, Utc::now().timestamp_millis());
                     self.snapshot = Some(snapshot);
                     self.clamp_selection();
                 }
@@ -1476,6 +1544,14 @@ impl App {
                     self.settings = settings;
                     self.settings_dirty = false;
                 }
+                WorkerEvent::Ratings(Ok(ratings)) => {
+                    self.rating_offsets = derive_offsets(&ratings, Utc::now().timestamp_millis());
+                }
+                // A service that predates ratings answers `getRatings` with
+                // the ordinary unknown-command error. Nobody asked for this
+                // fetch, so it fails silently rather than parking an error
+                // banner on a perfectly working older collector.
+                WorkerEvent::Ratings(Err(_)) => {}
                 WorkerEvent::Action(Ok(message)) => {
                     self.status = message;
                     self.status_is_error = false;
@@ -1841,6 +1917,7 @@ impl App {
                 process_name,
                 typed,
             } => self.handle_confirm_key(key, pid, process_name, typed),
+            InputMode::RatePerformance => self.handle_rating_key(key),
             InputMode::EditSetting { field, typed } => self.handle_setting_input(key, field, typed),
         }
     }
@@ -1978,6 +2055,10 @@ impl App {
             {
                 self.mode = InputMode::Chat(String::new());
             }
+            // "How does it feel?" — global, on every page, because the
+            // question is about the machine rather than about whatever is
+            // on screen.
+            KeyCode::Char('f') => self.mode = InputMode::RatePerformance,
             KeyCode::Char('r') => self.refresh_page(),
             // Global on every page, but inert until a newer release is
             // known: first press downloads + verifies, second press opens
@@ -2201,6 +2282,46 @@ impl App {
             }
             _ => {}
         }
+        false
+    }
+
+    /// The `f` overlay: one keypress answers it. Anything that is not a
+    /// choice or Esc is ignored, so a stray key cannot file a verdict the
+    /// user did not mean — the same discipline as the termination gate.
+    ///
+    /// A modified key is not a choice either: Ctrl-G and Alt-S are chords
+    /// aimed at the terminal or the shell, not answers to this question,
+    /// and treating them as `g`/`s` would file a verdict the user never
+    /// gave. Same guard as the vault-rename band's character arm.
+    fn handle_rating_key(&mut self, key: KeyEvent) -> bool {
+        let verdict = match key.code {
+            KeyCode::Esc => {
+                self.mode = InputMode::Normal;
+                return false;
+            }
+            KeyCode::Char(choice)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                match choice {
+                    'g' => RatingVerdict::Good,
+                    'a' => RatingVerdict::Acceptable,
+                    's' => RatingVerdict::Sluggish,
+                    _ => return false,
+                }
+            }
+            _ => return false,
+        };
+        // Closed before the answer lands: the pipe round trip happens on the
+        // worker thread and the statusline reports it when it does.
+        self.mode = InputMode::Normal;
+        let _ = self
+            .worker
+            .commands
+            .try_send(WorkerCommand::AddRating(verdict));
+        self.status = "Recording your rating…".into();
+        self.status_is_error = false;
         false
     }
 
@@ -2646,6 +2767,52 @@ impl App {
 
     /// Write the current client preferences to disk; without a store (tests,
     /// no %LOCALAPPDATA%) this is a no-op.
+    /// Ask for a rating, at most once a day, and only when the answer would
+    /// be worth having.
+    ///
+    /// All three gates are the spec's, and each one is load-bearing: during
+    /// the learning period the policy a rating would adjust is not in effect
+    /// yet; without a real stretch of heavy load the label says nothing
+    /// about the machine under demand (the deceptive-comfort hazard this
+    /// whole feature exists for); and more than one ask a day is nagging.
+    /// A service that does not report the demand context (`None`) never
+    /// nudges — an unknown heavy-minutes figure is not a zero.
+    ///
+    /// It also waits its turn behind a failure. An error on the statusline
+    /// is the one message the operator must not lose, and the nudge would
+    /// both overwrite it and burn the day's single ask on a line nobody
+    /// read — so the stamp is only spent when the question is actually
+    /// asked.
+    pub(crate) fn maybe_nudge_for_rating(&mut self, snapshot: &Snapshot, now_ms: i64) {
+        if self.status_is_error
+            || snapshot.learning
+            || now_ms.saturating_sub(self.client_prefs.last_rating_nudge_ms)
+                < RATING_NUDGE_INTERVAL_MS
+            || snapshot.heavy_minutes_trailing_hour.unwrap_or(0) < RATING_NUDGE_HEAVY_MINUTES
+        {
+            return;
+        }
+        self.status = RATING_NUDGE_STATUS.into();
+        self.status_is_error = false;
+        self.client_prefs.last_rating_nudge_ms = now_ms;
+        self.persist_client_prefs();
+    }
+
+    /// The notify-floor adjustment the user's ratings have earned for one
+    /// alert kind under the demand bucket the machine is in *now* — the
+    /// incidents pane's "policy adjusted by your ratings" line.
+    ///
+    /// `None` means there is nothing to say: no snapshot, a service that
+    /// does not report its demand bucket, or an offset that rounds to
+    /// nothing. Looked up per kind rather than read from `entries()`,
+    /// because the bucket-wide term an unexplained `sluggish` rating
+    /// produces only reaches a named kind through `lookup`.
+    pub fn rating_offset_for(&self, kind: &str) -> Option<f64> {
+        let bucket = self.snapshot.as_ref()?.demand?;
+        let offset = self.rating_offsets.lookup(kind, bucket);
+        (offset.abs() >= 0.005).then_some(offset)
+    }
+
     pub fn persist_client_prefs(&mut self) {
         if let Some(store) = &self.prefs_store
             && let Err(error) = store.save(&self.client_prefs)
@@ -6247,6 +6414,245 @@ mod tests {
         let mut focused = app_with_vault_session("A question");
         focused.handle_key(key(KeyCode::Char('e')));
         assert!(matches!(focused.mode, InputMode::Normal));
+    }
+
+    // ---- Performance ratings --------------------------------------------
+
+    fn rating_at(
+        bucket: pcpulse_service::models::DemandBucket,
+        verdict: RatingVerdict,
+        notifying_kind: &str,
+        at_ms: i64,
+    ) -> Rating {
+        use pcpulse_service::models::{DemandDetail, OpenIncidentRef};
+        Rating {
+            id: format!("rating-{at_ms}"),
+            at_ms,
+            verdict,
+            demand: bucket,
+            demand_detail: DemandDetail {
+                cpu_percent: 0.0,
+                cpu_percentile: None,
+                memory_occupancy_pct: 0.0,
+                memory_percentile: None,
+                disk_latency_ms: 0.0,
+                disk_percentile: None,
+                io_bytes_per_sec: 0.0,
+                io_percentile: None,
+            },
+            digest: serde_json::Value::Null,
+            open_incidents: vec![OpenIncidentRef {
+                fingerprint: format!("{notifying_kind}:1"),
+                kind: notifying_kind.into(),
+                severity: Severity::Warning,
+                notify: true,
+                acknowledged: false,
+            }],
+            during_learning: false,
+            unexplained: false,
+        }
+    }
+
+    fn nudge_snapshot(learning: bool, heavy_minutes: Option<u16>) -> Snapshot {
+        Snapshot {
+            learning,
+            heavy_minutes_trailing_hour: heavy_minutes,
+            ..Snapshot::default()
+        }
+    }
+
+    #[test]
+    fn f_opens_the_rating_overlay_and_esc_cancels_it_cleanly() {
+        let (mut app, commands) = app_with_captive_worker();
+        app.status = "untouched".into();
+        app.handle_key(key(KeyCode::Char('f')));
+        assert!(matches!(app.mode, InputMode::RatePerformance));
+
+        // A key that is not one of the three choices must not answer for
+        // the user -- the overlay simply stays open.
+        app.handle_key(key(KeyCode::Char('x')));
+        assert!(matches!(app.mode, InputMode::RatePerformance));
+
+        // Nor does a modified one: Ctrl-G is a terminal chord, not an
+        // answer, and must never be read as "good".
+        for modifiers in [KeyModifiers::CONTROL, KeyModifiers::ALT] {
+            for choice in ['g', 'a', 's'] {
+                app.handle_key(KeyEvent::new(KeyCode::Char(choice), modifiers));
+                assert!(
+                    matches!(app.mode, InputMode::RatePerformance),
+                    "{modifiers:?}+{choice} closed the overlay"
+                );
+                assert_eq!(
+                    commands.try_iter().count(),
+                    0,
+                    "{modifiers:?}+{choice} filed a rating"
+                );
+            }
+        }
+
+        app.handle_key(key(KeyCode::Esc));
+        assert!(matches!(app.mode, InputMode::Normal));
+        assert_eq!(app.status, "untouched", "cancelling says nothing");
+        assert_eq!(
+            commands.try_iter().count(),
+            0,
+            "a cancelled overlay files no rating"
+        );
+    }
+
+    #[test]
+    fn rating_choices_route_to_their_verdicts_without_blocking() {
+        for (choice, expected) in [
+            ('g', RatingVerdict::Good),
+            ('a', RatingVerdict::Acceptable),
+            ('s', RatingVerdict::Sluggish),
+        ] {
+            let (mut app, commands) = app_with_captive_worker();
+            app.handle_key(key(KeyCode::Char('f')));
+            app.handle_key(key(KeyCode::Char(choice)));
+            assert!(
+                matches!(app.mode, InputMode::Normal),
+                "the overlay closes on the answer, before the pipe answers"
+            );
+            let sent: Vec<WorkerCommand> = commands.try_iter().collect();
+            assert!(
+                matches!(sent.as_slice(), [WorkerCommand::AddRating(verdict)] if *verdict == expected),
+                "{choice} sent {sent:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_recorded_rating_confirms_on_the_statusline() {
+        let (mut app, _commands, events) = app_with_live_channels();
+        events
+            .send(WorkerEvent::Action(Ok(RATING_RECORDED_STATUS.into())))
+            .unwrap();
+        app.drain_events();
+        assert_eq!(app.status, RATING_RECORDED_STATUS);
+        assert!(!app.status_is_error);
+    }
+
+    #[test]
+    fn an_older_service_without_ratings_never_raises_an_error() {
+        // Nobody asked for the ratings fetch, so its failure against a
+        // pre-ratings collector must stay invisible.
+        let (mut app, _commands, events) = app_with_live_channels();
+        events
+            .send(WorkerEvent::Ratings(Err(
+                "unknown command (invalidRequest)".into(),
+            )))
+            .unwrap();
+        app.drain_events();
+        assert!(app.last_error.is_none());
+        assert!(!app.status_is_error, "status: {}", app.status);
+    }
+
+    #[test]
+    fn the_rating_nudge_needs_all_three_gates_and_is_stamped_once_a_day() {
+        let now_ms = 1_800_000_000_000;
+        let (store, path) = scratch_prefs_store("rating-nudge");
+        let mut app = App::new_inert();
+        app.prefs_store = Some(store.clone());
+        app.status.clear();
+
+        // 1. Still learning: the policy a rating would adjust is not in
+        //    effect yet.
+        app.maybe_nudge_for_rating(&nudge_snapshot(true, Some(45)), now_ms);
+        assert!(app.status.is_empty(), "learning: {}", app.status);
+        // 2. Not enough heavy load: a label at idle teaches nothing about
+        //    the machine under demand.
+        app.maybe_nudge_for_rating(&nudge_snapshot(false, Some(9)), now_ms);
+        assert!(app.status.is_empty(), "quiet hour: {}", app.status);
+        // 3. A service that does not report the figure at all is not a
+        //    zero -- and is not a reason to ask either.
+        app.maybe_nudge_for_rating(&nudge_snapshot(false, None), now_ms);
+        assert!(app.status.is_empty(), "unreported: {}", app.status);
+        // 4. A failure is on the statusline: the nudge neither overwrites it
+        //    nor spends the day's single ask behind it.
+        app.set_error("Collector unreachable".into());
+        app.maybe_nudge_for_rating(&nudge_snapshot(false, Some(45)), now_ms);
+        assert_eq!(app.status, "Collector unreachable");
+        assert_eq!(
+            app.client_prefs.last_rating_nudge_ms, 0,
+            "an unasked question must not burn the clock"
+        );
+        app.status.clear();
+        app.status_is_error = false;
+
+        // All three gates pass.
+        app.maybe_nudge_for_rating(&nudge_snapshot(false, Some(10)), now_ms);
+        assert_eq!(app.status, RATING_NUDGE_STATUS);
+        assert!(!app.status_is_error);
+        assert_eq!(app.client_prefs.last_rating_nudge_ms, now_ms);
+        assert_eq!(
+            store.load().last_rating_nudge_ms,
+            now_ms,
+            "the nudge stamp outlives the session"
+        );
+
+        // Not twice in one day, however heavy it gets...
+        app.status.clear();
+        app.maybe_nudge_for_rating(
+            &nudge_snapshot(false, Some(60)),
+            now_ms + 23 * 3_600_000 + 59 * 60_000,
+        );
+        assert!(app.status.is_empty(), "same day: {}", app.status);
+        // ...and once a day has passed, again.
+        app.maybe_nudge_for_rating(&nudge_snapshot(false, Some(60)), now_ms + 24 * 3_600_000);
+        assert_eq!(app.status, RATING_NUDGE_STATUS);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn the_displayed_offset_follows_the_live_bucket_and_never_guesses_one() {
+        use pcpulse_service::models::DemandBucket;
+        let now_ms = 1_800_000_000_000;
+        let mut app = App::new_inert();
+        // One `good` given under heavy load while sustainedCpu was
+        // notifying: that kind gets stricter, in that bucket only.
+        app.rating_offsets = derive_offsets(
+            &[rating_at(
+                DemandBucket::Heavy,
+                RatingVerdict::Good,
+                "sustainedCpu",
+                now_ms,
+            )],
+            now_ms,
+        );
+
+        assert_eq!(
+            app.rating_offset_for("sustainedCpu"),
+            None,
+            "no snapshot, no bucket, nothing to say"
+        );
+        app.snapshot = Some(Snapshot::default());
+        assert_eq!(
+            app.rating_offset_for("sustainedCpu"),
+            None,
+            "a service that reports no demand bucket must not be guessed at"
+        );
+
+        // The deceptive-comfort guard, as the pane sees it: under light
+        // load the heavy bucket's adjustment is simply not shown, because
+        // it is not in force.
+        app.snapshot = Some(Snapshot {
+            demand: Some(DemandBucket::Light),
+            ..Snapshot::default()
+        });
+        assert_eq!(app.rating_offset_for("sustainedCpu"), None);
+
+        app.snapshot = Some(Snapshot {
+            demand: Some(DemandBucket::Heavy),
+            ..Snapshot::default()
+        });
+        let offset = app.rating_offset_for("sustainedCpu").expect("heavy offset");
+        assert!((offset - 0.05).abs() < 1e-9, "{offset}");
+        assert_eq!(
+            app.rating_offset_for("memoryGrowth"),
+            None,
+            "a kind no rating ever named is untouched"
+        );
     }
 
     /// An `App` with both worker channels held open by the test: commands

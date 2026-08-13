@@ -44,6 +44,10 @@ The same calibration applies to the collector's watch over itself: its CPU, memo
 
 PC Pulse also now inventories the hardware itself — CPU, system, BIOS, memory, storage, and GPUs — over vendor-neutral WMI, independent of whatever telemetry happens to be readable. A GPU with no working sensor path (no NVML, say) still shows up as present in inventory even while its live gauge honestly reports unavailable: not being able to measure something is never confused with not having it.
 
+## Performance ratings
+
+Press `f` and answer in one keystroke — `g` good, `a` acceptable, `s` sluggish, `Esc` cancels. Each rating is filed against the workload PC Pulse saw over the trailing ten minutes — light, moderate, or heavy — so it only ever teaches the notification policy what "acceptable" means for *that* load level on *this* machine: a `good` given while the machine is idle can never lower the bar for what counts as acceptable under demanding load, and a `sluggish` given under heavy load is taken just as seriously no matter how many easy days came before it. Ratings tune only the notification policy's confidence and persistence floors — in ±0.05 steps, bounded to ±0.15, decaying with a 30-day half-life — never the learned baselines, detector thresholds, or severities those floors gate. Every rating also stores a redacted, size-capped performance digest — the same rollups, top processes, and incident evidence Oracle works from — building the labeled corpus a future optimization agent will train on. PC Pulse may nudge you to rate after a demanding stretch: a plain statusline message, at most once a day, and never while it's still learning your machine.
+
 ## Terminal interface
 
 The TUI ships three presentation profiles: **vitals** (default), a patient-monitor identity; **avionics**, an amber-CRT multi-function display with a bezel-key rail, an annunciator strip that keeps one lamp per finding class lit from every page, and a pressure-map treemap where every major process is a clickable tile sized by working set and heated by its dominant pressure channel; and **ledger**, a night-edition broadsheet that swaps every box border for typographic rules — a full-width masthead with a printed page index, block-digit headline figures for CPU/MEM/DISK (plus NET and IRQ minor figures on wide terminals), a MARKET strip of per-resource trend tickers with windowed deltas, a MOVERS board naming the processes with the largest CPU and working-set change over the last ~2 minutes, one-line NOTICES at the foot, and a folio line beneath. Start with `PcPulse.exe --theme vitals|avionics|ledger` or cycle live with `t`.
@@ -87,6 +91,7 @@ Important keys:
 | `z` | Archive the selected finding — it leaves the default list, lamps, and tapes but keeps detecting; in the archived view, `z` recovers it |
 | `v` | Cycle the Findings view: current (active + resolved) / archived only |
 | `i` | Investigate the selected finding in Oracle — a new chat opens and the composed question is submitted with the finding's evidence; double-clicking the finding row does the same |
+| `f` | Rate how the machine currently feels — opens a three-choice overlay: `g` good / `a` acceptable / `s` sluggish, `Esc` cancels |
 | `[` / `]` | Shorten or lengthen the persisted timeline |
 | `Enter` or `/` on Oracle | Ask the embedded systems analyzer |
 | `j`/`k`, `PgUp`/`PgDn` on Oracle | Scroll the conversation |

@@ -459,6 +459,21 @@ pub struct Snapshot {
     /// alongside `learning_percent`.
     #[serde(default)]
     pub learning_minutes_left: Option<u16>,
+    /// How demanding the workload is right now — the bucket the user's
+    /// rating offsets are read against, computed here because the machine
+    /// baseline the classification needs lives service-side. `None` in
+    /// snapshots from services that predate performance ratings, which is
+    /// how a client tells "light" from "not reported": the incidents pane
+    /// shows no rating-offset line at all rather than guessing a bucket.
+    #[serde(default)]
+    pub demand: Option<DemandBucket>,
+    /// Minutes of the trailing hour spent in the heavy demand bucket.
+    /// Counted in distinct wall-clock minutes, not in samples, so the
+    /// figure does not move with the configured sample cadence. The client's
+    /// rating nudge waits for ten of them: labels given under real load are
+    /// the ones worth asking for. `None` alongside [`Self::demand`].
+    #[serde(default)]
+    pub heavy_minutes_trailing_hour: Option<u16>,
 }
 
 impl Default for Snapshot {
@@ -473,6 +488,8 @@ impl Default for Snapshot {
             learning: false,
             learning_percent: None,
             learning_minutes_left: None,
+            demand: None,
+            heavy_minutes_trailing_hour: None,
         }
     }
 }
@@ -652,6 +669,12 @@ pub struct AgentContext {
     pub process_suspects: Vec<AgentProcessRollup>,
     pub diagnostic_log_rollups: Vec<AgentLogRollup>,
     pub recent_alerts: Vec<Alert>,
+    /// Non-zero notify-floor adjustments the user's performance ratings have
+    /// earned, per alert kind and demand bucket. Empty on a machine nobody
+    /// has rated, and `#[serde(default)]` so a context written before this
+    /// field existed still deserializes.
+    #[serde(default)]
+    pub rating_offsets: Vec<RatingOffset>,
     pub limitations: Vec<String>,
 }
 
@@ -828,6 +851,83 @@ impl OptimizationPlan {
     }
 }
 
+/// Overall performance verdict for a rating record.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum RatingVerdict {
+    Good,
+    Acceptable,
+    Sluggish,
+}
+
+/// Coarse system-demand bucket for a rating record. `Hash` because the
+/// notification policy keys its rating offsets by (kind, bucket).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "camelCase")]
+pub enum DemandBucket {
+    Light,
+    Moderate,
+    Heavy,
+}
+
+/// Per-resource demand readings behind a rating's `DemandBucket`.
+/// Percentiles are `None` when the historical sketch backing them can't yet
+/// answer (e.g. not enough learned history).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct DemandDetail {
+    pub cpu_percent: f64,
+    pub cpu_percentile: Option<f64>,
+    pub memory_occupancy_pct: f64,
+    pub memory_percentile: Option<f64>,
+    pub disk_latency_ms: f64,
+    pub disk_percentile: Option<f64>,
+    pub io_bytes_per_sec: f64,
+    pub io_percentile: Option<f64>,
+}
+
+/// Reference to an incident open at the time a rating was produced.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenIncidentRef {
+    pub fingerprint: String,
+    pub kind: String,
+    pub severity: Severity,
+    pub notify: bool,
+    pub acknowledged: bool,
+}
+
+/// A point-in-time performance rating: how good/bad the machine felt, how
+/// demanding the workload was, and what was open at the time.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct Rating {
+    pub id: String,
+    pub at_ms: i64,
+    pub verdict: RatingVerdict,
+    pub demand: DemandBucket,
+    pub demand_detail: DemandDetail,
+    pub digest: serde_json::Value,
+    pub open_incidents: Vec<OpenIncidentRef>,
+    pub during_learning: bool,
+    pub unexplained: bool,
+}
+
+/// One effective notify-floor adjustment the user's ratings have earned, as
+/// surfaced to the agent and the incidents detail pane. Always names a
+/// specific `kind` -- a bucket-wide adjustment (an unexplained `sluggish`
+/// rating, which names no kind) is netted into every named kind's effective
+/// offset instead of appearing as its own row, so a reader summing these
+/// entries never double-counts it. See
+/// [`crate::quality::PolicyOffsets::entries`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct RatingOffset {
+    pub kind: String,
+    pub bucket: DemandBucket,
+    pub offset: f64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "command", rename_all = "camelCase")]
 pub enum PipeRequest {
@@ -882,6 +982,16 @@ pub enum PipeRequest {
     TerminateProcess {
         pid: u32,
         confirmed: bool,
+    },
+    /// Submit a quick in-app performance rating. The client sends only the
+    /// verdict; the service owns the demand context and digest because the
+    /// data (recent samples, baselines, active incidents) lives there.
+    AddRating {
+        verdict: RatingVerdict,
+    },
+    /// Rating history, newest first, for the UI's rating log.
+    GetRatings {
+        limit: usize,
     },
 }
 
@@ -1084,7 +1194,11 @@ mod tests {
         );
         let restored: Alert = serde_json::from_value(old).unwrap();
         assert!(!restored.archived);
-        assert!(serde_json::to_string(&alert).unwrap().contains("\"archived\":true"));
+        assert!(
+            serde_json::to_string(&alert)
+                .unwrap()
+                .contains("\"archived\":true")
+        );
     }
 
     #[test]
@@ -1148,10 +1262,9 @@ mod tests {
 
     #[test]
     fn request_fields_are_snake_case_on_the_wire_as_documented() {
-        let history: PipeRequest = serde_json::from_str(
-            r#"{"command":"getHistory","from_ms":1,"to_ms":2,"limit":10}"#,
-        )
-        .expect("documented snake_case fields must parse");
+        let history: PipeRequest =
+            serde_json::from_str(r#"{"command":"getHistory","from_ms":1,"to_ms":2,"limit":10}"#)
+                .expect("documented snake_case fields must parse");
         assert!(matches!(history, PipeRequest::GetHistory { .. }));
         let context: PipeRequest =
             serde_json::from_str(r#"{"command":"getAgentContext","window_hours":2}"#)
@@ -1160,10 +1273,8 @@ mod tests {
         // The camelCase spelling protocol.md previously documented never
         // worked; keep it failing loudly rather than silently half-working.
         assert!(
-            serde_json::from_str::<PipeRequest>(
-                r#"{"command":"acknowledgeAlert","alertId":"x"}"#
-            )
-            .is_err()
+            serde_json::from_str::<PipeRequest>(r#"{"command":"acknowledgeAlert","alertId":"x"}"#)
+                .is_err()
         );
     }
 
@@ -1195,6 +1306,38 @@ mod tests {
                 confirmation_required_for_mutations: true,
             },
         }
+    }
+
+    #[test]
+    fn pre_ratings_snapshots_gain_the_demand_fields_as_absent() {
+        // Both fields are additive: a snapshot serialized by a service that
+        // predates them must still deserialize, with the demand context
+        // simply unknown rather than fabricated as Light/zero.
+        let wire = serde_json::to_string(&Snapshot {
+            demand: Some(DemandBucket::Heavy),
+            heavy_minutes_trailing_hour: Some(17),
+            ..Snapshot::default()
+        })
+        .unwrap();
+        assert!(wire.contains("\"demand\":\"heavy\""), "wire: {wire}");
+        assert!(
+            wire.contains("\"heavyMinutesTrailingHour\":17"),
+            "wire: {wire}"
+        );
+        let back: Snapshot = serde_json::from_str(&wire).unwrap();
+        assert_eq!(back.demand, Some(DemandBucket::Heavy));
+        assert_eq!(back.heavy_minutes_trailing_hour, Some(17));
+
+        // A snapshot from a service that predates the fields carries neither
+        // key; it must still deserialize, with the demand context simply
+        // unknown rather than fabricated as Light/zero.
+        let mut older: serde_json::Value = serde_json::from_str(&wire).unwrap();
+        let object = older.as_object_mut().unwrap();
+        object.remove("demand");
+        object.remove("heavyMinutesTrailingHour");
+        let snapshot: Snapshot = serde_json::from_value(older).unwrap();
+        assert_eq!(snapshot.demand, None);
+        assert_eq!(snapshot.heavy_minutes_trailing_hour, None);
     }
 
     #[test]

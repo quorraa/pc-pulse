@@ -10,6 +10,7 @@ pub mod metrics;
 pub mod models;
 pub mod pipe;
 pub mod quality;
+pub mod ratings;
 pub mod runtime;
 pub mod service;
 pub mod stats;

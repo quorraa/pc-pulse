@@ -3,7 +3,7 @@ use crate::{
     models::{
         AgentContext, AgentLogRollup, AgentProcessRollup, AgentSystemRollup, Alert,
         DiagnosticLevel, DiagnosticLog, DiagnosticLogStatus, HistoryResponse, ProcessMetric,
-        Snapshot,
+        RatingOffset, Snapshot,
     },
 };
 use std::collections::{HashMap, HashSet};
@@ -23,6 +23,10 @@ pub struct AgentContextSource<'a> {
     pub logs: Vec<DiagnosticLog>,
     pub log_status: DiagnosticLogStatus,
     pub alerts: Vec<Alert>,
+    /// Non-zero notify-floor adjustments the user's ratings have earned.
+    /// Empty on a machine nobody has rated, which is also what every caller
+    /// that does not care about ratings passes.
+    pub rating_offsets: Vec<RatingOffset>,
 }
 
 pub fn build_agent_context(source: AgentContextSource<'_>) -> AgentContext {
@@ -35,6 +39,7 @@ pub fn build_agent_context(source: AgentContextSource<'_>) -> AgentContext {
         logs,
         log_status,
         mut alerts,
+        rating_offsets,
     } = source;
     let system_rollup = rollup_system(&history);
     let process_suspects = rollup_processes(&history.processes, snapshot, settings);
@@ -71,6 +76,12 @@ pub fn build_agent_context(source: AgentContextSource<'_>) -> AgentContext {
                 .into(),
         );
     }
+    if !rating_offsets.is_empty() {
+        limitations.push(
+            "Performance ratings have adjusted the notification floors for the listed alert kinds and demand buckets; they never modify baselines, detector thresholds, or severities."
+                .into(),
+        );
+    }
     if log_status.last_error.is_some() {
         limitations.push(
             "The Windows diagnostic log collector reports a current error; treat event-log coverage as incomplete."
@@ -101,6 +112,7 @@ pub fn build_agent_context(source: AgentContextSource<'_>) -> AgentContext {
         process_suspects,
         diagnostic_log_rollups,
         recent_alerts: alerts,
+        rating_offsets,
         limitations,
     }
 }
@@ -149,7 +161,11 @@ fn current_pressure(process: &ProcessMetric, settings: &Settings) -> f64 {
         + if !process.responsive { 25.0 } else { 0.0 }
 }
 
-fn rollup_system(history: &HistoryResponse) -> AgentSystemRollup {
+/// `pub(crate)` (rather than private) so `ratings.rs` can build the same
+/// trailing-window system percentiles for a rating's performance digest
+/// instead of duplicating this logic -- the digest is a compacted sibling of
+/// the agent-context evidence bundle.
+pub(crate) fn rollup_system(history: &HistoryResponse) -> AgentSystemRollup {
     let cpu: Vec<f64> = history
         .system
         .iter()
@@ -210,7 +226,10 @@ struct ProcessAccumulator {
     working_set_max: u64,
 }
 
-fn rollup_processes(
+/// `pub(crate)` for the same reason as [`rollup_system`]: `ratings.rs` reuses
+/// this pressure-scored, redacted process rollup for the top-processes
+/// section of a rating's performance digest.
+pub(crate) fn rollup_processes(
     processes: &[ProcessMetric],
     snapshot: &Snapshot,
     settings: &Settings,
@@ -513,6 +532,7 @@ mod tests {
             logs: Vec::new(),
             log_status: DiagnosticLogStatus::default(),
             alerts: vec![alert("recent", false), alert("recent-filed", true)],
+            rating_offsets: Vec::new(),
         });
         assert_eq!(
             context

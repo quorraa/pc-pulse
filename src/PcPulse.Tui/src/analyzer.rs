@@ -717,6 +717,7 @@ mod tests {
             process_suspects: Vec::new(),
             diagnostic_log_rollups: Vec::new(),
             recent_alerts: Vec::new(),
+            rating_offsets: Vec::new(),
             limitations: Vec::new(),
         }
     }
