@@ -269,6 +269,12 @@ pub struct HardwareMetrics {
     pub gpus: Vec<GpuMetrics>,
     pub available: bool,
     pub detail: String,
+    /// The vendor-neutral hardware inventory (what exists), independent of
+    /// the gauges above (what is currently measurable). `None` only until
+    /// the collector's first inventory probe completes; absent entirely in
+    /// snapshots from services older than hardware inventory, which the
+    /// `#[serde(default)]` on this struct keeps deserializing.
+    pub inventory: Option<HardwareInventory>,
 }
 
 impl Default for HardwareMetrics {
@@ -280,6 +286,143 @@ impl Default for HardwareMetrics {
             gpus: Vec::new(),
             available: false,
             detail: "no hardware telemetry in this snapshot".into(),
+            inventory: None,
+        }
+    }
+}
+
+/// One inventory group's outcome: either the probed value, or a reason it
+/// could not be determined. `detail` is empty on success and non-empty on
+/// `unavailable` — it never carries a fabricated reading. Missing hardware
+/// TELEMETRY (a gauge that can't be read right now) never implies missing
+/// hardware (an inventory group that failed to enumerate); the two are
+/// deliberately separate concepts.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct InventoryGroup<T> {
+    pub value: Option<T>,
+    pub detail: String,
+    /// When the probe pass that produced this group's current `value` (or,
+    /// for an `unavailable` group with no value, this group's `detail`)
+    /// actually ran. A re-probe that fails for this specific group keeps
+    /// the group's previous value and detail rather than fabricating an
+    /// "unavailable" from fresh data that never arrived — see
+    /// `metrics::inventory`'s `retain_on_failure` — so this stamp can
+    /// legitimately lag behind `HardwareInventory::collected_at_ms`
+    /// (which is simply "when the most recent probe attempt ran").
+    /// Additive: `#[serde(default)]` so a group payload written before
+    /// this field existed still deserializes, as `0`.
+    #[serde(default)]
+    pub collected_at_ms: i64,
+}
+
+impl<T> InventoryGroup<T> {
+    pub fn present(value: T, collected_at_ms: i64) -> Self {
+        Self {
+            value: Some(value),
+            detail: String::new(),
+            collected_at_ms,
+        }
+    }
+
+    pub fn unavailable(detail: impl Into<String>, collected_at_ms: i64) -> Self {
+        Self {
+            value: None,
+            detail: detail.into(),
+            collected_at_ms,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct CpuInventory {
+    pub manufacturer: String,
+    pub brand: String,
+    pub physical_cores: u32,
+    pub logical_processors: u32,
+    pub base_clock_mhz: Option<u32>,
+    pub max_clock_mhz: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SystemInventory {
+    pub manufacturer: String,
+    pub model: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct BiosInventory {
+    pub version: String,
+    pub release_date: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryInventory {
+    pub installed_bytes: u64,
+    pub module_count: u32,
+    pub speed_mts: Option<u32>,
+}
+
+/// One physical storage device. `media_type` is `"ssd"`, `"hdd"`, or
+/// `"unknown"` — the `Win32_DiskDrive` fallback path can identify the bus
+/// but not the media, so it always reports `"unknown"` rather than guess.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct StorageDevice {
+    pub model: String,
+    pub size_bytes: u64,
+    pub bus_type: String,
+    pub media_type: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct GpuInventory {
+    pub name: String,
+    pub vendor: String,
+    pub driver_version: Option<String>,
+    pub vram_bytes: Option<u64>,
+}
+
+/// The vendor-neutral hardware inventory: what exists, independent of what
+/// the gauges can currently measure. Every group is probed independently,
+/// so one group's failure (e.g. a locked-down storage namespace) never
+/// blanks the others. Probed once at collector construction and re-probed
+/// at most once a day; see `metrics::inventory`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct HardwareInventory {
+    pub cpu: InventoryGroup<CpuInventory>,
+    pub system: InventoryGroup<SystemInventory>,
+    pub bios: InventoryGroup<BiosInventory>,
+    pub memory: InventoryGroup<MemoryInventory>,
+    pub storage: InventoryGroup<Vec<StorageDevice>>,
+    pub gpus: InventoryGroup<Vec<GpuInventory>>,
+    /// When the most recent probe *attempt* ran — not when every group's
+    /// value was last confirmed. A re-probe that fails for some groups
+    /// still advances this timestamp (an attempt did happen), while those
+    /// groups keep their own older `InventoryGroup::collected_at_ms`; read
+    /// the per-group stamp for "how fresh is this specific reading".
+    pub collected_at_ms: i64,
+}
+
+impl HardwareInventory {
+    /// Every group starts `unavailable`; callers fill in the groups they
+    /// actually probed. Used both as the pre-probe placeholder and as a
+    /// concise base for test fixtures (`..HardwareInventory::empty(0)`).
+    pub fn empty(collected_at_ms: i64) -> Self {
+        Self {
+            cpu: InventoryGroup::unavailable("not probed", collected_at_ms),
+            system: InventoryGroup::unavailable("not probed", collected_at_ms),
+            bios: InventoryGroup::unavailable("not probed", collected_at_ms),
+            memory: InventoryGroup::unavailable("not probed", collected_at_ms),
+            storage: InventoryGroup::unavailable("not probed", collected_at_ms),
+            gpus: InventoryGroup::unavailable("not probed", collected_at_ms),
+            collected_at_ms,
         }
     }
 }
@@ -757,6 +900,7 @@ mod tests {
                 }],
                 available: true,
                 detail: String::new(),
+                inventory: None,
             },
             ..Snapshot::default()
         };
