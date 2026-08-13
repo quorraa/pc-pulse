@@ -418,9 +418,14 @@ fn sampling_loop(state: &Arc<AppState>, stop: crossbeam_channel::Receiver<()>) -
         let calibration = Calibration {
             learning: baselines.machine.is_learning(timestamp_ms),
             baseline_maturity: baselines.machine.maturity(timestamp_ms),
+            names: Some(&baselines),
         };
-        let mut evaluation = {
-            let mut alerts = state
+        // Copied out so the snapshot block below can reuse this sample's
+        // learning state without `calibration`'s `&baselines` borrow living
+        // past the mutable baseline updates that follow the evaluation.
+        let (learning, baseline_maturity) = (calibration.learning, calibration.baseline_maturity);
+        let (mut evaluation, quarantine) = {
+            let mut engine = state
                 .alerts
                 .lock()
                 .map_err(|_| anyhow!("alert lock poisoned"))?;
@@ -429,18 +434,33 @@ fn sampling_loop(state: &Arc<AppState>, stop: crossbeam_channel::Receiver<()>) -
             // whether a DPC incident is worth interrupting the user for; the
             // verdict is the previous sample's, since a capture only runs
             // once a finding exists.
-            alerts.observe_interrupts(InterruptContext {
+            engine.observe_interrupts(InterruptContext {
                 verdict: interrupts.verdict_state(),
                 corroborating_signals: interrupts.corroborating_signals(),
                 dpc_p95: baselines.machine.dpc_rate.quantile(0.95),
                 interrupt_p95: baselines.machine.interrupt_rate.quantile(0.95),
             });
-            alerts.evaluate(&system, &processes, &settings, calibration)
+            let evaluation = engine.evaluate(&system, &processes, &settings, calibration);
+            // Which instances must not be folded into their own name's norm
+            // this sample. Read under the same lock as the evaluation that
+            // decided it, and small enough (bounded by the growth watch list)
+            // to copy rather than hold the lock across the baseline update.
+            let quarantine = engine.self_training_quarantine().clone();
+            (evaluation, quarantine)
         };
         baselines
             .machine
             .observe(&system, processes.len(), timestamp_ms);
         for process in &processes {
+            // An instance that has been climbing monotonically for half an
+            // hour stops teaching its own executable name what "normal" is.
+            // Note this stops *further* teaching only -- whatever its ramp
+            // taught before it qualified is already folded in. See
+            // `AlertEngine::self_training_quarantine` for what that does and
+            // does not buy.
+            if quarantine.contains(&(process.pid, process.started_at_ms)) {
+                continue;
+            }
             baselines.observe_process(process, timestamp_ms);
         }
         forensics.observe(&evaluation.active, timestamp_ms);
@@ -477,13 +497,13 @@ fn sampling_loop(state: &Arc<AppState>, stop: crossbeam_channel::Receiver<()>) -
             snapshot.processes = processes.clone();
             snapshot.active_alerts = evaluation.active;
             snapshot.hardware = hardware;
-            // `calibration` was computed above from this same `timestamp_ms`,
-            // before this sample folded into the baseline -- reuse it rather
-            // than re-deriving learning state from a baseline that has since
+            // Computed above from this same `timestamp_ms`, before this
+            // sample folded into the baseline -- reuse it rather than
+            // re-deriving learning state from a baseline that has since
             // observed one more point.
-            snapshot.learning = calibration.learning;
-            snapshot.learning_hours_left = calibration.learning.then(|| {
-                let remaining_fraction = (1.0 - calibration.baseline_maturity).clamp(0.0, 1.0);
+            snapshot.learning = learning;
+            snapshot.learning_hours_left = learning.then(|| {
+                let remaining_fraction = (1.0 - baseline_maturity).clamp(0.0, 1.0);
                 (remaining_fraction * 24.0).ceil() as u8
             });
         }
