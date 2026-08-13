@@ -491,6 +491,11 @@ mod tests {
             occurrence_count: 1,
             resolved_at_ms: None,
             archived,
+            fingerprint: String::new(),
+            state: crate::models::IncidentState::Open,
+            quality: crate::models::AlertQuality::default(),
+            notify: true,
+            notify_generation: 0,
         };
         let snapshot = Snapshot {
             active_alerts: vec![alert("live", false), alert("filed", true)],

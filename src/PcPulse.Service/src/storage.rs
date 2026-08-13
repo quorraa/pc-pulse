@@ -513,6 +513,11 @@ mod tests {
             occurrence_count: 1,
             resolved_at_ms: None,
             archived: false,
+            fingerprint: String::new(),
+            state: crate::models::IncidentState::Open,
+            quality: crate::models::AlertQuality::default(),
+            notify: true,
+            notify_generation: 0,
         };
         storage.upsert_alerts(&[alert]).unwrap();
 
@@ -539,6 +544,11 @@ mod tests {
             occurrence_count: 1,
             resolved_at_ms: None,
             archived: false,
+            fingerprint: String::new(),
+            state: crate::models::IncidentState::Open,
+            quality: crate::models::AlertQuality::default(),
+            notify: true,
+            notify_generation: 0,
         }
     }
 
