@@ -18,7 +18,7 @@
 
 ---
 
-### Task R1: Rating model + storage
+### Task 1: Rating model + storage
 
 **Files:**
 - Modify: `src/PcPulse.Service/src/models.rs` (Rating types), `src/PcPulse.Service/src/storage.rs` (table + CRUD)
@@ -33,7 +33,7 @@
 
 ---
 
-### Task R2: Demand bucketing + digest (`ratings.rs`)
+### Task 2: Demand bucketing + digest (`ratings.rs`)
 
 **Files:**
 - Create: `src/PcPulse.Service/src/ratings.rs`; Modify: `lib.rs` (`pub mod ratings;`)
@@ -50,7 +50,7 @@
 
 ---
 
-### Task R3: Pipe commands
+### Task 3: Pipe commands
 
 **Files:**
 - Modify: `src/PcPulse.Service/src/models.rs` (PipeRequest variants), `src/PcPulse.Service/src/runtime.rs` (handlers), `src/PcPulse.Tui/src/client.rs` (client calls), `docs/protocol.md`
@@ -65,7 +65,7 @@
 
 ---
 
-### Task R4: Policy offsets
+### Task 4: Policy offsets
 
 **Files:**
 - Modify: `src/PcPulse.Service/src/quality.rs` (offset derivation + application), `src/PcPulse.Service/src/alerting.rs` (feed offsets into the scoring pass), `src/PcPulse.Service/src/runtime.rs` (load recent ratings into the engine on start + on AddRating)
@@ -85,7 +85,7 @@
 
 ---
 
-### Task R5: TUI — rating overlay, nudge, visibility
+### Task 5: TUI — rating overlay, nudge, visibility
 
 **Files:**
 - Modify: `src/PcPulse.Tui/src/app.rs` (input mode + nudge state + prefs `last_rating_nudge_ms: i64` serde default 0), `src/PcPulse.Tui/src/ui.rs` (overlay + incidents-page annotations + offset display), `src/PcPulse.Tui/src/prefs.rs`
@@ -100,7 +100,7 @@
 
 ---
 
-### Task R6: Docs + live smoke
+### Task 6: Docs + live smoke
 
 **Files:**
 - Modify: `README.md` (ratings section, house voice); verify `docs/protocol.md` (R3 wrote it; cross-check against shipped serde)
