@@ -153,11 +153,15 @@ impl<P: InventoryProbe> InventorySampler<P> {
 }
 
 /// One group's re-probe outcome, merged against what was previously
-/// cached. A successful `fresh` group always wins (refresh). A failed
-/// `fresh` group keeps `previous`'s value when it had one, so a transient
-/// re-probe failure can never turn real, previously-observed hardware into
-/// "unavailable" — only a group that was never successfully probed stays
-/// unavailable.
+/// cached. A successful `fresh` group always wins (refresh, with the new
+/// probe's own `collected_at_ms`). A failed `fresh` group keeps
+/// `previous`'s value *and* `previous`'s `collected_at_ms` when it had a
+/// value, so a transient re-probe failure can never turn real,
+/// previously-observed hardware into "unavailable", and the retained
+/// group's timestamp keeps honestly pointing at when it was actually last
+/// confirmed rather than the failed attempt that just ran. Only a group
+/// that was never successfully probed stays unavailable (with the fresh
+/// failure's own timestamp).
 fn retain_on_failure<T: Clone>(
     previous: &InventoryGroup<T>,
     fresh: InventoryGroup<T>,
@@ -172,6 +176,7 @@ fn retain_on_failure<T: Clone>(
                 "retained from previous probe; latest re-probe failed: {}",
                 fresh.detail
             ),
+            collected_at_ms: previous.collected_at_ms,
         },
         None => fresh,
     }
@@ -205,46 +210,57 @@ impl WmiInventoryProbe {
     fn group<T>(
         &self,
         label: &str,
+        collected_at_ms: i64,
         probe: impl FnOnce(&IWbemServices) -> Result<T>,
     ) -> InventoryGroup<T> {
         match &self.cimv2 {
             Ok(services) => match probe(services) {
-                Ok(value) => InventoryGroup::present(value),
-                Err(error) => {
-                    InventoryGroup::unavailable(format!("{label} query failed: {error:#}"))
-                }
+                Ok(value) => InventoryGroup::present(value, collected_at_ms),
+                Err(error) => InventoryGroup::unavailable(
+                    format!("{label} query failed: {error:#}"),
+                    collected_at_ms,
+                ),
             },
-            Err(detail) => {
-                InventoryGroup::unavailable(format!("root\\CIMV2 unavailable: {detail}"))
-            }
+            Err(detail) => InventoryGroup::unavailable(
+                format!("root\\CIMV2 unavailable: {detail}"),
+                collected_at_ms,
+            ),
         }
     }
 
-    fn storage_group(&self) -> InventoryGroup<Vec<StorageDevice>> {
+    fn storage_group(&self, collected_at_ms: i64) -> InventoryGroup<Vec<StorageDevice>> {
         match &self.storage {
             Ok(services) => match physical_disk_inventory(services) {
-                Ok(devices) => InventoryGroup::present(devices),
-                Err(error) => {
-                    self.fallback_disk_drive(&format!("MSFT_PhysicalDisk query failed: {error:#}"))
-                }
+                Ok(devices) => InventoryGroup::present(devices, collected_at_ms),
+                Err(error) => self.fallback_disk_drive(
+                    &format!("MSFT_PhysicalDisk query failed: {error:#}"),
+                    collected_at_ms,
+                ),
             },
-            Err(detail) => self.fallback_disk_drive(&format!(
-                "root\\microsoft\\windows\\storage unavailable: {detail}"
-            )),
+            Err(detail) => self.fallback_disk_drive(
+                &format!("root\\microsoft\\windows\\storage unavailable: {detail}"),
+                collected_at_ms,
+            ),
         }
     }
 
-    fn fallback_disk_drive(&self, reason: &str) -> InventoryGroup<Vec<StorageDevice>> {
+    fn fallback_disk_drive(
+        &self,
+        reason: &str,
+        collected_at_ms: i64,
+    ) -> InventoryGroup<Vec<StorageDevice>> {
         match &self.cimv2 {
             Ok(services) => match disk_drive_inventory(services) {
-                Ok(devices) => InventoryGroup::present(devices),
-                Err(error) => InventoryGroup::unavailable(format!(
-                    "{reason}; Win32_DiskDrive fallback failed: {error:#}"
-                )),
+                Ok(devices) => InventoryGroup::present(devices, collected_at_ms),
+                Err(error) => InventoryGroup::unavailable(
+                    format!("{reason}; Win32_DiskDrive fallback failed: {error:#}"),
+                    collected_at_ms,
+                ),
             },
-            Err(detail) => {
-                InventoryGroup::unavailable(format!("{reason}; root\\CIMV2 unavailable: {detail}"))
-            }
+            Err(detail) => InventoryGroup::unavailable(
+                format!("{reason}; root\\CIMV2 unavailable: {detail}"),
+                collected_at_ms,
+            ),
         }
     }
 }
@@ -257,14 +273,21 @@ impl Default for WmiInventoryProbe {
 
 impl InventoryProbe for WmiInventoryProbe {
     fn collect(&self) -> HardwareInventory {
+        // One timestamp for this whole probe pass: it stamps every group
+        // that this pass actually answers (successfully or not), and
+        // becomes `HardwareInventory::collected_at_ms` — "when this attempt
+        // ran". `InventorySampler::collect`'s `retain_on_failure` is what
+        // keeps an individual group's stamp from advancing when this pass
+        // fails to answer it.
+        let collected_at_ms = chrono::Utc::now().timestamp_millis();
         HardwareInventory {
-            cpu: self.group("CPU", cpu_inventory),
-            system: self.group("system", system_inventory),
-            bios: self.group("BIOS", bios_inventory),
-            memory: self.group("memory", memory_inventory),
-            storage: self.storage_group(),
-            gpus: self.group("GPU", gpu_inventory_list),
-            collected_at_ms: chrono::Utc::now().timestamp_millis(),
+            cpu: self.group("CPU", collected_at_ms, cpu_inventory),
+            system: self.group("system", collected_at_ms, system_inventory),
+            bios: self.group("BIOS", collected_at_ms, bios_inventory),
+            memory: self.group("memory", collected_at_ms, memory_inventory),
+            storage: self.storage_group(collected_at_ms),
+            gpus: self.group("GPU", collected_at_ms, gpu_inventory_list),
+            collected_at_ms,
         }
     }
 }
@@ -611,27 +634,37 @@ mod tests {
     impl InventoryProbe for LenovoStub {
         fn collect(&self) -> HardwareInventory {
             HardwareInventory {
-                cpu: InventoryGroup::present(CpuInventory {
-                    manufacturer: "AuthenticAMD".into(),
-                    brand: "AMD Ryzen 5 PRO 5650GE with Radeon Graphics".into(),
-                    physical_cores: 6,
-                    logical_processors: 12,
-                    base_clock_mhz: Some(3400),
-                    max_clock_mhz: Some(4400),
-                }),
-                gpus: InventoryGroup::present(vec![GpuInventory {
-                    name: "AMD Radeon(TM) Graphics".into(),
-                    vendor: "Advanced Micro Devices, Inc.".into(),
-                    driver_version: Some("31.0.21912.14".into()),
-                    vram_bytes: None,
-                }]),
-                memory: InventoryGroup::present(MemoryInventory {
-                    installed_bytes: 16 * 1024 * 1024 * 1024,
-                    module_count: 2,
-                    speed_mts: Some(3200),
-                }),
+                cpu: InventoryGroup::present(
+                    CpuInventory {
+                        manufacturer: "AuthenticAMD".into(),
+                        brand: "AMD Ryzen 5 PRO 5650GE with Radeon Graphics".into(),
+                        physical_cores: 6,
+                        logical_processors: 12,
+                        base_clock_mhz: Some(3400),
+                        max_clock_mhz: Some(4400),
+                    },
+                    0,
+                ),
+                gpus: InventoryGroup::present(
+                    vec![GpuInventory {
+                        name: "AMD Radeon(TM) Graphics".into(),
+                        vendor: "Advanced Micro Devices, Inc.".into(),
+                        driver_version: Some("31.0.21912.14".into()),
+                        vram_bytes: None,
+                    }],
+                    0,
+                ),
+                memory: InventoryGroup::present(
+                    MemoryInventory {
+                        installed_bytes: 16 * 1024 * 1024 * 1024,
+                        module_count: 2,
+                        speed_mts: Some(3200),
+                    },
+                    0,
+                ),
                 storage: InventoryGroup::unavailable(
                     "WMI storage namespace query failed: access denied",
+                    0,
                 ),
                 ..HardwareInventory::empty(0)
             }
@@ -723,14 +756,17 @@ mod tests {
         fn collect(&self) -> HardwareInventory {
             self.calls.set(self.calls.get() + 1);
             HardwareInventory {
-                cpu: InventoryGroup::present(CpuInventory {
-                    manufacturer: "GenuineIntel".into(),
-                    brand: "Intel Core i7".into(),
-                    physical_cores: 8,
-                    logical_processors: 16,
-                    base_clock_mhz: Some(2600),
-                    max_clock_mhz: Some(4800),
-                }),
+                cpu: InventoryGroup::present(
+                    CpuInventory {
+                        manufacturer: "GenuineIntel".into(),
+                        brand: "Intel Core i7".into(),
+                        physical_cores: 8,
+                        logical_processors: 16,
+                        base_clock_mhz: Some(2600),
+                        max_clock_mhz: Some(4800),
+                    },
+                    1_000,
+                ),
                 ..HardwareInventory::empty(1_000)
             }
         }
@@ -785,39 +821,57 @@ mod tests {
 
     fn fully_healthy_inventory(collected_at_ms: i64) -> HardwareInventory {
         HardwareInventory {
-            cpu: InventoryGroup::present(CpuInventory {
-                manufacturer: "GenuineIntel".into(),
-                brand: "Intel Core i7".into(),
-                physical_cores: 8,
-                logical_processors: 16,
-                base_clock_mhz: Some(2600),
-                max_clock_mhz: Some(4800),
-            }),
-            system: InventoryGroup::present(SystemInventory {
-                manufacturer: "Dell Inc.".into(),
-                model: "XPS 15".into(),
-            }),
-            bios: InventoryGroup::present(BiosInventory {
-                version: "1.2.3".into(),
-                release_date: Some("20240101000000.000000+000".into()),
-            }),
-            memory: InventoryGroup::present(MemoryInventory {
-                installed_bytes: 32 * 1024 * 1024 * 1024,
-                module_count: 2,
-                speed_mts: Some(4800),
-            }),
-            storage: InventoryGroup::present(vec![StorageDevice {
-                model: "Samsung 990 Pro".into(),
-                size_bytes: 2_000_000_000_000,
-                bus_type: "NVMe".into(),
-                media_type: "ssd".into(),
-            }]),
-            gpus: InventoryGroup::present(vec![GpuInventory {
-                name: "NVIDIA GeForce RTX 4080".into(),
-                vendor: "NVIDIA".into(),
-                driver_version: Some("560.94".into()),
-                vram_bytes: Some(16 * 1024 * 1024 * 1024),
-            }]),
+            cpu: InventoryGroup::present(
+                CpuInventory {
+                    manufacturer: "GenuineIntel".into(),
+                    brand: "Intel Core i7".into(),
+                    physical_cores: 8,
+                    logical_processors: 16,
+                    base_clock_mhz: Some(2600),
+                    max_clock_mhz: Some(4800),
+                },
+                collected_at_ms,
+            ),
+            system: InventoryGroup::present(
+                SystemInventory {
+                    manufacturer: "Dell Inc.".into(),
+                    model: "XPS 15".into(),
+                },
+                collected_at_ms,
+            ),
+            bios: InventoryGroup::present(
+                BiosInventory {
+                    version: "1.2.3".into(),
+                    release_date: Some("20240101000000.000000+000".into()),
+                },
+                collected_at_ms,
+            ),
+            memory: InventoryGroup::present(
+                MemoryInventory {
+                    installed_bytes: 32 * 1024 * 1024 * 1024,
+                    module_count: 2,
+                    speed_mts: Some(4800),
+                },
+                collected_at_ms,
+            ),
+            storage: InventoryGroup::present(
+                vec![StorageDevice {
+                    model: "Samsung 990 Pro".into(),
+                    size_bytes: 2_000_000_000_000,
+                    bus_type: "NVMe".into(),
+                    media_type: "ssd".into(),
+                }],
+                collected_at_ms,
+            ),
+            gpus: InventoryGroup::present(
+                vec![GpuInventory {
+                    name: "NVIDIA GeForce RTX 4080".into(),
+                    vendor: "NVIDIA".into(),
+                    driver_version: Some("560.94".into()),
+                    vram_bytes: Some(16 * 1024 * 1024 * 1024),
+                }],
+                collected_at_ms,
+            ),
             collected_at_ms,
         }
     }
@@ -828,12 +882,12 @@ mod tests {
             results: vec![
                 fully_healthy_inventory(1_000),
                 HardwareInventory {
-                    cpu: InventoryGroup::unavailable("WMI transient failure"),
-                    system: InventoryGroup::unavailable("WMI transient failure"),
-                    bios: InventoryGroup::unavailable("WMI transient failure"),
-                    memory: InventoryGroup::unavailable("WMI transient failure"),
-                    storage: InventoryGroup::unavailable("WMI transient failure"),
-                    gpus: InventoryGroup::unavailable("WMI transient failure"),
+                    cpu: InventoryGroup::unavailable("WMI transient failure", 2_000),
+                    system: InventoryGroup::unavailable("WMI transient failure", 2_000),
+                    bios: InventoryGroup::unavailable("WMI transient failure", 2_000),
+                    memory: InventoryGroup::unavailable("WMI transient failure", 2_000),
+                    storage: InventoryGroup::unavailable("WMI transient failure", 2_000),
+                    gpus: InventoryGroup::unavailable("WMI transient failure", 2_000),
                     collected_at_ms: 2_000,
                 },
             ],
@@ -863,6 +917,22 @@ mod tests {
             after_failed_reprobe.gpus.value.as_ref().unwrap()[0].name,
             "NVIDIA GeForce RTX 4080"
         );
+        // Every retained group keeps the timestamp of the probe pass that
+        // actually produced it (1_000, the first pass) — not the failed
+        // re-probe attempt's own timestamp (2_000) — even though the
+        // top-level `collected_at_ms` does advance to 2_000, since an
+        // attempt genuinely happened.
+        for stamp in [
+            after_failed_reprobe.cpu.collected_at_ms,
+            after_failed_reprobe.system.collected_at_ms,
+            after_failed_reprobe.bios.collected_at_ms,
+            after_failed_reprobe.memory.collected_at_ms,
+            after_failed_reprobe.storage.collected_at_ms,
+            after_failed_reprobe.gpus.collected_at_ms,
+        ] {
+            assert_eq!(stamp, 1_000);
+        }
+        assert_eq!(after_failed_reprobe.collected_at_ms, 2_000);
         // …but the detail is annotated so a reader can tell the data is
         // stale rather than freshly confirmed.
         for detail in [
@@ -881,22 +951,35 @@ mod tests {
     #[test]
     fn a_partially_failed_reprobe_refreshes_the_healthy_groups_and_retains_the_rest() {
         let mut degraded = fully_healthy_inventory(2_000);
-        // CPU and GPUs come back fresh (and different, to prove a refresh
-        // actually happened rather than accidentally matching the retained
-        // value); everything else fails this re-probe and must be
+        // CPU and GPUs come back fresh — and with values that actually
+        // differ from the first pass, so a passing assertion proves a
+        // genuine refresh happened rather than merely matching whatever
+        // was retained. Everything else fails this re-probe and must be
         // retained from the first, fully-healthy pass.
-        degraded.cpu = InventoryGroup::present(CpuInventory {
-            manufacturer: "GenuineIntel".into(),
-            brand: "Intel Core i9 (refreshed)".into(),
-            physical_cores: 8,
-            logical_processors: 16,
-            base_clock_mhz: Some(3200),
-            max_clock_mhz: Some(5600),
-        });
-        degraded.system = InventoryGroup::unavailable("WMI transient failure");
-        degraded.bios = InventoryGroup::unavailable("WMI transient failure");
-        degraded.memory = InventoryGroup::unavailable("WMI transient failure");
-        degraded.storage = InventoryGroup::unavailable("WMI transient failure");
+        degraded.cpu = InventoryGroup::present(
+            CpuInventory {
+                manufacturer: "GenuineIntel".into(),
+                brand: "Intel Core i9 (refreshed)".into(),
+                physical_cores: 8,
+                logical_processors: 16,
+                base_clock_mhz: Some(3200),
+                max_clock_mhz: Some(5600),
+            },
+            2_000,
+        );
+        degraded.gpus = InventoryGroup::present(
+            vec![GpuInventory {
+                name: "NVIDIA GeForce RTX 4080".into(),
+                vendor: "NVIDIA".into(),
+                driver_version: Some("561.00 (refreshed)".into()),
+                vram_bytes: Some(16 * 1024 * 1024 * 1024),
+            }],
+            2_000,
+        );
+        degraded.system = InventoryGroup::unavailable("WMI transient failure", 2_000);
+        degraded.bios = InventoryGroup::unavailable("WMI transient failure", 2_000);
+        degraded.memory = InventoryGroup::unavailable("WMI transient failure", 2_000);
+        degraded.storage = InventoryGroup::unavailable("WMI transient failure", 2_000);
 
         let sampler_probe = SequencedStub {
             results: vec![fully_healthy_inventory(1_000), degraded],
@@ -905,22 +988,37 @@ mod tests {
         let mut sampler = InventorySampler::with_probe(sampler_probe);
         let first = sampler.collect();
         assert_eq!(first.cpu.value.as_ref().unwrap().brand, "Intel Core i7");
+        assert_eq!(
+            first.gpus.value.as_ref().unwrap()[0]
+                .driver_version
+                .as_deref(),
+            Some("560.94")
+        );
 
         sampler.last_probe = Instant::now() - Duration::from_secs(25 * 60 * 60);
         let after_partial_reprobe = sampler.collect();
 
-        // The groups the re-probe actually answered are refreshed…
+        // The groups the re-probe actually answered are refreshed, to
+        // genuinely different values (not the retained ones) and the new
+        // pass's own timestamp…
         assert_eq!(
             after_partial_reprobe.cpu.value.as_ref().unwrap().brand,
             "Intel Core i9 (refreshed)"
         );
         assert!(after_partial_reprobe.cpu.detail.is_empty());
+        assert_eq!(after_partial_reprobe.cpu.collected_at_ms, 2_000);
         assert_eq!(
-            after_partial_reprobe.gpus.value.as_ref().unwrap()[0].name,
-            "NVIDIA GeForce RTX 4080"
+            after_partial_reprobe.gpus.value.as_ref().unwrap()[0]
+                .driver_version
+                .as_deref(),
+            Some("561.00 (refreshed)")
         );
+        assert!(after_partial_reprobe.gpus.detail.is_empty());
+        assert_eq!(after_partial_reprobe.gpus.collected_at_ms, 2_000);
         // …while the groups that failed this pass keep their previously
-        // observed values, annotated as stale rather than reported empty.
+        // observed values, annotated as stale rather than reported empty,
+        // stamped with the timestamp of the pass that actually produced
+        // them (1_000) rather than the failed attempt (2_000).
         assert_eq!(
             after_partial_reprobe.system.value.as_ref().unwrap().model,
             "XPS 15"
@@ -931,6 +1029,7 @@ mod tests {
                 .detail
                 .contains("retained from previous probe")
         );
+        assert_eq!(after_partial_reprobe.system.collected_at_ms, 1_000);
         assert_eq!(
             after_partial_reprobe.storage.value.as_ref().unwrap()[0].model,
             "Samsung 990 Pro"
@@ -941,6 +1040,10 @@ mod tests {
                 .detail
                 .contains("retained from previous probe")
         );
+        assert_eq!(after_partial_reprobe.storage.collected_at_ms, 1_000);
+        // The top-level stamp always advances to the latest probe
+        // attempt, whether or not every group answered it.
+        assert_eq!(after_partial_reprobe.collected_at_ms, 2_000);
     }
 
     #[test]

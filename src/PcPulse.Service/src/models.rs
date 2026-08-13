@@ -235,20 +235,34 @@ impl Default for HardwareMetrics {
 pub struct InventoryGroup<T> {
     pub value: Option<T>,
     pub detail: String,
+    /// When the probe pass that produced this group's current `value` (or,
+    /// for an `unavailable` group with no value, this group's `detail`)
+    /// actually ran. A re-probe that fails for this specific group keeps
+    /// the group's previous value and detail rather than fabricating an
+    /// "unavailable" from fresh data that never arrived — see
+    /// `metrics::inventory`'s `retain_on_failure` — so this stamp can
+    /// legitimately lag behind `HardwareInventory::collected_at_ms`
+    /// (which is simply "when the most recent probe attempt ran").
+    /// Additive: `#[serde(default)]` so a group payload written before
+    /// this field existed still deserializes, as `0`.
+    #[serde(default)]
+    pub collected_at_ms: i64,
 }
 
 impl<T> InventoryGroup<T> {
-    pub fn present(value: T) -> Self {
+    pub fn present(value: T, collected_at_ms: i64) -> Self {
         Self {
             value: Some(value),
             detail: String::new(),
+            collected_at_ms,
         }
     }
 
-    pub fn unavailable(detail: impl Into<String>) -> Self {
+    pub fn unavailable(detail: impl Into<String>, collected_at_ms: i64) -> Self {
         Self {
             value: None,
             detail: detail.into(),
+            collected_at_ms,
         }
     }
 }
@@ -321,6 +335,11 @@ pub struct HardwareInventory {
     pub memory: InventoryGroup<MemoryInventory>,
     pub storage: InventoryGroup<Vec<StorageDevice>>,
     pub gpus: InventoryGroup<Vec<GpuInventory>>,
+    /// When the most recent probe *attempt* ran — not when every group's
+    /// value was last confirmed. A re-probe that fails for some groups
+    /// still advances this timestamp (an attempt did happen), while those
+    /// groups keep their own older `InventoryGroup::collected_at_ms`; read
+    /// the per-group stamp for "how fresh is this specific reading".
     pub collected_at_ms: i64,
 }
 
@@ -330,12 +349,12 @@ impl HardwareInventory {
     /// concise base for test fixtures (`..HardwareInventory::empty(0)`).
     pub fn empty(collected_at_ms: i64) -> Self {
         Self {
-            cpu: InventoryGroup::unavailable("not probed"),
-            system: InventoryGroup::unavailable("not probed"),
-            bios: InventoryGroup::unavailable("not probed"),
-            memory: InventoryGroup::unavailable("not probed"),
-            storage: InventoryGroup::unavailable("not probed"),
-            gpus: InventoryGroup::unavailable("not probed"),
+            cpu: InventoryGroup::unavailable("not probed", collected_at_ms),
+            system: InventoryGroup::unavailable("not probed", collected_at_ms),
+            bios: InventoryGroup::unavailable("not probed", collected_at_ms),
+            memory: InventoryGroup::unavailable("not probed", collected_at_ms),
+            storage: InventoryGroup::unavailable("not probed", collected_at_ms),
+            gpus: InventoryGroup::unavailable("not probed", collected_at_ms),
             collected_at_ms,
         }
     }
