@@ -58,7 +58,7 @@ Budget: while subscribed, the loop costs one `PdhCollectQueryData` over a seven-
 
 ## Alert lifecycle and calibration
 
-`Alert` gained six additive camelCase fields for incident lifecycle and notification calibration. All are `#[serde(default)]`; alerts persisted by older services deserialize with the defaults noted below, which reproduce their old, ungated behavior exactly. `protocolVersion` is unchanged (still 1).
+`Alert` gained five additive camelCase fields for incident lifecycle and notification calibration. All are `#[serde(default)]`; alerts persisted by older services deserialize with the defaults noted below, which reproduce their old, ungated behavior exactly. `protocolVersion` is unchanged (still 1).
 
 | Field | Type | Default (pre-upgrade records) | Meaning |
 |---|---|---|---|
