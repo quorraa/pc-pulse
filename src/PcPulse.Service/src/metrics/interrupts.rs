@@ -381,6 +381,67 @@ pub fn assess_confidence(
     }
 }
 
+/// Successful captures that must agree on a driver family before the
+/// attribution counts as repeatable (spec Phase D: "the same driver family
+/// as modal candidate across >= 2 successful captures").
+pub const REPEATABLE_CAPTURES: usize = 2;
+
+/// How settled a finding's root-cause attribution is, as the notification
+/// policy needs to see it. Derived from the same capture history the
+/// evidence rows are built from, on every rebuild.
+///
+/// The distinction the field reports demand is between an attribution that
+/// *held* and one that merely *existed*: a single 8-second trace, or labels
+/// rotating storage -> graphics -> network, are diagnostic evidence that must
+/// never ring a bell by themselves.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum VerdictState {
+    /// No successful capture, or none that attributed a real driver. There
+    /// is no attribution to judge -- not a bad one.
+    #[default]
+    NoCapture,
+    /// A modal driver exists but has not held: too few captures, a
+    /// fragmented field, or a leader that keeps changing.
+    SingleCapture,
+    /// One device family leads a majority of the capture history across at
+    /// least [`REPEATABLE_CAPTURES`] captures, and the confidence rubric
+    /// rates that lead above [`Confidence::Low`]. `driver_family` is a
+    /// [`DeviceClass`] name, so two storage drivers taking turns still read
+    /// as one repeatable cause.
+    Repeatable { driver_family: String },
+    /// A repeatable verdict for a family that replaced an earlier repeatable
+    /// verdict for a different one -- both sides passed the same gate, so
+    /// this is a change of cause rather than a label flip. It is the DPC
+    /// detector's "materially changed fingerprint" for renotification.
+    ChangedConfidently { from: String, to: String },
+}
+
+impl VerdictState {
+    /// Whether the verdict names a family that has held across captures.
+    /// [`Self::ChangedConfidently`] counts: it is two repeatable verdicts in
+    /// a row, which is more attribution than one, not less -- and it stands
+    /// as the engine's answer until the next capture minutes later, so
+    /// reading it as unattributed would silence the finding for exactly as
+    /// long as the change is newest.
+    pub fn is_attributed(&self) -> bool {
+        matches!(
+            self,
+            Self::Repeatable { .. } | Self::ChangedConfidently { .. }
+        )
+    }
+
+    /// What the quality layer should read for `attribution_stable`. A
+    /// verdictless finding has nothing to say and scores neutral; one whose
+    /// modal driver never held says so.
+    pub fn attribution_stable(&self) -> Option<bool> {
+        match self {
+            Self::NoCapture => None,
+            Self::SingleCapture => Some(false),
+            Self::Repeatable { .. } | Self::ChangedConfidently { .. } => Some(true),
+        }
+    }
+}
+
 /// The most-likely-cause summary distilled from a finding's capture history.
 #[derive(Debug, Clone, PartialEq)]
 pub struct VerdictCandidate {
@@ -570,6 +631,13 @@ struct FindingState {
     rows: Vec<Evidence>,
     history: VecDeque<CaptureRecord>,
     class: Option<DeviceClass>,
+    /// How settled this finding's attribution is, recomputed on every
+    /// rebuild alongside the evidence rows.
+    verdict: VerdictState,
+    /// The last family this finding produced a verdict for that passed the
+    /// confidence gate, so a later confident verdict for a different family
+    /// is recognizable as a *change* rather than a first attribution.
+    confident_family: Option<String>,
 }
 
 /// Holds the root-cause state per `dpcInterrupt` alert ID, the adaptive
@@ -783,6 +851,21 @@ impl<S: InterruptSource> InterruptEngine<S> {
             .get(id)
             .map(|state| state.history.iter().cloned().collect())
             .unwrap_or_default();
+        // The device class of every driver that leads at least one capture,
+        // so family agreement can be counted without asking the version
+        // resource the same question twice.
+        let mut families: HashMap<String, DeviceClass> = HashMap::new();
+        for record in &history {
+            if let Some(top) = record.top_driver()
+                && !families.contains_key(top)
+            {
+                let description = self.source.driver_description(top);
+                families.insert(
+                    top.to_string(),
+                    classify_driver(top, description.as_deref()),
+                );
+            }
+        }
         let verdict = modal_candidate(&history).map(|candidate| {
             let description = self.source.driver_description(&candidate.driver);
             let class = classify_driver(&candidate.driver, description.as_deref());
@@ -794,14 +877,34 @@ impl<S: InterruptSource> InterruptEngine<S> {
                 candidate.margin,
                 correlation.matched_r(),
             );
-            (candidate, description, class, correlation, confidence)
+            // Family-level agreement, which is deliberately looser than the
+            // rubric's driver-level `consistent`: two storage drivers taking
+            // turns are one repeatable cause, not two rival ones.
+            let agreement = history
+                .iter()
+                .filter(|record| {
+                    record
+                        .top_driver()
+                        .and_then(|top| families.get(top))
+                        .is_some_and(|top_class| *top_class == class)
+                })
+                .count();
+            (
+                candidate,
+                description,
+                class,
+                correlation,
+                confidence,
+                agreement,
+            )
         });
         let Some(state) = self.findings.get_mut(id) else {
             return;
         };
         let mut rows = Vec::with_capacity(6);
         state.class = None;
-        if let Some((candidate, description, class, correlation, confidence)) = verdict {
+        state.verdict = VerdictState::NoCapture;
+        if let Some((candidate, description, class, correlation, confidence, agreement)) = verdict {
             rows.push(evidence(
                 LIKELY_CAUSE_LABEL,
                 format_likely_cause(&candidate.driver, description.as_deref(), class),
@@ -812,9 +915,65 @@ impl<S: InterruptSource> InterruptEngine<S> {
             ));
             rows.push(evidence(CORRELATION_LABEL, format_correlation(&correlation)));
             state.class = Some(class);
+            // Repeatable takes three things at once: enough captures naming
+            // the family, a *majority* of the history behind it (so a
+            // rotating leader can never accumulate its way to a verdict),
+            // and the existing confidence rubric above its floor.
+            let repeatable = agreement >= REPEATABLE_CAPTURES
+                && agreement * 2 > history.len()
+                && confidence != Confidence::Low;
+            let family = class.as_str().to_string();
+            state.verdict = if !repeatable {
+                VerdictState::SingleCapture
+            } else {
+                match state.confident_family.replace(family.clone()) {
+                    Some(previous) if previous != family => VerdictState::ChangedConfidently {
+                        from: previous,
+                        to: family,
+                    },
+                    _ => VerdictState::Repeatable {
+                        driver_family: family,
+                    },
+                }
+            };
         }
         rows.extend(capture_rows.iter().cloned());
         state.rows = rows;
+    }
+
+    /// How settled the live `dpcInterrupt` finding's attribution is -- what
+    /// the notification policy gates on.
+    ///
+    /// The detector's engine key is the fixed string `dpcInterrupt`, so at
+    /// most one finding is ever live; findings that resolved on this pass are
+    /// excluded, and in the impossible case of several the best-evidenced one
+    /// answers.
+    pub fn verdict_state(&self) -> VerdictState {
+        self.live_finding()
+            .map_or(VerdictState::NoCapture, |state| state.verdict.clone())
+    }
+
+    /// Independent co-signals corroborating the live finding: a class-matched
+    /// activity correlation at or above the rubric's floor is one. Pure
+    /// memory work over the activity ring, like the rest of the correlation
+    /// path.
+    pub fn corroborating_signals(&self) -> u32 {
+        let Some(class) = self.live_finding().and_then(|state| state.class) else {
+            return 0;
+        };
+        u32::from(
+            class_correlation(&self.activity, class)
+                .matched_r()
+                .is_some_and(|r| r >= CONFIDENCE_R_FLOOR),
+        )
+    }
+
+    fn live_finding(&self) -> Option<&FindingState> {
+        self.findings
+            .iter()
+            .filter(|(id, _)| !self.stale.contains(*id))
+            .map(|(_, state)| state)
+            .max_by_key(|state| state.history.len())
     }
 
     #[cfg(test)]
@@ -2096,6 +2255,114 @@ mod tests {
         assert_eq!(assess_confidence(1, 4, 80.0, 80.0, None), Low);
         // LOW: consistent but weak share.
         assert_eq!(assess_confidence(2, 4, 20.0, 0.0, None), Low);
+    }
+
+    /// The engine-level half of the field report's DPC cases. The
+    /// gating half (one incident, silent, stable title) lives in
+    /// `alerting.rs`; this is the verdict the gate reads.
+    #[test]
+    fn verdict_state_holds_only_when_a_family_leads_the_history() {
+        let mut engine = InterruptEngine::new(StubSource::default());
+        engine.source_mut().drivers = drivers(&[
+            (0xFFFF_F800_0000_0000, "storport.sys"),
+            (0xFFFF_F800_1000_0000, "nvlddmkm.sys"),
+        ]);
+        let storage = capture(&[(0xFFFF_F800_0001_0000, 100)]);
+        let graphics = capture(&[(0xFFFF_F800_1001_0000, 100)]);
+        feed_gpu_correlated_activity(&mut engine);
+        let alerts = [dpc_alert("d1")];
+        assert_eq!(
+            engine.verdict_state(),
+            VerdictState::NoCapture,
+            "no capture, no verdict"
+        );
+        assert_eq!(engine.corroborating_signals(), 0);
+
+        // One trace is diagnostic evidence only.
+        engine.source_mut().capture = storage.clone();
+        engine.observe(&alerts, 0);
+        assert_eq!(engine.verdict_state(), VerdictState::SingleCapture);
+
+        // A second trace agreeing on the family makes it repeatable.
+        engine.observe(&alerts, 2 * 60_000);
+        assert_eq!(
+            engine.verdict_state(),
+            VerdictState::Repeatable {
+                driver_family: "storage".into()
+            }
+        );
+        // Storage activity is flat in this window, so nothing corroborates.
+        assert_eq!(engine.corroborating_signals(), 0);
+
+        // The cause moves to the GPU. While the history is evenly split the
+        // engine says so rather than picking a side.
+        engine.source_mut().capture = graphics;
+        engine.observe(&alerts, 4 * 60_000);
+        assert_eq!(
+            engine.verdict_state(),
+            VerdictState::Repeatable {
+                driver_family: "storage".into()
+            },
+            "two of three captures still say storage"
+        );
+        engine.observe(&alerts, 14 * 60_000);
+        assert_eq!(
+            engine.verdict_state(),
+            VerdictState::SingleCapture,
+            "an evenly split history names no family"
+        );
+        engine.observe(&alerts, 24 * 60_000);
+        assert_eq!(
+            engine.verdict_state(),
+            VerdictState::ChangedConfidently {
+                from: "storage".into(),
+                to: "gpu".into()
+            },
+            "both sides passed the confidence gate, so this is a real change"
+        );
+        // The GPU series does track the interrupt rate in this window.
+        assert_eq!(engine.corroborating_signals(), 1);
+    }
+
+    #[test]
+    fn alternating_capture_families_never_reach_a_repeatable_verdict() {
+        let mut engine = InterruptEngine::new(StubSource::default());
+        engine.source_mut().drivers = drivers(&[
+            (0xFFFF_F800_0000_0000, "storport.sys"),
+            (0xFFFF_F800_1000_0000, "nvlddmkm.sys"),
+            (0xFFFF_F800_2000_0000, "ndis.sys"),
+        ]);
+        // Each trace is a fragmented field whose leader rotates
+        // storage -> graphics -> network: exactly the field report.
+        let rotation = [
+            capture(&[
+                (0xFFFF_F800_0001_0000, 40),
+                (0xFFFF_F800_1001_0000, 35),
+                (0xFFFF_F800_2001_0000, 25),
+            ]),
+            capture(&[
+                (0xFFFF_F800_0001_0000, 25),
+                (0xFFFF_F800_1001_0000, 40),
+                (0xFFFF_F800_2001_0000, 35),
+            ]),
+            capture(&[
+                (0xFFFF_F800_0001_0000, 35),
+                (0xFFFF_F800_1001_0000, 25),
+                (0xFFFF_F800_2001_0000, 40),
+            ]),
+        ];
+        let alerts = [dpc_alert("d1")];
+        // Minutes: the fast phase, then the ten-minute cooldown.
+        for (index, minute) in [0, 2, 4, 14, 24, 34].into_iter().enumerate() {
+            engine.source_mut().capture = rotation[index % rotation.len()].clone();
+            engine.observe(&alerts, minute * 60_000);
+            assert_eq!(
+                engine.verdict_state(),
+                VerdictState::SingleCapture,
+                "no family has held after {} traces",
+                index + 1
+            );
+        }
     }
 
     #[test]

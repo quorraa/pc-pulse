@@ -1,8 +1,9 @@
 use crate::{
     baselines::RunningStats,
     config::Settings,
+    metrics::interrupts::VerdictState,
     models::{Alert, Evidence, IncidentState, ProcessMetric, Severity, SystemMetric},
-    quality::{Calibration, QualityInputs, decide, score},
+    quality::{Calibration, NotifyDecision, QualityInputs, decide, score},
     stats::{TrendPoint, TrendShape, classify_trend},
 };
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -26,6 +27,16 @@ const EXIT_RATIO: f64 = 0.85;
 /// incident. Also the window `runtime` seeds the engine's reopen memory from,
 /// so a condition that outlives a service restart reattaches.
 pub const QUIET_PERIOD_MS: i64 = 6 * 3_600_000;
+/// The engine key -- and so the fingerprint -- of the DPC/interrupt
+/// incident. Fixed by the spec: attribution changes never split it.
+const DPC_KEY: &str = "dpcInterrupt";
+/// How long the kernel rate has to stay at or above the machine's learned
+/// p95 before it can carry a notification on its own evidence, with no
+/// repeatable driver-family attribution behind it.
+const SUSTAINED_P95_MS: i64 = 15 * 60_000;
+/// Incident kinds that speak for the person at the keyboard. Their presence
+/// alongside a machine-wide incident is the `user_impact` signal.
+const USER_IMPACT_KINDS: [&str; 2] = ["unresponsive", "slowLaunch"];
 
 #[derive(Debug, Clone, Default)]
 struct ProcessBaseline {
@@ -74,9 +85,61 @@ struct Candidate {
     /// Detector-supplied "what I am describing is materially different now"
     /// flag -- e.g. a *confident* DPC driver-family verdict change, never a
     /// low-confidence label flip. It is one of the notification policy's
-    /// renotify conditions. No detector sets it yet (Phase D does); it is
-    /// plumbed here so the policy has somewhere to read it from.
+    /// renotify conditions.
     material_change: bool,
+    /// What this detector knows about its own evidence, on its way to the
+    /// scoring pass.
+    quality: CandidateQuality,
+}
+
+/// The quality inputs only the detector can supply, carried from the
+/// candidate that fired to the scoring pass via [`IncidentCalibration`].
+///
+/// `Default` is "nothing to add", which is every detector that has not been
+/// calibrated to fill it in: an unknown attribution (neutral, not negative),
+/// no co-signals, and no veto of its own.
+#[derive(Debug, Clone, Copy)]
+struct CandidateQuality {
+    /// Whether the detector's attribution has held. `None` when it has no
+    /// attribution to offer.
+    attribution_stable: Option<bool>,
+    corroborating_signals: u32,
+    user_impact_signals: u32,
+    /// Whether the detector's own evidence bar is met. The generic floors in
+    /// [`crate::quality::decide`] stay necessary; this makes them
+    /// insufficient. It is a veto and never a promotion: a detector cannot
+    /// notify past the floors with it.
+    notify: bool,
+}
+
+impl Default for CandidateQuality {
+    fn default() -> Self {
+        Self {
+            attribution_stable: None,
+            corroborating_signals: 0,
+            user_impact_signals: 0,
+            notify: true,
+        }
+    }
+}
+
+/// What the runtime knows about DPC/interrupt attribution and the machine's
+/// learned kernel-rate norms, handed to the engine before each evaluation by
+/// [`AlertEngine::observe_interrupts`].
+///
+/// `Default` is an engine that has never been told anything -- no verdict,
+/// nothing learned -- which keeps the DPC incident history-only. That is the
+/// honest reading for a caller with no interrupt engine behind it, and it is
+/// what every test that does not care about DPC gets.
+#[derive(Debug, Clone, Default)]
+pub struct InterruptContext {
+    pub verdict: VerdictState,
+    /// Independent co-signals from the interrupt engine's correlation pass.
+    pub corroborating_signals: u32,
+    /// Machine-learned p95 of the DPC and interrupt rates; `None` while the
+    /// sketch has too few observations to answer.
+    pub dpc_p95: Option<f64>,
+    pub interrupt_p95: Option<f64>,
 }
 
 impl Candidate {
@@ -114,6 +177,12 @@ struct IncidentCalibration {
     /// Carried from the candidate that fired this sample, and consumed by
     /// the same sample's scoring pass.
     material_change: bool,
+    /// The detector's own quality inputs, latched from the candidate that
+    /// last fired. Unlike `material_change` these are *not* cleared each
+    /// sample: an incident held open by hysteresis has no candidate to
+    /// restate them, and the last thing the detector said is the best thing
+    /// known about it.
+    quality: CandidateQuality,
 }
 
 /// When an incident was last marked notifiable, and at which generation.
@@ -169,6 +238,20 @@ pub struct AlertEngine {
     baselines: HashMap<(u32, i64), ProcessBaseline>,
     history: HashMap<(u32, i64), VecDeque<ProcessPoint>>,
     pool_baseline: RunningStats,
+    /// The latest DPC/interrupt attribution and learned kernel-rate norms.
+    interrupts: InterruptContext,
+    /// When the kernel rate first reached the machine's learned p95 in the
+    /// current unbroken run; cleared the moment it drops back.
+    above_p95_since: Option<i64>,
+    /// The last confident driver-family change acted on, so a verdict that
+    /// stays `ChangedConfidently` for many samples (the interrupt engine
+    /// only re-derives it on a capture, minutes apart) renotifies once.
+    last_verdict_change: Option<(String, String)>,
+    /// A confident change that has not reached a scoring pass yet. Latched
+    /// rather than applied at once because the change can land on a sample
+    /// where the incident is held open by hysteresis, with no candidate to
+    /// carry it -- and a dropped flag is a renotification the user never got.
+    pending_verdict_change: bool,
 }
 
 impl AlertEngine {
@@ -204,6 +287,34 @@ impl AlertEngine {
             }
         }
         engine
+    }
+
+    /// Feed the DPC/interrupt attribution verdict, its corroboration, and
+    /// the machine's learned kernel-rate p95s. The runtime calls this before
+    /// every [`Self::evaluate`]; an engine that is never told keeps the
+    /// honest default and holds the DPC incident to history.
+    pub fn observe_interrupts(&mut self, context: InterruptContext) {
+        if let VerdictState::ChangedConfidently { from, to } = &context.verdict {
+            let change = (from.clone(), to.clone());
+            if self.last_verdict_change.as_ref() != Some(&change) {
+                self.last_verdict_change = Some(change);
+                self.pending_verdict_change = true;
+            }
+        }
+        self.interrupts = context;
+    }
+
+    /// Open incidents that speak for the user rather than the machine. Read
+    /// from the active map, so an impact incident that opens on this very
+    /// sample counts from the next one -- a one-sample lag against a gate
+    /// measured in quarter-hours.
+    fn user_impact_signals(&self) -> u32 {
+        let count = self
+            .active
+            .values()
+            .filter(|alert| USER_IMPACT_KINDS.contains(&alert.kind.as_str()))
+            .count();
+        u32::try_from(count).unwrap_or(u32::MAX)
     }
 
     pub fn evaluate(
@@ -560,10 +671,27 @@ impl AlertEngine {
                     - self.pool_baseline.mean,
             );
             readings.insert(
-                "dpcInterrupt".into(),
+                DPC_KEY.into(),
                 ratio(system.dpc_rate, settings.dpc_rate)
                     .max(ratio(system.interrupt_rate, settings.interrupt_rate)),
             );
+        }
+
+        // The learned-p95 clock runs whether or not the configured threshold
+        // is breached: it measures the machine against itself, and it has to
+        // be honest about when the current run started.
+        let above_p95 = self
+            .interrupts
+            .dpc_p95
+            .is_some_and(|p95| system.dpc_rate >= p95)
+            || self
+                .interrupts
+                .interrupt_p95
+                .is_some_and(|p95| system.interrupt_rate >= p95);
+        if above_p95 {
+            self.above_p95_since.get_or_insert(system.timestamp_ms);
+        } else {
+            self.above_p95_since = None;
         }
 
         if system.disk_latency_ms >= settings.disk_latency_ms {
@@ -588,6 +716,7 @@ impl AlertEngine {
                 entry: Some(settings.disk_latency_ms),
                 exit_ratio: EXIT_RATIO,
                 material_change: false,
+                quality: CandidateQuality::default(),
             });
         }
 
@@ -616,13 +745,33 @@ impl AlertEngine {
                 entry: Some(settings.kernel_pool_growth_mb * MIB),
                 exit_ratio: EXIT_RATIO,
                 material_change: false,
+                quality: CandidateQuality::default(),
             });
         }
 
         if system.dpc_rate >= settings.dpc_rate || system.interrupt_rate >= settings.interrupt_rate
         {
+            // The incident opens on the configured rate, but notification
+            // needs evidence the rate alone cannot give (spec Phase D):
+            // either an attribution that held across captures, or a quarter
+            // of an hour above the machine's own learned p95 with something
+            // independent agreeing. `user_impact >= 0.3` is one signal --
+            // the score closes half the remaining gap per signal, so the
+            // first one is 0.5.
+            let user_impact_signals = self.user_impact_signals();
+            let sustained = self
+                .above_p95_since
+                .is_some_and(|since| system.timestamp_ms - since >= SUSTAINED_P95_MS);
+            let corroborated =
+                self.interrupts.corroborating_signals >= 1 || user_impact_signals >= 1;
+            let quality = CandidateQuality {
+                attribution_stable: self.interrupts.verdict.attribution_stable(),
+                corroborating_signals: self.interrupts.corroborating_signals,
+                user_impact_signals,
+                notify: self.interrupts.verdict.is_attributed() || (sustained && corroborated),
+            };
             candidates.push(Candidate {
-                key: "dpcInterrupt".into(),
+                key: DPC_KEY.into(),
                 kind: "dpcInterrupt",
                 severity: Severity::Warning,
                 required_samples: settings.sustained_samples,
@@ -637,7 +786,11 @@ impl AlertEngine {
                 recommendation: "Check recently connected devices and update OEM chipset, network, audio, and storage drivers. Do not disable devices until you have identified a repeatable cause.".into(),
                 entry: Some(1.0),
                 exit_ratio: EXIT_RATIO,
+                // The verdict change is latched on arrival instead (it can
+                // land while no candidate is firing), so the candidate never
+                // has to carry it.
                 material_change: false,
+                quality,
             });
         }
 
@@ -662,6 +815,7 @@ impl AlertEngine {
             terms.window_ms =
                 Some(i64::from(candidate.required_samples) * settings.sample_interval_ms as i64);
             terms.material_change = candidate.material_change;
+            terms.quality = candidate.quality;
             if *streak < candidate.required_samples {
                 continue;
             }
@@ -803,23 +957,38 @@ impl AlertEngine {
                 sustained_window_ms: window_ms,
                 breach_duration_ms: system.timestamp_ms - breach_since_ms,
                 baseline_maturity: calibration.baseline_maturity,
-                // Detector-supplied corroboration, user impact, and
-                // attribution stability are Phase D's to plumb; until then
-                // an unknown attribution scores neutral and the two signal
-                // counts score honestly empty.
-                attribution_stable: None,
-                corroborating_signals: 0,
-                user_impact_signals: 0,
+                // Detector-supplied, carried here from the candidate that
+                // last fired for this incident. A detector with nothing to
+                // say leaves an unknown attribution (which scores neutral)
+                // and two honestly empty signal counts.
+                attribution_stable: terms.quality.attribution_stable,
+                corroborating_signals: terms.quality.corroborating_signals,
+                user_impact_signals: terms.quality.user_impact_signals,
                 notified_before: notified.is_some(),
                 last_notified_ms: notified.map(|memory| memory.at_ms),
             });
+            // A confident DPC verdict change may have arrived on a sample
+            // with no candidate to carry it, so the latch is redeemed here,
+            // at the first pass that actually scores the incident.
+            let material_change = terms.material_change
+                || (key.as_str() == DPC_KEY && std::mem::take(&mut self.pending_verdict_change));
             let decision = decide(
                 alert,
                 &quality,
                 calibration.learning,
                 previous.get(key),
-                terms.material_change,
+                material_change,
             );
+            // The detector's own bar, applied after the generic floors and
+            // only ever downward.
+            let decision = if terms.quality.notify {
+                decision
+            } else {
+                NotifyDecision {
+                    notify: false,
+                    bump_generation: false,
+                }
+            };
             let before = (alert.quality, alert.notify, alert.notify_generation);
             alert.quality = quality;
             alert.notify = decision.notify;
@@ -1041,8 +1210,10 @@ fn process_candidate(
         // `Candidate::with_entry`.
         entry: None,
         exit_ratio: EXIT_RATIO,
-        // No detector sets this yet; Phase D does.
+        // Per-process detectors have no attribution machinery and no veto of
+        // their own; the DPC detector builds its candidate by hand.
         material_change: false,
+        quality: CandidateQuality::default(),
     }
 }
 
@@ -1057,6 +1228,7 @@ fn evidence(label: impl Into<String>, value: impl Into<String>) -> Evidence {
 mod tests {
     use super::*;
     use crate::models::IncidentState;
+    use crate::quality::{CONFIDENCE_FLOOR, PERSISTENCE_FLOOR};
 
     fn process(timestamp_ms: i64, cpu: f64, memory_mb: u64) -> ProcessMetric {
         ProcessMetric {
@@ -1881,5 +2053,253 @@ mod tests {
             });
         }
         assert!(collector_working_set_growth(&history).is_none());
+    }
+
+    const DPC_TITLE: &str = "High DPC or interrupt activity";
+
+    /// A system sample whose DPC rate breaches the configured limit by the
+    /// stated factor. `1.0` is exactly the entry threshold; `0.9` sits inside
+    /// the hysteresis band (below entry, above 85% of it), where the incident
+    /// stays open with no candidate to carry anything.
+    fn dpc_system(settings: &Settings, timestamp_ms: i64, factor: f64) -> SystemMetric {
+        SystemMetric {
+            timestamp_ms,
+            dpc_rate: settings.dpc_rate * factor,
+            ..SystemMetric::default()
+        }
+    }
+
+    /// Drive `count` DPC samples one interval apart, returning the incident's
+    /// state after the last one.
+    fn drive_dpc(
+        engine: &mut AlertEngine,
+        settings: &Settings,
+        start_ms: i64,
+        count: i64,
+        factor: f64,
+    ) -> Option<Alert> {
+        for index in 0..count {
+            let timestamp_ms = start_ms + index * settings.sample_interval_ms as i64;
+            engine.evaluate(
+                &dpc_system(settings, timestamp_ms, factor),
+                &[],
+                settings,
+                Calibration::default(),
+            );
+        }
+        engine.active.get(DPC_KEY).cloned()
+    }
+
+    fn repeatable(family: &str) -> InterruptContext {
+        InterruptContext {
+            verdict: VerdictState::Repeatable {
+                driver_family: family.into(),
+            },
+            ..InterruptContext::default()
+        }
+    }
+
+    #[test]
+    fn alternating_low_confidence_attribution_is_one_silent_incident() {
+        // The interrupt engine reports `SingleCapture` for exactly the field
+        // report's storage -> graphics -> network rotation (asserted over
+        // real captures in `interrupts.rs`). Here that verdict has to buy
+        // nothing: one incident, one title, never a notification.
+        let settings = lifecycle_settings();
+        let mut engine = AlertEngine::default();
+        engine.observe_interrupts(InterruptContext {
+            verdict: VerdictState::SingleCapture,
+            ..InterruptContext::default()
+        });
+        let mut ids = HashSet::new();
+        let mut titles = HashSet::new();
+        let mut rates = HashSet::new();
+        for index in 0..30 {
+            let timestamp_ms = index * settings.sample_interval_ms as i64;
+            // The reading wanders; the evidence has to follow it.
+            let factor = 5.0 + (index % 3) as f64;
+            let evaluation = engine.evaluate(
+                &dpc_system(&settings, timestamp_ms, factor),
+                &[],
+                &settings,
+                Calibration::default(),
+            );
+            for alert in evaluation
+                .active
+                .iter()
+                .filter(|a| a.kind == "dpcInterrupt")
+            {
+                ids.insert(alert.id.clone());
+                titles.insert(alert.title.clone());
+                rates.extend(
+                    alert
+                        .evidence
+                        .iter()
+                        .filter(|row| row.label == "DPC rate")
+                        .map(|row| row.value.clone()),
+                );
+                assert!(
+                    !alert.notify,
+                    "an attribution that never held cannot notify: {:?}",
+                    alert.quality
+                );
+                assert_eq!(alert.notify_generation, 0);
+            }
+        }
+        assert_eq!(ids.len(), 1, "one incident, not one per label");
+        assert_eq!(titles.len(), 1);
+        assert_eq!(titles.into_iter().next().as_deref(), Some(DPC_TITLE));
+        assert_eq!(rates.len(), 3, "evidence keeps tracking the live reading");
+        // Suppression is a notification decision, and an explainable one: the
+        // incident is scored and recorded either way.
+        let incident = engine.active.get(DPC_KEY).expect("still open");
+        assert!(incident.quality.persistence > PERSISTENCE_FLOOR);
+        assert!(
+            incident.quality.confidence >= CONFIDENCE_FLOOR,
+            "the generic floors would have let it through: {}",
+            incident.quality.confidence
+        );
+    }
+
+    #[test]
+    fn a_repeatable_driver_family_verdict_notifies_once() {
+        let settings = lifecycle_settings();
+        let mut engine = AlertEngine::default();
+        engine.observe_interrupts(repeatable("storage"));
+        let opened = drive_dpc(&mut engine, &settings, 0, 3, 5.0).expect("the incident opens");
+        assert!(
+            !opened.notify,
+            "one sustained window is not yet persistent enough"
+        );
+
+        let notified =
+            drive_dpc(&mut engine, &settings, 6_000, 4, 5.0).expect("the incident stays open");
+        assert!(notified.notify, "a repeatable family carries the finding");
+        assert_eq!(
+            notified.notify_generation, 0,
+            "a first notification pops on an unseen (id, generation); it never bumps"
+        );
+
+        // Further agreeing captures say nothing new.
+        let later = drive_dpc(&mut engine, &settings, 20_000, 10, 5.0).expect("still open");
+        assert_eq!(later.id, notified.id);
+        assert!(later.notify);
+        assert_eq!(
+            later.notify_generation, 0,
+            "agreeing captures neither bump nor re-pop"
+        );
+    }
+
+    #[test]
+    fn sustained_p95_with_corroboration_notifies_without_attribution() {
+        // Sixteen minutes above the machine's learned p95 with no usable
+        // capture at all: the rate alone must not notify, but the rate plus
+        // something else agreeing must.
+        let settings = lifecycle_settings();
+        let sustained_samples = (SUSTAINED_P95_MS + 60_000) / settings.sample_interval_ms as i64;
+        let run = |corroborating_signals: u32, hung: bool| -> Alert {
+            let mut engine = AlertEngine::default();
+            engine.observe_interrupts(InterruptContext {
+                verdict: VerdictState::NoCapture,
+                corroborating_signals,
+                dpc_p95: Some(settings.dpc_rate * 2.0),
+                interrupt_p95: None,
+            });
+            for index in 0..sustained_samples {
+                let timestamp_ms = index * settings.sample_interval_ms as i64;
+                let mut worker = process(timestamp_ms, 1.0, 20);
+                worker.has_visible_window = hung;
+                worker.responsive = !hung;
+                engine.evaluate(
+                    &dpc_system(&settings, timestamp_ms, 3.0),
+                    &[worker],
+                    &settings,
+                    Calibration::default(),
+                );
+            }
+            engine.active.get(DPC_KEY).cloned().expect("open incident")
+        };
+        let alone = run(0, false);
+        assert!(
+            !alone.notify,
+            "a rate above p95 with nothing agreeing stays history-only"
+        );
+        assert!(
+            alone.quality.confidence >= CONFIDENCE_FLOOR,
+            "again, not the generic floors doing the suppressing: {}",
+            alone.quality.confidence
+        );
+        assert!(
+            run(1, false).notify,
+            "correlated device activity corroborates it"
+        );
+        let impacted = run(0, true);
+        assert!(
+            impacted.notify,
+            "a hung window is user impact, which corroborates it too"
+        );
+        assert!(impacted.quality.user_impact >= 0.3);
+    }
+
+    #[test]
+    fn a_confident_verdict_change_renotifies_the_same_incident() {
+        let settings = lifecycle_settings();
+        let mut engine = AlertEngine::default();
+        engine.observe_interrupts(repeatable("storage"));
+        let before = drive_dpc(&mut engine, &settings, 0, 8, 5.0).expect("open");
+        assert!(before.notify);
+
+        engine.observe_interrupts(InterruptContext {
+            verdict: VerdictState::ChangedConfidently {
+                from: "storage".into(),
+                to: "gpu".into(),
+            },
+            ..InterruptContext::default()
+        });
+        let changed = drive_dpc(&mut engine, &settings, 16_000, 1, 5.0).expect("still open");
+        assert_eq!(
+            changed.id, before.id,
+            "attribution never splits the incident"
+        );
+        assert_eq!(changed.title, DPC_TITLE, "the title never moves either");
+        assert_eq!(changed.state, IncidentState::Open);
+        assert!(changed.notify);
+        assert_eq!(
+            changed.notify_generation,
+            before.notify_generation + 1,
+            "a confident change is a materially changed fingerprint"
+        );
+
+        // The change is spent: the same standing verdict does not keep popping.
+        let settled = drive_dpc(&mut engine, &settings, 18_000, 5, 5.0).expect("still open");
+        assert_eq!(settled.notify_generation, changed.notify_generation);
+    }
+
+    #[test]
+    fn a_confident_verdict_change_lands_through_a_hysteresis_hold() {
+        // The verdict arrives on a sample where the rate has dipped into the
+        // hysteresis band: the incident is held open with no candidate, so
+        // there is nothing to carry the flag unless the engine latches it.
+        let settings = lifecycle_settings();
+        let mut engine = AlertEngine::default();
+        engine.observe_interrupts(repeatable("storage"));
+        let before = drive_dpc(&mut engine, &settings, 0, 8, 5.0).expect("open");
+        assert!(before.notify);
+
+        engine.observe_interrupts(InterruptContext {
+            verdict: VerdictState::ChangedConfidently {
+                from: "storage".into(),
+                to: "gpu".into(),
+            },
+            ..InterruptContext::default()
+        });
+        let held = drive_dpc(&mut engine, &settings, 16_000, 2, 0.9).expect("held by hysteresis");
+        assert_eq!(held.id, before.id);
+        assert!(held.notify);
+        assert_eq!(
+            held.notify_generation,
+            before.notify_generation + 1,
+            "a change that lands during a hold must not be dropped"
+        );
     }
 }

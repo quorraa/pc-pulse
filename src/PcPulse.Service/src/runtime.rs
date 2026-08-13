@@ -1,5 +1,5 @@
 use crate::{
-    alerting::{AlertEngine, QUIET_PERIOD_MS},
+    alerting::{AlertEngine, InterruptContext, QUIET_PERIOD_MS},
     analysis::{AgentContextSource, build_agent_context},
     baselines::BaselineStore,
     config::Settings,
@@ -419,11 +419,24 @@ fn sampling_loop(state: &Arc<AppState>, stop: crossbeam_channel::Receiver<()>) -
             learning: baselines.machine.is_learning(timestamp_ms),
             baseline_maturity: baselines.machine.maturity(timestamp_ms),
         };
-        let mut evaluation = state
-            .alerts
-            .lock()
-            .map_err(|_| anyhow!("alert lock poisoned"))?
-            .evaluate(&system, &processes, &settings, calibration);
+        let mut evaluation = {
+            let mut alerts = state
+                .alerts
+                .lock()
+                .map_err(|_| anyhow!("alert lock poisoned"))?;
+            // What the interrupt engine has made of the DPC finding so far,
+            // and what the machine considers a normal kernel rate. Both gate
+            // whether a DPC incident is worth interrupting the user for; the
+            // verdict is the previous sample's, since a capture only runs
+            // once a finding exists.
+            alerts.observe_interrupts(InterruptContext {
+                verdict: interrupts.verdict_state(),
+                corroborating_signals: interrupts.corroborating_signals(),
+                dpc_p95: baselines.machine.dpc_rate.quantile(0.95),
+                interrupt_p95: baselines.machine.interrupt_rate.quantile(0.95),
+            });
+            alerts.evaluate(&system, &processes, &settings, calibration)
+        };
         baselines
             .machine
             .observe(&system, processes.len(), timestamp_ms);
