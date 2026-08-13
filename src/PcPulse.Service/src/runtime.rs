@@ -17,7 +17,7 @@ use crate::{
         ProcessNode, Snapshot,
     },
     pipe,
-    quality::Calibration,
+    quality::{Calibration, derive_offsets},
     storage::Storage,
 };
 use anyhow::{Result, anyhow};
@@ -147,6 +147,12 @@ impl AppState {
                     logs,
                     log_status: status,
                     alerts,
+                    rating_offsets: self
+                        .alerts
+                        .lock()
+                        .map_err(|_| anyhow!("alert lock poisoned"))?
+                        .rating_offsets()
+                        .entries(),
                 });
                 self.remember_context(&context)?;
                 Ok(serde_json::to_value(context)?)
@@ -243,7 +249,29 @@ struct IssuedContext {
     evidence_refs: HashSet<String>,
 }
 
+/// How much rating history the notification policy is derived from. Ratings
+/// decay with a 30-day half-life, so anything past the newest couple hundred
+/// is arithmetically inaudible long before it is dropped -- and the bound
+/// keeps a machine with a thousand stored ratings from re-deriving the whole
+/// table on every new one.
+const POLICY_OFFSET_RATINGS: usize = 200;
+
 impl AppState {
+    /// Re-derive the notify-floor offsets from the rating history and hand
+    /// them to the engine. Called once at startup and again whenever a new
+    /// rating lands, because the ratings table is the single source of truth
+    /// and [`derive_offsets`] is a pure function over it -- there is no
+    /// second store to keep in step, only this cache to refresh.
+    pub fn refresh_rating_offsets(&self) -> Result<()> {
+        let ratings = self.storage.ratings(POLICY_OFFSET_RATINGS)?;
+        let offsets = derive_offsets(&ratings, Utc::now().timestamp_millis());
+        self.alerts
+            .lock()
+            .map_err(|_| anyhow!("alert lock poisoned"))?
+            .observe_rating_offsets(offsets);
+        Ok(())
+    }
+
     fn remember_context(&self, context: &crate::models::AgentContext) -> Result<()> {
         let evidence_refs = context
             .process_suspects
@@ -337,6 +365,9 @@ pub fn run(data_dir: &Path, stop: crossbeam_channel::Receiver<()>) -> Result<()>
         settings_path,
         live: LiveEngine::windows(),
     });
+    // What the user's past ratings have made of the notification policy. Read
+    // once here so the first evaluation after a restart already honors it.
+    state.refresh_rating_offsets()?;
     let pipe_stop = Arc::new(AtomicBool::new(false));
     let pipe_state = Arc::clone(&state);
     let pipe_stop_worker = Arc::clone(&pipe_stop);
@@ -419,6 +450,16 @@ fn sampling_loop(state: &Arc<AppState>, stop: crossbeam_channel::Receiver<()>) -
             learning: baselines.machine.is_learning(),
             baseline_maturity: baselines.machine.maturity(),
             names: Some(&baselines),
+            // How demanding the workload is right now: the bucket the user's
+            // rating offsets are read against, so a rating only ever adjusts
+            // the policy under the load it was given at.
+            //
+            // TODO(ratings): replace with
+            // `ratings::demand_bucket(recent, &baselines.machine).0` once
+            // that module lands. Until then this is the default bucket,
+            // which is only ever correct on an unrated machine -- where
+            // every lookup answers 0.0 and the bucket cannot matter.
+            demand: Calibration::default().demand,
         };
         // Copied out so the snapshot block below can reuse this sample's
         // learning state without `calibration`'s `&baselines` borrow living
@@ -633,7 +674,8 @@ fn build_node(
 mod tests {
     use super::*;
     use crate::models::{
-        DiagnosticLogStatus, HistoryResponse, OptimizationPlan, PlanAgent, PlanConstraints,
+        DemandBucket, DemandDetail, DiagnosticLogStatus, HistoryResponse, OpenIncidentRef,
+        OptimizationPlan, PlanAgent, PlanConstraints, Rating, RatingVerdict, Severity,
     };
 
     fn process(pid: u32, parent_pid: u32) -> ProcessMetric {
@@ -659,6 +701,57 @@ mod tests {
             launch_duration_ms: None,
             is_agent_candidate: false,
         }
+    }
+
+    #[test]
+    fn stored_ratings_reach_the_engine_and_the_agent_context() {
+        // The engine's copy of the policy offsets is a cache of a pure
+        // function over the ratings table, so a restart -- or any new rating
+        // -- has to be able to rebuild it from storage alone.
+        let directory = tempfile::tempdir().unwrap();
+        let state = test_state(&directory);
+        assert!(
+            state.alerts.lock().unwrap().rating_offsets().is_empty(),
+            "a machine nobody has rated carries no offsets"
+        );
+
+        let now_ms = Utc::now().timestamp_millis();
+        state
+            .storage
+            .save_rating(&Rating {
+                id: "rating-1".into(),
+                at_ms: now_ms,
+                verdict: RatingVerdict::Good,
+                demand: DemandBucket::Heavy,
+                demand_detail: DemandDetail {
+                    cpu_percent: 0.0,
+                    cpu_percentile: None,
+                    memory_occupancy_pct: 0.0,
+                    memory_percentile: None,
+                    disk_latency_ms: 0.0,
+                    disk_percentile: None,
+                    io_bytes_per_sec: 0.0,
+                    io_percentile: None,
+                },
+                digest: serde_json::Value::Null,
+                open_incidents: vec![OpenIncidentRef {
+                    fingerprint: "collectorBudget:1".into(),
+                    kind: "collectorBudget".into(),
+                    severity: Severity::Warning,
+                    notify: true,
+                    acknowledged: false,
+                }],
+                during_learning: false,
+                unexplained: false,
+            })
+            .unwrap();
+        state.refresh_rating_offsets().unwrap();
+
+        let entries = state.alerts.lock().unwrap().rating_offsets().entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].kind, "collectorBudget");
+        assert_eq!(entries[0].bucket, DemandBucket::Heavy);
+        assert!((entries[0].offset - 0.05).abs() < 1e-9);
     }
 
     #[test]
@@ -783,6 +876,7 @@ mod tests {
             logs: Vec::new(),
             log_status: DiagnosticLogStatus::default(),
             alerts: Vec::new(),
+            rating_offsets: Vec::new(),
         });
         state.remember_context(&context).unwrap();
         let mut plan = OptimizationPlan {

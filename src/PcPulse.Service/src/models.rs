@@ -652,6 +652,12 @@ pub struct AgentContext {
     pub process_suspects: Vec<AgentProcessRollup>,
     pub diagnostic_log_rollups: Vec<AgentLogRollup>,
     pub recent_alerts: Vec<Alert>,
+    /// Non-zero notify-floor adjustments the user's performance ratings have
+    /// earned, per alert kind and demand bucket. Empty on a machine nobody
+    /// has rated, and `#[serde(default)]` so a context written before this
+    /// field existed still deserializes.
+    #[serde(default)]
+    pub rating_offsets: Vec<RatingOffset>,
     pub limitations: Vec<String>,
 }
 
@@ -837,8 +843,9 @@ pub enum RatingVerdict {
     Sluggish,
 }
 
-/// Coarse system-demand bucket for a rating record.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+/// Coarse system-demand bucket for a rating record. `Hash` because the
+/// notification policy keys its rating offsets by (kind, bucket).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "camelCase")]
 pub enum DemandBucket {
     Light,
@@ -887,6 +894,18 @@ pub struct Rating {
     pub open_incidents: Vec<OpenIncidentRef>,
     pub during_learning: bool,
     pub unexplained: bool,
+}
+
+/// One effective notify-floor adjustment the user's ratings have earned, as
+/// surfaced to the agent and the incidents detail pane. `kind` is
+/// [`crate::quality::ALL_KINDS`] when the adjustment applies to every kind in
+/// its bucket, which is what an unexplained `sluggish` rating produces.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct RatingOffset {
+    pub kind: String,
+    pub bucket: DemandBucket,
+    pub offset: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
