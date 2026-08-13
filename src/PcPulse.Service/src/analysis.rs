@@ -149,7 +149,11 @@ fn current_pressure(process: &ProcessMetric, settings: &Settings) -> f64 {
         + if !process.responsive { 25.0 } else { 0.0 }
 }
 
-fn rollup_system(history: &HistoryResponse) -> AgentSystemRollup {
+/// `pub(crate)` (rather than private) so `ratings.rs` can build the same
+/// trailing-window system percentiles for a rating's performance digest
+/// instead of duplicating this logic -- the digest is a compacted sibling of
+/// the agent-context evidence bundle.
+pub(crate) fn rollup_system(history: &HistoryResponse) -> AgentSystemRollup {
     let cpu: Vec<f64> = history
         .system
         .iter()
@@ -210,7 +214,10 @@ struct ProcessAccumulator {
     working_set_max: u64,
 }
 
-fn rollup_processes(
+/// `pub(crate)` for the same reason as [`rollup_system`]: `ratings.rs` reuses
+/// this pressure-scored, redacted process rollup for the top-processes
+/// section of a rating's performance digest.
+pub(crate) fn rollup_processes(
     processes: &[ProcessMetric],
     snapshot: &Snapshot,
     settings: &Settings,
