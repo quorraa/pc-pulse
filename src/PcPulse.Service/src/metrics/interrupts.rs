@@ -400,8 +400,9 @@ pub enum VerdictState {
     /// is no attribution to judge -- not a bad one.
     #[default]
     NoCapture,
-    /// A modal driver exists but has not held: too few captures, a
-    /// fragmented field, or a leader that keeps changing.
+    /// Attributed, but not yet held: a modal driver exists and has not
+    /// stood up across captures -- too few traces, a fragmented field, or a
+    /// leader that keeps changing.
     SingleCapture,
     /// One device family leads a majority of the capture history across at
     /// least [`REPEATABLE_CAPTURES`] captures, and the confidence rubric
@@ -953,19 +954,37 @@ impl<S: InterruptSource> InterruptEngine<S> {
             .map_or(VerdictState::NoCapture, |state| state.verdict.clone())
     }
 
-    /// Independent co-signals corroborating the live finding: a class-matched
-    /// activity correlation at or above the rubric's floor is one. Pure
-    /// memory work over the activity ring, like the rest of the correlation
-    /// path.
+    /// Independent co-signals corroborating the live finding: an activity
+    /// correlation at or above the rubric's floor is one. Pure memory work
+    /// over the activity ring, like the rest of the correlation path.
+    ///
+    /// With a verdict class in hand the correlation is class-matched, which
+    /// is the stronger claim -- storage attribution against disk activity.
+    /// With no class at all (no capture yet, or an ETW session the machine
+    /// refuses to grant, which is exactly the machine this path exists for)
+    /// there is nothing to match, so every activity series is tried and the
+    /// strongest agreement counts. That is weaker evidence, and it is why it
+    /// only ever *contributes* to the sustained-p95 gate rather than opening
+    /// it alone.
     pub fn corroborating_signals(&self) -> u32 {
-        let Some(class) = self.live_finding().and_then(|state| state.class) else {
-            return 0;
+        let correlation = match self.live_finding().and_then(|state| state.class) {
+            Some(class) => class_correlation(&self.activity, class).matched_r(),
+            None => self.unclassed_correlation(),
         };
-        u32::from(
-            class_correlation(&self.activity, class)
-                .matched_r()
-                .is_some_and(|r| r >= CONFIDENCE_R_FLOOR),
-        )
+        u32::from(correlation.is_some_and(|r| r >= CONFIDENCE_R_FLOOR))
+    }
+
+    /// The strongest correlation between the kernel rates and *any* device
+    /// activity series. Ranked by signed r, not magnitude: the question this
+    /// answers is whether something moves *with* the interrupt load, and a
+    /// strong inverse correlation is not that.
+    fn unclassed_correlation(&self) -> Option<f64> {
+        [DeviceClass::Storage, DeviceClass::Network, DeviceClass::Gpu]
+            .into_iter()
+            .filter_map(|class| class_correlation(&self.activity, class).matched_r())
+            .fold(None, |best: Option<f64>, r| {
+                Some(best.map_or(r, |current| current.max(r)))
+            })
     }
 
     fn live_finding(&self) -> Option<&FindingState> {
@@ -2276,7 +2295,11 @@ mod tests {
             VerdictState::NoCapture,
             "no capture, no verdict"
         );
-        assert_eq!(engine.corroborating_signals(), 0);
+        assert_eq!(
+            engine.corroborating_signals(),
+            1,
+            "with no class to match, any agreeing activity series counts"
+        );
 
         // One trace is diagnostic evidence only.
         engine.source_mut().capture = storage.clone();
@@ -2291,7 +2314,9 @@ mod tests {
                 driver_family: "storage".into()
             }
         );
-        // Storage activity is flat in this window, so nothing corroborates.
+        // Once a class exists the correlation must match it, and storage
+        // activity is flat in this window: the class-matched path is the
+        // stricter one.
         assert_eq!(engine.corroborating_signals(), 0);
 
         // The cause moves to the GPU. While the history is evenly split the
@@ -2322,6 +2347,54 @@ mod tests {
         );
         // The GPU series does track the interrupt rate in this window.
         assert_eq!(engine.corroborating_signals(), 1);
+    }
+
+    /// Feeds a five-minute window where the DPC rate tracks disk traffic.
+    fn feed_disk_correlated_activity<S: InterruptSource>(engine: &mut InterruptEngine<S>) {
+        for index in 0..150_i64 {
+            let bytes = (index % 50) as f64 * 100_000.0;
+            let mut sample = activity_sample(index * 2_000);
+            sample.disk_read_bytes_per_sec = bytes;
+            sample.disk_write_bytes_per_sec = 0.0;
+            sample.dpc_rate = 4_000.0 + bytes / 1_000.0;
+            engine.record_activity(&sample, None);
+        }
+    }
+
+    /// The machine this path exists for: the ETW session is refused, so
+    /// there is never a verdict and never a class to match a correlation
+    /// against. Corroboration still has to be reachable, or the sustained-p95
+    /// notification path can only ever open on user impact.
+    #[test]
+    fn corroboration_survives_a_machine_that_never_attributes() {
+        let mut engine = InterruptEngine::new(StubSource::default());
+        engine.source_mut().fail_capture = true;
+        let alerts = [dpc_alert("d1")];
+        engine.observe(&alerts, 0);
+        assert_eq!(engine.verdict_state(), VerdictState::NoCapture);
+        assert_eq!(
+            engine.corroborating_signals(),
+            0,
+            "an empty activity ring corroborates nothing"
+        );
+
+        feed_disk_correlated_activity(&mut engine);
+        assert_eq!(engine.verdict_state(), VerdictState::NoCapture);
+        assert_eq!(
+            engine.corroborating_signals(),
+            1,
+            "disk traffic tracking the DPC rate is a co-signal even unattributed"
+        );
+
+        // A flat machine still corroborates nothing: the fallback is a
+        // correlation, not a free pass.
+        let mut flat = InterruptEngine::new(StubSource::default());
+        flat.source_mut().fail_capture = true;
+        flat.observe(&alerts, 0);
+        for index in 0..150_i64 {
+            flat.record_activity(&activity_sample(index * 2_000), None);
+        }
+        assert_eq!(flat.corroborating_signals(), 0);
     }
 
     #[test]
