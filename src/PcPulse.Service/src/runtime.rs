@@ -416,14 +416,16 @@ fn sampling_loop(state: &Arc<AppState>, stop: crossbeam_channel::Receiver<()>) -
         // folded into it: an incident is judged against what was learned
         // before it, never against itself.
         let calibration = Calibration {
-            learning: baselines.machine.is_learning(timestamp_ms),
-            baseline_maturity: baselines.machine.maturity(timestamp_ms),
+            learning: baselines.machine.is_learning(),
+            baseline_maturity: baselines.machine.maturity(),
             names: Some(&baselines),
         };
         // Copied out so the snapshot block below can reuse this sample's
         // learning state without `calibration`'s `&baselines` borrow living
         // past the mutable baseline updates that follow the evaluation.
-        let (learning, baseline_maturity) = (calibration.learning, calibration.baseline_maturity);
+        let learning = calibration.learning;
+        let learning_progress_pct = baselines.machine.learning_progress_pct();
+        let learning_remaining_ms = baselines.machine.learning_remaining_ms();
         let (mut evaluation, quarantine) = {
             let mut engine = state
                 .alerts
@@ -497,14 +499,18 @@ fn sampling_loop(state: &Arc<AppState>, stop: crossbeam_channel::Receiver<()>) -
             snapshot.processes = processes.clone();
             snapshot.active_alerts = evaluation.active;
             snapshot.hardware = hardware;
-            // Computed above from this same `timestamp_ms`, before this
-            // sample folded into the baseline -- reuse it rather than
-            // re-deriving learning state from a baseline that has since
-            // observed one more point.
+            // Captured above, before this sample folded into the baseline --
+            // reuse it rather than re-deriving learning state from a baseline
+            // that has since observed one more point.
             snapshot.learning = learning;
-            snapshot.learning_hours_left = learning.then(|| {
-                let remaining_fraction = (1.0 - baseline_maturity).clamp(0.0, 1.0);
-                (remaining_fraction * 24.0).ceil() as u8
+            snapshot.learning_percent = learning.then_some(learning_progress_pct);
+            // Observed minutes still owed, rounded up so a partial minute
+            // still reads as time remaining. One learning period is 1 440
+            // minutes, comfortably inside u16.
+            snapshot.learning_minutes_left = learning.then(|| {
+                (learning_remaining_ms.max(0) as u64)
+                    .div_ceil(60_000)
+                    .min(u16::MAX as u64) as u16
             });
         }
         if Instant::now() >= next_system_write {

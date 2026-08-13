@@ -114,7 +114,13 @@ Inventory is probed once at service start and re-probed at most once a day (stat
 
 ## Learning state
 
-`getSnapshot`'s top-level payload gained `learning: bool` (default `false`) and `learningHoursLeft: number | null` (default `null`), both additive and absent-compatible with snapshots from services older than alert calibration. `learning` is true while the machine-wide baseline is still younger than the notification policy's learning period (24 hours from first observation); `learningHoursLeft` counts down the remaining hours and is `null` once the baseline has matured. During the learning period the notification floor is raised — only a high-confidence Critical incident notifies — while every incident still accrues normally in history.
+`getSnapshot`'s top-level payload gained `learning: bool` (default `false`), `learningPercent: number | null` (default `null`), and `learningMinutesLeft: number | null` (default `null`) — all additive and absent-compatible with snapshots from services older than alert calibration.
+
+The learning period is **24 hours of observed time**, not 24 hours of wall clock. The service accumulates observed time one inter-sample gap at a time, and each gap is credited at most 60 seconds, so time the machine spends asleep, hibernating, powered off, or with the service stopped does not count toward maturity. A machine watched for an hour and then suspended overnight wakes up with roughly an hour of learning behind it, not a day's worth.
+
+`learning` is true while the machine-wide baseline has observed less than that period. `learningPercent` is progress as a whole percent (floored, 0–100) and `learningMinutesLeft` is the observed time still owed, in minutes (rounded up) — both `null` once the baseline has matured. Because the countdown is in observed rather than elapsed time, clients should present it as monitoring still to be done rather than as a wall-clock deadline.
+
+During the learning period the notification floor is raised — only a high-confidence Critical incident notifies — while every incident still accrues normally in history.
 
 `terminateProcess` is rejected unless `confirmed` is exactly `true`. The TUI sends it only after the user types the selected process's exact PID. The service independently rejects system/idle PIDs and its own PID.
 

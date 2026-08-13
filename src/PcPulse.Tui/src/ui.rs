@@ -6326,10 +6326,15 @@ fn render_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
             ),
         ])
     } else if app.snapshot.as_ref().is_some_and(|snapshot| snapshot.learning) {
-        let hours_left = app
+        let percent = app
             .snapshot
             .as_ref()
-            .and_then(|snapshot| snapshot.learning_hours_left)
+            .and_then(|snapshot| snapshot.learning_percent)
+            .unwrap_or(0);
+        let minutes_left = app
+            .snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.learning_minutes_left)
             .unwrap_or(0);
         Line::from(vec![
             Span::styled(
@@ -6337,7 +6342,7 @@ fn render_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
                 Style::default().fg(palette().bg).bg(palette().info).bold(),
             ),
             Span::styled(
-                format!("  learning your machine ({hours_left}h left)"),
+                format!("  {}", learning_status_text(percent, minutes_left)),
                 Style::default().fg(palette().muted),
             ),
         ])
@@ -6360,6 +6365,25 @@ fn render_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
         ),
         area,
     );
+}
+
+/// The statusline's learning line: how far the machine baseline has got and
+/// how much more *monitoring* (not wall-clock waiting) it still needs. The
+/// service counts only time it spends observing, so the phrasing avoids
+/// promising the operator that the countdown runs while the machine sleeps.
+/// Under an hour the remainder reads in plain minutes, so the last stretch
+/// visibly moves.
+fn learning_status_text(percent: u8, minutes_left: u16) -> String {
+    let hours = minutes_left / 60;
+    let minutes = minutes_left % 60;
+    let remaining = if hours == 0 {
+        format!("{minutes}m")
+    } else if minutes == 0 {
+        format!("{hours}h")
+    } else {
+        format!("{hours}h {minutes}m")
+    };
+    format!("learning your machine — {percent}% (~{remaining} of monitoring left)")
 }
 
 /// Per-page contextual hints, shared by the statusline footer and the
@@ -8732,7 +8756,8 @@ mod tests {
         {
             let snapshot = app.snapshot.as_mut().expect("snapshot");
             snapshot.learning = true;
-            snapshot.learning_hours_left = Some(18);
+            snapshot.learning_percent = Some(63);
+            snapshot.learning_minutes_left = Some(530);
         }
         let backend = render(&mut app);
         let text = buffer_text(backend.buffer());
@@ -8740,18 +8765,43 @@ mod tests {
             text.contains("learning your machine"),
             "learning statusline must render: {text}"
         );
+        assert!(text.contains("63%"), "learning percent must render: {text}");
         assert!(
-            text.contains("(18h left)"),
-            "hours-left must render: {text}"
+            text.contains("~8h 50m of monitoring left"),
+            "remaining monitoring time must render: {text}"
         );
 
         // Once learning completes the statusline reverts to its usual hint.
         let snapshot = app.snapshot.as_mut().expect("snapshot");
         snapshot.learning = false;
-        snapshot.learning_hours_left = None;
+        snapshot.learning_percent = None;
+        snapshot.learning_minutes_left = None;
         let backend = render(&mut app);
         let text = buffer_text(backend.buffer());
         assert!(!text.contains("learning your machine"), "{text}");
+    }
+
+    #[test]
+    fn learning_status_text_reads_in_hours_then_minutes() {
+        assert_eq!(
+            learning_status_text(63, 530),
+            "learning your machine — 63% (~8h 50m of monitoring left)"
+        );
+        // A whole number of hours drops the empty minutes.
+        assert_eq!(
+            learning_status_text(50, 720),
+            "learning your machine — 50% (~12h of monitoring left)"
+        );
+        // The final stretch reads in minutes so progress stays visible.
+        assert_eq!(
+            learning_status_text(97, 41),
+            "learning your machine — 97% (~41m of monitoring left)"
+        );
+        // A brand-new machine is honest about having learned nothing yet.
+        assert_eq!(
+            learning_status_text(0, 1_440),
+            "learning your machine — 0% (~24h of monitoring left)"
+        );
     }
 
     #[test]
@@ -8960,7 +9010,8 @@ mod tests {
             active_alerts: Vec::new(),
             hardware,
             learning: false,
-            learning_hours_left: None,
+            learning_percent: None,
+            learning_minutes_left: None,
         });
         app
     }

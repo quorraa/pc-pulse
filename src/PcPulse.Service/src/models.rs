@@ -440,20 +440,25 @@ pub struct Snapshot {
     /// the extra field.
     #[serde(default)]
     pub hardware: HardwareMetrics,
-    /// True while the machine-wide baseline (`BaselineStore::machine`) is
-    /// still younger than the notification policy's learning period, so
+    /// True while the machine-wide baseline (`BaselineStore::machine`) has
+    /// observed less than the notification policy's learning period, so
     /// clients can tell the operator the machine is still calibrating.
     /// Absent in snapshots from services older than alert calibration; the
     /// default `false` keeps old JSON deserializing as "done learning",
     /// matching the notification policy's own pre-calibration behavior.
     #[serde(default)]
     pub learning: bool,
-    /// Hours remaining in the learning period while `learning` is true;
-    /// `None` once the baseline has matured (and, via the same
-    /// default-absent compatibility as `learning`, for snapshots from
-    /// pre-calibration services).
+    /// Learning progress as a whole percent (floored) while `learning` is
+    /// true; `None` once the baseline has matured, and for snapshots from
+    /// services that predate the field.
     #[serde(default)]
-    pub learning_hours_left: Option<u8>,
+    pub learning_percent: Option<u8>,
+    /// Minutes of *observed* time still owed before the baseline matures.
+    /// Not a wall-clock countdown: a machine that sleeps makes no progress,
+    /// so this is time the collector must still spend watching. `None`
+    /// alongside `learning_percent`.
+    #[serde(default)]
+    pub learning_minutes_left: Option<u16>,
 }
 
 impl Default for Snapshot {
@@ -466,7 +471,8 @@ impl Default for Snapshot {
             active_alerts: Vec::new(),
             hardware: HardwareMetrics::default(),
             learning: false,
-            learning_hours_left: None,
+            learning_percent: None,
+            learning_minutes_left: None,
         }
     }
 }
@@ -949,13 +955,18 @@ mod tests {
     fn snapshot_learning_fields_round_trip_in_camel_case() {
         let snapshot = Snapshot {
             learning: true,
-            learning_hours_left: Some(18),
+            learning_percent: Some(63),
+            learning_minutes_left: Some(530),
             ..Snapshot::default()
         };
         let json = serde_json::to_string(&snapshot).unwrap();
         assert!(json.contains("\"learning\":true"), "wire: {json}");
         assert!(
-            json.contains("\"learningHoursLeft\":18"),
+            json.contains("\"learningPercent\":63"),
+            "camelCase wire name: {json}"
+        );
+        assert!(
+            json.contains("\"learningMinutesLeft\":530"),
             "camelCase wire name: {json}"
         );
         let restored: Snapshot = serde_json::from_str(&json).unwrap();
@@ -964,8 +975,8 @@ mod tests {
 
     #[test]
     fn snapshot_without_learning_fields_still_deserializes() {
-        // A snapshot serialized by a pre-calibration service has neither
-        // key; both must default to "done learning".
+        // A snapshot serialized by a pre-calibration service has none of the
+        // keys; all must default to "done learning".
         let json = serde_json::json!({
             "protocolVersion": crate::PROTOCOL_VERSION,
             "serviceVersion": "1.16.0",
@@ -975,7 +986,8 @@ mod tests {
         });
         let snapshot: Snapshot = serde_json::from_value(json).unwrap();
         assert!(!snapshot.learning);
-        assert_eq!(snapshot.learning_hours_left, None);
+        assert_eq!(snapshot.learning_percent, None);
+        assert_eq!(snapshot.learning_minutes_left, None);
     }
 
     #[test]
