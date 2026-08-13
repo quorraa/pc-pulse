@@ -143,6 +143,13 @@ impl MachineBaseline {
     pub fn is_learning(&self, now_ms: i64) -> bool {
         self.age_ms(now_ms) < LEARNING_PERIOD_MS
     }
+
+    /// Baseline age as a fraction of the learning period, 0-1: the
+    /// `baseline_maturity` the quality layer weighs into confidence. It lives
+    /// here rather than at the call site so the 24 h period is defined once.
+    pub fn maturity(&self, now_ms: i64) -> f64 {
+        (self.age_ms(now_ms) as f64 / LEARNING_PERIOD_MS as f64).clamp(0.0, 1.0)
+    }
 }
 
 /// EWMA mean/variance for one process-age bucket: CPU, working set,
@@ -287,6 +294,21 @@ impl BaselineStore {
         }
         store
     }
+
+    /// Rebuild a store from persisted rows, starting a fresh machine baseline
+    /// at `now_ms` when nothing was persisted for the machine scope.
+    /// [`Self::from_rows`] alone dates an absent machine baseline to the
+    /// epoch, which would read as decades of maturity on a machine that has
+    /// never learned anything -- the learning period has to start when
+    /// learning does.
+    pub fn restore(rows: Vec<(String, String)>, now_ms: i64) -> Self {
+        let had_machine = rows.iter().any(|(scope, _)| scope == "machine");
+        let mut store = Self::from_rows(rows);
+        if !had_machine {
+            store.machine = MachineBaseline::new(now_ms);
+        }
+        store
+    }
 }
 
 #[cfg(test)]
@@ -373,6 +395,23 @@ mod tests {
             }
         }
         assert!(store.tracked_names() <= 200);
+    }
+
+    #[test]
+    fn a_machine_with_nothing_persisted_starts_its_learning_period_now() {
+        let now_ms = 40 * 24 * 3_600_000;
+        // Nothing learned yet: the learning period starts now, and maturity
+        // with it -- not at the epoch.
+        let fresh = BaselineStore::restore(Vec::new(), now_ms);
+        assert!(fresh.machine.is_learning(now_ms));
+        assert!((fresh.machine.maturity(now_ms) - 0.0).abs() < 1e-9);
+        assert!((fresh.machine.maturity(now_ms + 12 * 3_600_000) - 0.5).abs() < 1e-9);
+        assert!(!fresh.machine.is_learning(now_ms + 25 * 3_600_000));
+        assert!((fresh.machine.maturity(now_ms + 100 * 3_600_000) - 1.0).abs() < 1e-9);
+        // A persisted machine row keeps its own start, so a restart resumes
+        // the baseline rather than restarting the learning period.
+        let restored = BaselineStore::restore(fresh.to_rows(), now_ms + 30 * 3_600_000);
+        assert!(!restored.machine.is_learning(now_ms + 30 * 3_600_000));
     }
 
     #[test]

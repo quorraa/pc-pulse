@@ -9,6 +9,7 @@ pub mod eventlog;
 pub mod metrics;
 pub mod models;
 pub mod pipe;
+pub mod quality;
 pub mod runtime;
 pub mod service;
 pub mod stats;

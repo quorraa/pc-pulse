@@ -216,6 +216,7 @@ impl<S: DumpSource> DumpEngine<S> {
         for id in resolved {
             if let Some(mut alert) = self.active.remove(&id) {
                 alert.resolved_at_ms = Some(now_ms);
+                alert.state = crate::models::IncidentState::Resolved;
                 changed.push(alert);
             }
         }
@@ -356,7 +357,10 @@ fn build_alert(
         occurrence_count: 1,
         resolved_at_ms: None,
         archived: false,
-        fingerprint: String::new(),
+        // The finding id *is* the incident's stable key (`crashDump:<fnv>` of
+        // the dump's path and timestamp), so the fingerprint is the same
+        // string: a rediscovered dump reattaches to its own incident.
+        fingerprint: id.to_string(),
         state: crate::models::IncidentState::Open,
         quality: crate::models::AlertQuality::default(),
         notify: true,
@@ -1162,12 +1166,17 @@ mod tests {
         assert_eq!(fired.len(), 1);
         let id = fired[0].id.clone();
         assert!(id.starts_with("crashDump:"));
+        // The stable id is also the incident fingerprint, so this finding
+        // takes part in the same lifecycle every other incident does.
+        assert_eq!(fired[0].fingerprint, id);
+        assert_eq!(fired[0].state, crate::models::IncidentState::Open);
         assert_eq!(engine.active_alerts().len(), 1);
         engine.source_mut().files = Vec::new();
         let resolved = engine.observe(now + SCAN_INTERVAL_MS);
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].id, id, "same deterministic identity");
         assert!(resolved[0].resolved_at_ms.is_some());
+        assert_eq!(resolved[0].state, crate::models::IncidentState::Resolved);
         assert!(engine.active_alerts().is_empty());
         // Nothing further changes while nothing exists.
         assert!(engine.observe(now + 2 * SCAN_INTERVAL_MS).is_empty());

@@ -1,6 +1,7 @@
 use crate::{
     alerting::{AlertEngine, QUIET_PERIOD_MS},
     analysis::{AgentContextSource, build_agent_context},
+    baselines::BaselineStore,
     config::Settings,
     etw::EtwCollector,
     eventlog::EventLogCollector,
@@ -16,6 +17,7 @@ use crate::{
         ProcessNode, Snapshot,
     },
     pipe,
+    quality::Calibration,
     storage::Storage,
 };
 use anyhow::{Result, anyhow};
@@ -376,10 +378,18 @@ fn sampling_loop(state: &Arc<AppState>, stop: crossbeam_channel::Receiver<()>) -
     // timestamp comparison, and triage headers are read once per new dump.
     let mut dumps = DumpEngine::new(WindowsDumpSource);
     let mut event_logs = EventLogCollector::default();
+    // Learned per-machine and per-executable norms, carried across restarts.
+    // A machine with nothing persisted starts its learning period now rather
+    // than dating an empty baseline to the epoch.
+    let mut baselines = BaselineStore::restore(
+        state.storage.load_baselines()?,
+        Utc::now().timestamp_millis(),
+    );
     let mut next_system_write = Instant::now();
     let mut next_process_write = Instant::now();
     let mut next_prune = Instant::now();
     let mut next_event_log_poll = Instant::now();
+    let mut next_baseline_save = Instant::now() + Duration::from_secs(5 * 60);
     loop {
         let started = Instant::now();
         let settings = state
@@ -402,11 +412,24 @@ fn sampling_loop(state: &Arc<AppState>, stop: crossbeam_channel::Receiver<()>) -
             .map_or_else(crate::etw::EtwSnapshot::default, EtwCollector::snapshot);
         let (system, processes, hardware) =
             collector.collect(timestamp_ms, &settings, &etw_snapshot)?;
+        // How much the machine baseline knows, decided before this sample is
+        // folded into it: an incident is judged against what was learned
+        // before it, never against itself.
+        let calibration = Calibration {
+            learning: baselines.machine.is_learning(timestamp_ms),
+            baseline_maturity: baselines.machine.maturity(timestamp_ms),
+        };
         let mut evaluation = state
             .alerts
             .lock()
             .map_err(|_| anyhow!("alert lock poisoned"))?
-            .evaluate(&system, &processes, &settings);
+            .evaluate(&system, &processes, &settings, calibration);
+        baselines
+            .machine
+            .observe(&system, processes.len(), timestamp_ms);
+        for process in &processes {
+            baselines.observe_process(process, timestamp_ms);
+        }
         forensics.observe(&evaluation.active, timestamp_ms);
         forensics.decorate(&mut evaluation.active);
         forensics.decorate(&mut evaluation.changed);
@@ -467,12 +490,27 @@ fn sampling_loop(state: &Arc<AppState>, stop: crossbeam_channel::Receiver<()>) -
             state.storage.prune(&settings, timestamp_ms)?;
             next_prune = Instant::now() + Duration::from_secs(24 * 60 * 60);
         }
+        if Instant::now() >= next_baseline_save {
+            state
+                .storage
+                .save_baselines(&baselines.to_rows(), timestamp_ms)?;
+            next_baseline_save = Instant::now() + Duration::from_secs(5 * 60);
+        }
         let delay =
             Duration::from_millis(settings.sample_interval_ms).saturating_sub(started.elapsed());
         match stop.recv_timeout(delay) {
             Ok(()) | Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
         }
+    }
+    // Clean shutdown: keep what this run learned, so the next start resumes
+    // its baselines instead of re-entering the learning period. A failure
+    // here costs learned norms, never the shutdown itself.
+    if let Err(error) = state
+        .storage
+        .save_baselines(&baselines.to_rows(), Utc::now().timestamp_millis())
+    {
+        eprintln!("failed to persist baselines on shutdown: {error:#}");
     }
     Ok(())
 }

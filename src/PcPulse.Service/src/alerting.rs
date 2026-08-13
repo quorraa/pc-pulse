@@ -2,6 +2,7 @@ use crate::{
     baselines::RunningStats,
     config::Settings,
     models::{Alert, Evidence, IncidentState, ProcessMetric, Severity, SystemMetric},
+    quality::{Calibration, QualityInputs, decide, score},
     stats::{TrendPoint, TrendShape, classify_trend},
 };
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -70,6 +71,12 @@ struct Candidate {
     /// because they have no sustained value to fall back below.
     entry: Option<f64>,
     exit_ratio: f64,
+    /// Detector-supplied "what I am describing is materially different now"
+    /// flag -- e.g. a *confident* DPC driver-family verdict change, never a
+    /// low-confidence label flip. It is one of the notification policy's
+    /// renotify conditions. No detector sets it yet (Phase D does); it is
+    /// plumbed here so the policy has somewhere to read it from.
+    material_change: bool,
 }
 
 impl Candidate {
@@ -90,6 +97,32 @@ struct ExitGuard {
     exit_threshold: f64,
     /// One full sustained window: `required_samples × sample_interval_ms`.
     hold_ms: i64,
+}
+
+/// What the quality layer needs to remember about a live incident between
+/// evaluations: the terms of the detector that raised it, and where the
+/// current run of breaching samples began.
+#[derive(Debug, Clone, Copy, Default)]
+struct IncidentCalibration {
+    /// The detector's sustained window (`required_samples × interval`).
+    window_ms: Option<i64>,
+    /// When the current unbroken run of breaching samples started -- the
+    /// honest start of the breach, which for a reopened incident is *not*
+    /// its original `first_seen_ms`. `Option`, not a zero sentinel: a
+    /// breach that began at timestamp zero is a real breach.
+    breach_since_ms: Option<i64>,
+    /// Carried from the candidate that fired this sample, and consumed by
+    /// the same sample's scoring pass.
+    material_change: bool,
+}
+
+/// When an incident was last marked notifiable, and at which generation.
+/// Outlives the incident itself (pruned on the quiet period) so a reopened
+/// incident remembers that the user has already been told.
+#[derive(Debug, Clone, Copy)]
+struct NotifyMemory {
+    generation: u32,
+    at_ms: i64,
 }
 
 /// What the engine remembers about a resolved incident so a refire of the
@@ -127,6 +160,11 @@ pub struct AlertEngine {
     /// Fingerprint -> the incident that most recently closed under it,
     /// pruned to the quiet period.
     resolved_memory: HashMap<String, ResolvedIncident>,
+    /// Scoring terms for each incident with a live streak or an open alert,
+    /// keyed like `streaks`.
+    calibrations: HashMap<String, IncidentCalibration>,
+    /// Fingerprint -> the last notification the policy authorized for it.
+    notify_memory: HashMap<String, NotifyMemory>,
     baselines: HashMap<(u32, i64), ProcessBaseline>,
     history: HashMap<(u32, i64), VecDeque<ProcessPoint>>,
     pool_baseline: RunningStats,
@@ -172,8 +210,14 @@ impl AlertEngine {
         system: &SystemMetric,
         processes: &[ProcessMetric],
         settings: &Settings,
+        calibration: Calibration,
     ) -> Evaluation {
         let mut candidates = Vec::new();
+        // The pre-evaluation state of every open incident, which the
+        // notification policy compares against (severity escalation, whether
+        // the incident was already notifying). Bounded by the active set,
+        // which is a handful of alerts even on a struggling machine.
+        let previous: HashMap<String, Alert> = self.active.clone();
         // What each value-shaped detector currently reads, whether or not it
         // breached. An open incident needs these to decide whether the
         // condition has actually cleared or merely dipped under the entry
@@ -542,6 +586,7 @@ impl AlertEngine {
                 recommendation: "Let active transfers finish, check free disk space and drive health, then inspect the named process. Do not disable write caching or security tools blindly.".into(),
                 entry: Some(settings.disk_latency_ms),
                 exit_ratio: EXIT_RATIO,
+                material_change: false,
             });
         }
 
@@ -569,6 +614,7 @@ impl AlertEngine {
                 recommendation: "Update recently changed drivers and use PoolMon to identify the allocation tag. Reboot only as temporary relief; do not terminate arbitrary system processes.".into(),
                 entry: Some(settings.kernel_pool_growth_mb * MIB),
                 exit_ratio: EXIT_RATIO,
+                material_change: false,
             });
         }
 
@@ -590,6 +636,7 @@ impl AlertEngine {
                 recommendation: "Check recently connected devices and update OEM chipset, network, audio, and storage drivers. Do not disable devices until you have identified a repeatable cause.".into(),
                 entry: Some(1.0),
                 exit_ratio: EXIT_RATIO,
+                material_change: false,
             });
         }
 
@@ -597,13 +644,23 @@ impl AlertEngine {
             .iter()
             .map(|candidate| candidate.key.clone())
             .collect();
-        let mut changed = Vec::new();
+        // Keys whose alert this evaluation created or updated. Their records
+        // are cloned into `changed` after scoring, so what reaches storage
+        // and the snapshot carries this sample's quality and notify decision.
+        let mut touched: HashSet<String> = HashSet::new();
         for candidate in candidates {
             // The condition is present again, so any exit clock it had
             // started is void.
             self.below_exit_since.remove(&candidate.key);
             let streak = self.streaks.entry(candidate.key.clone()).or_default();
             *streak = streak.saturating_add(1);
+            let terms = self.calibrations.entry(candidate.key.clone()).or_default();
+            if *streak == 1 {
+                terms.breach_since_ms = Some(system.timestamp_ms);
+            }
+            terms.window_ms =
+                Some(i64::from(candidate.required_samples) * settings.sample_interval_ms as i64);
+            terms.material_change = candidate.material_change;
             if *streak < candidate.required_samples {
                 continue;
             }
@@ -626,7 +683,12 @@ impl AlertEngine {
                 alert.last_seen_ms = system.timestamp_ms;
                 alert.occurrence_count = alert.occurrence_count.saturating_add(1);
                 alert.evidence = candidate.evidence;
-                changed.push(alert.clone());
+                // The detector's current reading of how bad this is: a
+                // banded detector can move an incident between severities
+                // while it stays the same incident, and an escalation is one
+                // of the policy's renotify conditions.
+                alert.severity = candidate.severity;
+                touched.insert(candidate.key);
             } else {
                 // A refire inside the quiet period continues the incident it
                 // belongs to instead of minting a sibling: same id, same
@@ -663,15 +725,21 @@ impl AlertEngine {
                     state: reopened
                         .as_ref()
                         .map_or(IncidentState::Open, |_| IncidentState::Reopened),
+                    // Both are decided by the scoring pass below, for this
+                    // incident and every other open one.
                     quality: crate::models::AlertQuality::default(),
-                    notify: true,
+                    notify: false,
                     notify_generation: reopened.as_ref().map_or(0, |prior| prior.notify_generation),
                 };
-                changed.push(alert.clone());
+                touched.insert(candidate.key.clone());
                 self.active.insert(candidate.key, alert);
             }
         }
 
+        // Resolved records keep the last quality the incident was scored
+        // with: persistence and novelty describe a live breach, and there is
+        // no live breach left to describe.
+        let mut resolved = Vec::new();
         let resolved_keys: Vec<String> = self
             .active
             .keys()
@@ -695,7 +763,7 @@ impl AlertEngine {
                         notify_generation: alert.notify_generation,
                     },
                 );
-                changed.push(alert);
+                resolved.push(alert);
             }
             self.guards.remove(&key);
             self.below_exit_since.remove(&key);
@@ -703,10 +771,82 @@ impl AlertEngine {
         }
         // Streaks survive for still-open incidents: a condition held open by
         // hysteresis must not have to re-earn its sustained window when its
-        // value crosses back above the entry threshold.
+        // value crosses back above the entry threshold. Their scoring terms
+        // live and die with them.
         let active = &self.active;
         self.streaks
             .retain(|key, _| present.contains(key) || active.contains_key(key));
+        self.calibrations
+            .retain(|key, _| present.contains(key) || active.contains_key(key));
+        // A notification is remembered for as long as the incident it belongs
+        // to could still come back.
+        self.notify_memory.retain(|key, memory| {
+            active.contains_key(key) || system.timestamp_ms - memory.at_ms <= QUIET_PERIOD_MS
+        });
+
+        // Score every open incident and apply the notification policy. This
+        // runs after reconciliation so an incident opened, updated, or held
+        // open by hysteresis this sample is all scored the same way, and
+        // before `changed` is built so storage and the snapshot carry the
+        // decision rather than the state that preceded it.
+        let default_window_ms =
+            i64::from(settings.sustained_samples) * settings.sample_interval_ms as i64;
+        let mut changed = Vec::new();
+        for (key, alert) in &mut self.active {
+            let terms = self.calibrations.get(key).copied().unwrap_or_default();
+            let window_ms = terms.window_ms.unwrap_or(default_window_ms);
+            let breach_since_ms = terms.breach_since_ms.unwrap_or(alert.first_seen_ms);
+            let notified = self.notify_memory.get(key).copied();
+            let quality = score(&QualityInputs {
+                alert,
+                sustained_window_ms: window_ms,
+                breach_duration_ms: system.timestamp_ms - breach_since_ms,
+                baseline_maturity: calibration.baseline_maturity,
+                // Detector-supplied corroboration, user impact, and
+                // attribution stability are Phase D's to plumb; until then
+                // an unknown attribution scores neutral and the two signal
+                // counts score honestly empty.
+                attribution_stable: None,
+                corroborating_signals: 0,
+                user_impact_signals: 0,
+                notified_before: notified.is_some(),
+                last_notified_ms: notified.map(|memory| memory.at_ms),
+            });
+            let decision = decide(
+                alert,
+                &quality,
+                calibration.learning,
+                previous.get(key),
+                terms.material_change,
+            );
+            let before = (alert.quality, alert.notify, alert.notify_generation);
+            alert.quality = quality;
+            alert.notify = decision.notify;
+            if decision.bump_generation {
+                alert.notify_generation = alert.notify_generation.saturating_add(1);
+            }
+            if decision.notify
+                && notified.is_none_or(|memory| memory.generation != alert.notify_generation)
+            {
+                self.notify_memory.insert(
+                    key.clone(),
+                    NotifyMemory {
+                        generation: alert.notify_generation,
+                        at_ms: system.timestamp_ms,
+                    },
+                );
+            }
+            if touched.contains(key)
+                || before != (alert.quality, alert.notify, alert.notify_generation)
+            {
+                changed.push(alert.clone());
+            }
+        }
+        // The flag describes one sample's candidate, not a standing state.
+        for terms in self.calibrations.values_mut() {
+            terms.material_change = false;
+        }
+        changed.extend(resolved);
 
         for process in processes {
             let identity = (process.pid, process.started_at_ms);
@@ -900,6 +1040,8 @@ fn process_candidate(
         // `Candidate::with_entry`.
         entry: None,
         exit_ratio: EXIT_RATIO,
+        // No detector sets this yet; Phase D does.
+        material_change: false,
     }
 }
 
@@ -982,6 +1124,7 @@ mod tests {
                         200,
                     )],
                     &settings,
+                    Calibration::default(),
                 );
             }
             engine
@@ -1013,6 +1156,7 @@ mod tests {
                         200,
                     )],
                     &raised,
+                    Calibration::default(),
                 );
             }
             engine
@@ -1045,7 +1189,12 @@ mod tests {
             timestamp_ms: 1_000,
             ..SystemMetric::default()
         };
-        let evaluation = engine.evaluate(&system, &[process(1_000, 99.0, 20)], &settings);
+        let evaluation = engine.evaluate(
+            &system,
+            &[process(1_000, 99.0, 20)],
+            &settings,
+            Calibration::default(),
+        );
         assert!(evaluation.active.is_empty());
     }
 
@@ -1063,6 +1212,7 @@ mod tests {
                 &system,
                 &[process(system.timestamp_ms, 95.0, 20)],
                 &settings,
+                Calibration::default(),
             );
         }
         assert_eq!(engine.active.len(), 1);
@@ -1072,8 +1222,12 @@ mod tests {
         let mut resolved = None;
         for _ in 0..4 {
             system.timestamp_ms += 2_000;
-            let evaluation =
-                engine.evaluate(&system, &[process(system.timestamp_ms, 1.0, 20)], &settings);
+            let evaluation = engine.evaluate(
+                &system,
+                &[process(system.timestamp_ms, 1.0, 20)],
+                &settings,
+                Calibration::default(),
+            );
             resolved = resolved.or_else(|| {
                 evaluation
                     .changed
@@ -1102,6 +1256,7 @@ mod tests {
                 &system,
                 &[process(system.timestamp_ms, 95.0, 20)],
                 &settings,
+                Calibration::default(),
             );
         }
         let id = engine.active.values().next().unwrap().id.clone();
@@ -1116,6 +1271,7 @@ mod tests {
             &system,
             &[process(system.timestamp_ms, 95.0, 20)],
             &settings,
+            Calibration::default(),
         );
         let updated = evaluation
             .changed
@@ -1150,6 +1306,7 @@ mod tests {
                     210,
                 )],
                 &settings,
+                Calibration::default(),
             );
         }
         assert!(
@@ -1180,6 +1337,7 @@ mod tests {
                     210,
                 )],
                 &settings,
+                Calibration::default(),
             );
         }
         let alert = engine
@@ -1214,6 +1372,7 @@ mod tests {
                     210,
                 )],
                 &settings,
+                Calibration::default(),
             );
         }
         let alert = engine
@@ -1251,6 +1410,25 @@ mod tests {
         count: i64,
         cpu: f64,
     ) -> Vec<Evaluation> {
+        drive_cpu_calibrated(
+            engine,
+            settings,
+            start_ms,
+            count,
+            cpu,
+            Calibration::default(),
+        )
+    }
+
+    /// [`drive_cpu`] against a stated view of the machine's learned baselines.
+    fn drive_cpu_calibrated(
+        engine: &mut AlertEngine,
+        settings: &Settings,
+        start_ms: i64,
+        count: i64,
+        cpu: f64,
+        calibration: Calibration,
+    ) -> Vec<Evaluation> {
         (0..count)
             .map(|index| {
                 let timestamp_ms = start_ms + index * settings.sample_interval_ms as i64;
@@ -1258,7 +1436,12 @@ mod tests {
                     timestamp_ms,
                     ..SystemMetric::default()
                 };
-                engine.evaluate(&system, &[process(timestamp_ms, cpu, 20)], settings)
+                engine.evaluate(
+                    &system,
+                    &[process(timestamp_ms, cpu, 20)],
+                    settings,
+                    calibration,
+                )
             })
             .collect()
     }
@@ -1474,6 +1657,117 @@ mod tests {
     }
 
     #[test]
+    fn an_incident_is_recorded_before_it_is_worth_notifying() {
+        // The sustained window is 3 x 2 s; persistence reaches the policy's
+        // 0.5 floor at 1.5 windows (9 s) of breach. So the incident opens at
+        // 4 s, is recorded and scored from that moment, and only becomes
+        // notifiable at 10 s.
+        let settings = lifecycle_settings();
+        let mut engine = AlertEngine::default();
+        let evaluations = drive_cpu(&mut engine, &settings, 0, 8, 95.0);
+        let timeline: Vec<(i64, bool, f64, u32)> = evaluations
+            .iter()
+            .filter_map(|evaluation| evaluation.active.first())
+            .map(|alert| {
+                (
+                    alert.last_seen_ms,
+                    alert.notify,
+                    alert.quality.persistence,
+                    alert.notify_generation,
+                )
+            })
+            .collect();
+        assert_eq!(
+            timeline
+                .iter()
+                .map(|(at_ms, notify, _, _)| (*at_ms, *notify))
+                .collect::<Vec<_>>(),
+            vec![
+                (4_000, false),
+                (6_000, false),
+                (8_000, false),
+                (10_000, true),
+                (12_000, true),
+                (14_000, true),
+            ]
+        );
+        // Persistence only ever climbs, and the floor is what flipped the
+        // decision -- not some incidental change.
+        let mut previous = 0.0;
+        for (at_ms, notify, persistence, generation) in &timeline {
+            assert!(*persistence > previous, "persistence must climb at {at_ms}");
+            assert_eq!(*notify, *persistence >= 0.5);
+            // A steady incident never re-pops: nothing escalated and nothing
+            // materially changed, so the generation stays put across the
+            // suppressed-to-notifiable flip too.
+            assert_eq!(*generation, 0);
+            previous = *persistence;
+        }
+        // Suppression is a notification decision only: every sample, including
+        // the suppressed ones, still reached storage carrying its scores.
+        for evaluation in &evaluations[2..] {
+            let active = evaluation.active.first().expect("the incident is open");
+            let stored = evaluation
+                .changed
+                .iter()
+                .find(|alert| alert.id == active.id)
+                .expect("an open incident is persisted every sample it is scored");
+            assert_eq!(stored.quality, active.quality);
+            assert_eq!(stored.notify, active.notify);
+            assert!(
+                stored.quality.confidence >= 0.5,
+                "a mature machine, deep samples"
+            );
+        }
+    }
+
+    #[test]
+    fn the_learning_period_records_a_warning_without_ever_notifying() {
+        // Identical breach, identical duration; the only difference is a
+        // machine that has not finished learning what normal looks like.
+        let settings = lifecycle_settings();
+        let mut engine = AlertEngine::default();
+        let evaluations = drive_cpu_calibrated(
+            &mut engine,
+            &settings,
+            0,
+            10,
+            95.0,
+            Calibration {
+                learning: true,
+                baseline_maturity: 0.2,
+            },
+        );
+        let scored: Vec<&Alert> = evaluations
+            .iter()
+            .filter_map(|evaluation| evaluation.active.first())
+            .collect();
+        assert!(
+            !scored.is_empty(),
+            "the incident still opens while learning"
+        );
+        assert!(
+            scored.iter().all(|alert| !alert.notify),
+            "a Warning cannot notify during the learning period"
+        );
+        let last = scored.last().expect("at least one scored sample");
+        assert!(
+            last.quality.persistence > 0.5,
+            "it is suppressed by policy, not by a weak score"
+        );
+        assert_eq!(last.notify_generation, 0);
+        // And the same breach on a learned machine does notify.
+        let mut learned = AlertEngine::default();
+        let after = drive_cpu(&mut learned, &settings, 0, 10, 95.0);
+        assert!(
+            after
+                .iter()
+                .filter_map(|evaluation| evaluation.active.first())
+                .any(|alert| alert.notify)
+        );
+    }
+
+    #[test]
     fn an_event_shaped_detector_still_resolves_on_absence() {
         // Slow launch has no sustained value to fall below an exit
         // threshold, so its incident closes the moment the event stops.
@@ -1484,15 +1778,19 @@ mod tests {
             system.timestamp_ms = index * 2_000;
             let mut slow = process(system.timestamp_ms, 1.0, 20);
             slow.launch_duration_ms = Some(settings.slow_launch_ms + 1_000);
-            engine.evaluate(&system, &[slow], &settings);
+            engine.evaluate(&system, &[slow], &settings, Calibration::default());
         }
         let opened = only_active(&engine);
         assert_eq!(opened.kind, "slowLaunch");
         assert_eq!(opened.fingerprint, "slowLaunch:42:1");
 
         system.timestamp_ms += 2_000;
-        let evaluation =
-            engine.evaluate(&system, &[process(system.timestamp_ms, 1.0, 20)], &settings);
+        let evaluation = engine.evaluate(
+            &system,
+            &[process(system.timestamp_ms, 1.0, 20)],
+            &settings,
+            Calibration::default(),
+        );
         let resolved = resolution(&[evaluation]).expect("event-shaped absence resolves at once");
         assert_eq!(resolved.id, opened.id);
         assert!(engine.active.is_empty());
