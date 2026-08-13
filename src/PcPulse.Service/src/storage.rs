@@ -1,7 +1,8 @@
 use crate::{
     config::Settings,
     models::{
-        Alert, DiagnosticLog, HistoryResponse, OptimizationPlan, ProcessMetric, SystemMetric,
+        Alert, DiagnosticLog, Evidence, HistoryResponse, IncidentState, OptimizationPlan,
+        ProcessMetric, SystemMetric,
     },
 };
 use anyhow::{Context, Result};
@@ -11,6 +12,9 @@ use std::{path::Path, sync::Mutex};
 pub struct Storage {
     connection: Mutex<Connection>,
 }
+
+/// Evidence label the startup force-resolve stamps on findings it closes.
+const RESTART_RESOLUTION_LABEL: &str = "Resolved by";
 
 impl Storage {
     pub fn open(path: &Path) -> Result<Self> {
@@ -214,6 +218,20 @@ impl Storage {
         }
         for alert in &mut open {
             alert.resolved_at_ms = Some(resolved_at_ms);
+            alert.state = IncidentState::Resolved;
+            // A restart closes findings for lack of continuity, not because
+            // the condition went away; the note says so, and the fingerprint
+            // keeps the incident reopen-eligible.
+            if !alert
+                .evidence
+                .iter()
+                .any(|row| row.label == RESTART_RESOLUTION_LABEL)
+            {
+                alert.evidence.push(Evidence {
+                    label: RESTART_RESOLUTION_LABEL.into(),
+                    value: "Service restart".into(),
+                });
+            }
         }
         let transaction = connection.transaction()?;
         {
@@ -229,6 +247,29 @@ impl Storage {
         }
         transaction.commit()?;
         Ok(open.len())
+    }
+
+    /// Alerts resolved at or after `since_ms` that carry an incident
+    /// fingerprint, newest resolution first. Seeds `AlertEngine::new`'s
+    /// reopen memory at startup so a condition that outlived a service
+    /// restart reattaches to its incident instead of minting a sibling.
+    /// Records without a fingerprint predate incident tracking and cannot be
+    /// reattached to anything, so they are left out.
+    pub fn recent_resolved_alerts(&self, since_ms: i64) -> Result<Vec<Alert>> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow::anyhow!("database lock poisoned"))?;
+        let alerts = query_json_rows::<Alert>(
+            &connection,
+            "SELECT payload FROM alerts WHERE resolved_at_ms IS NOT NULL AND resolved_at_ms>=?1
+             ORDER BY resolved_at_ms DESC LIMIT 5000",
+            params![since_ms],
+        )?;
+        Ok(alerts
+            .into_iter()
+            .filter(|alert| !alert.fingerprint.is_empty())
+            .collect())
     }
 
     pub fn acknowledge_alert(&self, id: &str) -> Result<bool> {
@@ -591,6 +632,38 @@ mod tests {
             notify: true,
             notify_generation: 0,
         }
+    }
+
+    #[test]
+    fn restart_resolution_leaves_fingerprints_reopen_eligible() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = Storage::open(&directory.path().join("history.db")).unwrap();
+        let mut fingerprinted = stored_alert("finding-1");
+        fingerprinted.fingerprint = "sustainedCpu:42:1".into();
+        storage
+            .upsert_alerts(&[fingerprinted, stored_alert("legacy-finding")])
+            .unwrap();
+
+        assert_eq!(storage.resolve_open_alerts(1_000).unwrap(), 2);
+        let recent = storage.recent_resolved_alerts(0).unwrap();
+        assert_eq!(
+            recent.len(),
+            1,
+            "records without a fingerprint cannot reattach to anything"
+        );
+        assert_eq!(recent[0].id, "finding-1");
+        assert_eq!(recent[0].state, crate::models::IncidentState::Resolved);
+        assert!(
+            recent[0]
+                .evidence
+                .iter()
+                .any(|row| row.value == "Service restart"),
+            "the force-resolve records why it closed"
+        );
+        assert!(
+            storage.recent_resolved_alerts(2_000).unwrap().is_empty(),
+            "resolutions older than the window are not reopen-eligible"
+        );
     }
 
     #[test]

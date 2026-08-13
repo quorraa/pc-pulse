@@ -1,5 +1,5 @@
 use crate::{
-    alerting::AlertEngine,
+    alerting::{AlertEngine, QUIET_PERIOD_MS},
     analysis::{AgentContextSource, build_agent_context},
     config::Settings,
     etw::EtwCollector,
@@ -319,12 +319,17 @@ pub fn run(data_dir: &Path, stop: crossbeam_channel::Receiver<()>) -> Result<()>
     let storage = Arc::new(Storage::open(&data_dir.join("history.db"))?);
     // A restart breaks monitoring continuity. Close persisted open findings so the
     // fresh sustained detector can reacquire only conditions that are still present.
-    storage.resolve_open_alerts(Utc::now().timestamp_millis())?;
+    let started_at_ms = Utc::now().timestamp_millis();
+    storage.resolve_open_alerts(started_at_ms)?;
+    // Those fingerprints stay reopen-eligible for the quiet period: a condition
+    // that outlived the restart reattaches to its incident (same id, occurrences
+    // continuing) rather than presenting as a brand-new finding.
+    let reopen_seed = storage.recent_resolved_alerts(started_at_ms - QUIET_PERIOD_MS)?;
     let state = Arc::new(AppState {
         snapshot: RwLock::new(Snapshot::default()),
         settings: RwLock::new(settings),
         storage,
-        alerts: Mutex::new(AlertEngine::default()),
+        alerts: Mutex::new(AlertEngine::new(reopen_seed)),
         log_status: Mutex::new(DiagnosticLogStatus::default()),
         issued_contexts: Mutex::new(VecDeque::new()),
         settings_path,
