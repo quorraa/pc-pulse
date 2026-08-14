@@ -2,11 +2,13 @@ use anyhow::{Context, Result, anyhow, bail};
 use pcpulse_service::{
     PIPE_NAME,
     config::Settings,
+    launches::LaunchGroup,
     models::{
-        AgentContext, Alert, DiagnosticLogResponse, HistoryResponse, LiveSample, OptimizationPlan,
-        PipeRequest, PipeResponse, ProcessNode, Rating, RatingVerdict, Snapshot,
+        AgentContext, Alert, DiagnosticLogResponse, HistoryResponse, LaunchEvent, LiveSample,
+        OptimizationPlan, PipeRequest, PipeResponse, ProcessNode, Rating, RatingVerdict, Snapshot,
     },
 };
+use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use std::{
     thread,
@@ -24,6 +26,30 @@ use windows::{
 };
 
 const MAX_MESSAGE_BYTES: usize = 1024 * 1024;
+
+/// The `getLaunchGroups` envelope. The service answers `{"groups": [...]}`
+/// rather than a bare array, so the wrapper is mirrored here exactly as the
+/// other response envelopes are — the `LaunchGroup` payload itself is the
+/// service's own struct, so the two can never drift.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LaunchGroupsResponse {
+    pub groups: Vec<LaunchGroup>,
+}
+
+/// The `getLaunchOccurrences` envelope (`{"events": [...]}`), newest first.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LaunchOccurrencesResponse {
+    pub events: Vec<LaunchEvent>,
+}
+
+/// The `deleteCommandLines` envelope (`{"deleted": n}`).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteCommandLinesResponse {
+    pub deleted: usize,
+}
 
 pub struct PipeClient;
 
@@ -122,6 +148,46 @@ impl PipeClient {
     /// Rating history, newest first.
     pub fn ratings(&self, limit: usize) -> Result<Vec<Rating>> {
         self.send(&PipeRequest::GetRatings { limit })
+    }
+
+    /// Recorded launches bucketed by `(exe_path, lineage_sig)` over the
+    /// service's default 7-day window. Services that predate launch history
+    /// answer with the ordinary unknown-command `invalidRequest` error.
+    pub fn launch_groups(
+        &self,
+        console_hosts_only: bool,
+        limit: usize,
+    ) -> Result<LaunchGroupsResponse> {
+        self.send(&PipeRequest::GetLaunchGroups {
+            from_ms: None,
+            console_hosts_only: Some(console_hosts_only),
+            limit: Some(limit),
+        })
+    }
+
+    /// One group's individual occurrences, newest first. `exe_path` and
+    /// `lineage_sig` must be the byte-exact values `getLaunchGroups`
+    /// returned: the service matches them literally against its stored
+    /// (already-lowercased) values, so re-casing or normalizing them here
+    /// would silently match nothing.
+    pub fn launch_occurrences(
+        &self,
+        exe_path: String,
+        lineage_sig: String,
+        limit: usize,
+    ) -> Result<LaunchOccurrencesResponse> {
+        self.send(&PipeRequest::GetLaunchOccurrences {
+            exe_path,
+            lineage_sig,
+            from_ms: None,
+            limit: Some(limit),
+        })
+    }
+
+    /// Forget every captured command line. Never touches launch-event rows,
+    /// which never carried a command line in the first place.
+    pub fn delete_command_lines(&self) -> Result<DeleteCommandLinesResponse> {
+        self.send(&PipeRequest::DeleteCommandLines)
     }
 
     pub fn send<T: DeserializeOwned>(&self, request: &PipeRequest) -> Result<T> {

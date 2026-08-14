@@ -7,9 +7,10 @@ use crate::{
     format,
     theme::{self, LayoutKind, palette},
 };
+use pcpulse_service::launches::LaunchGroup;
 use pcpulse_service::models::{
-    Alert, DemandBucket, HardwareMetrics, IncidentState, OptimizationPlan, PlanAction, PlanRisk,
-    ProcessMetric, RatingVerdict, Severity, SystemMetric,
+    Alert, DemandBucket, HardwareMetrics, IncidentState, LaunchCaptureStatus, OptimizationPlan,
+    PlanAction, PlanRisk, ProcessMetric, RatingVerdict, Severity, SystemMetric, WindowState,
 };
 use ratatui::{
     Frame,
@@ -274,7 +275,12 @@ fn mouse_scroll(app: &mut App, delta: isize) {
             }
             app.refresh_page();
         }
-        Page::Processes | Page::Tree | Page::Alerts | Page::Analyzer | Page::Settings => {
+        Page::Processes
+        | Page::Tree
+        | Page::Alerts
+        | Page::Analyzer
+        | Page::Settings
+        | Page::Launches => {
             app.move_selection(delta);
         }
         _ => {}
@@ -470,12 +476,61 @@ fn mouse_body_click(
             }
             false
         }
+        // Read-only by construction: a click here only ever moves a
+        // cursor. There is no right-click action to reach for.
+        Page::Launches if button == MouseButton::Left => {
+            let (groups, detail, _) = launches_regions(body);
+            if let Some(index) = table_row_at(
+                inset(groups),
+                point,
+                2,
+                app.launch_state.offset(),
+                app.launch_groups.len(),
+            ) {
+                app.launch_detail_focused = false;
+                app.launch_state.select(Some(index));
+                app.sync_launch_occurrences();
+                return true;
+            }
+            if let Some(index) = table_row_at(
+                launch_detail_rows(detail)[0],
+                point,
+                2,
+                app.launch_occurrence_state.offset(),
+                app.launch_occurrences.len(),
+            ) {
+                app.launch_detail_focused = true;
+                app.launch_occurrence_state.select(Some(index));
+                return true;
+            }
+            false
+        }
         _ => false,
     }
 }
 
+/// The columns the statusline route strip needs to print every page with
+/// its full name. Derived from the labels themselves rather than pinned to
+/// a number: a hand-set threshold silently drops the trailing entry the
+/// moment a page is added, which is exactly how the "? KEYS" appendix fell
+/// off the end at 150 columns.
+fn route_strip_width() -> u16 {
+    let labels: usize = Page::ALL
+        .iter()
+        .map(|page| route_name(*page).chars().count() + 5)
+        .sum();
+    (labels + ROUTE_SEPARATOR.chars().count() * (Page::ALL.len() - 1)).min(u16::MAX as usize) as u16
+}
+
+/// Whether the route strip must fall back to short labels at this width.
+fn route_compact(area: Rect) -> bool {
+    area.width < route_strip_width()
+}
+
+const ROUTE_SEPARATOR: &str = "  ›  ";
+
 fn route_at(column: u16, area: Rect) -> Option<Page> {
-    let compact = area.width < 112;
+    let compact = route_compact(area);
     let mut x = area.x;
     for (index, page) in Page::ALL.iter().copied().enumerate() {
         if index > 0 {
@@ -897,6 +952,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
         Page::Settings => render_settings(frame, app, regions.body),
         Page::Help => render_help(frame, regions.body),
         Page::Hardware => render_hardware(frame, app, regions.body),
+        Page::Launches => render_launches(frame, app, regions.body),
     }
     if broadsheet {
         render_folio(frame, app, regions.footer);
@@ -1481,8 +1537,9 @@ fn rail_input_line(app: &App) -> Line<'static> {
                 Page::Timeline => "[ ] r",
                 Page::Analyzer => "↵ ask e n h y",
                 Page::Settings => "↵ edit s",
-                Page::Help => "1–8 Tab",
+                Page::Help => "1–9 Tab",
                 Page::Hardware => "r sample",
+                Page::Launches => "j/k o c ↵ l",
             };
             return Line::styled(format!(" {hints}"), Style::default().fg(palette().faint));
         }
@@ -1768,12 +1825,12 @@ fn render_header(frame: &mut Frame<'_>, app: &App, area: Rect) {
 }
 
 fn render_route(frame: &mut Frame<'_>, app: &App, area: Rect) {
-    let compact = area.width < 112;
+    let compact = route_compact(area);
     let mut spans = Vec::new();
     for (index, page) in Page::ALL.iter().enumerate() {
         if index > 0 {
             spans.push(Span::styled(
-                "  ›  ",
+                ROUTE_SEPARATOR,
                 Style::default().fg(palette().border_hot),
             ));
         }
@@ -1809,6 +1866,7 @@ fn route_name(page: Page) -> &'static str {
         Page::Settings => "TUNE",
         Page::Help => "KEYS",
         Page::Hardware => "GAUGES",
+        Page::Launches => "LAUNCHES",
     }
 }
 
@@ -1823,6 +1881,7 @@ fn route_short(page: Page) -> &'static str {
         Page::Settings => "TUNE",
         Page::Help => "KEYS",
         Page::Hardware => "GAUGE",
+        Page::Launches => "LAUNCH",
     }
 }
 
@@ -1867,6 +1926,7 @@ fn route_description(page: Page) -> &'static str {
         Page::Settings => "shape baselines and sustained thresholds",
         Page::Help => "operate the console without leaving the keyboard",
         Page::Hardware => "watch temperatures and clocks, best-effort by sensor",
+        Page::Launches => "see what keeps launching, and what launched it",
     }
 }
 
@@ -6400,12 +6460,419 @@ fn render_setting_detail(
     );
 }
 
+// ---- LAUNCHES ----------------------------------------------------------
+
+/// The exact sentence the page owes an operator whose command lines are not
+/// being captured. It is not an error and not a nag: it draws the line
+/// between what PC Pulse *does* know (which executable ran, and what
+/// launched it) and what it deliberately does not.
+const LAUNCH_CAPTURE_OFF: &str = "Command-line capture is off — PC Pulse can identify the executable and launcher, but not the exact command or script.";
+/// A launch that came and went inside one sampling interval was never
+/// observed having (or not having) a window. Saying so is the honest
+/// answer; "no window" would be a guess dressed as a fact.
+const LAUNCH_WINDOW_UNOBSERVED: &str =
+    "window state unobserved — lived less than one sampling interval";
+/// Shown above the recorded lineage when the selected occurrence is not the
+/// process running under that pid now — the ordinary case for the
+/// short-lived launches this page is mostly made of.
+const LAUNCH_PROCESS_EXITED: &str = "process has exited — showing recorded lineage";
+
+/// The page's shape: the groups list beside the drill-down, with the
+/// capture-health strip along the bottom. Every consumer derives its rect
+/// from here — the renderer and the click hit-test both — so a click can
+/// never resolve to a row the table it landed on does not have.
+fn launches_regions(body: Rect) -> (Rect, Rect, Rect) {
+    let rows = Layout::vertical([Constraint::Min(6), Constraint::Length(3)]).split(body);
+    let columns =
+        Layout::horizontal([Constraint::Percentage(58), Constraint::Percentage(42)]).split(rows[0]);
+    (columns[0], columns[1], rows[1])
+}
+
+/// The drill-down column's two halves: the occurrence table over the
+/// selected occurrence's record.
+fn launch_detail_rows(column: Rect) -> [Rect; 2] {
+    let rows = Layout::vertical([Constraint::Percentage(45), Constraint::Percentage(55)])
+        .split(inset(column));
+    [rows[0], rows[1]]
+}
+
+/// The group's window-state summary in one glyph. Any windowed occurrence
+/// at all wins the group: a program that has ever shown a window is a
+/// program with a face. Otherwise the majority of what was actually
+/// *observed* decides, and a group nothing has been observed for says `?`
+/// rather than claiming "never windowed".
+fn launch_window_glyph(group: &LaunchGroup) -> &'static str {
+    if group.windowed > 0 {
+        "▣"
+    } else if group.never_windowed == 0 && group.unobserved == 0 {
+        "?"
+    } else if group.never_windowed >= group.unobserved {
+        "▢"
+    } else {
+        "?"
+    }
+}
+
+/// `Some(ms)` formatted as a duration, `—` for the honest `None` the
+/// service sends when there is nothing to measure (a single occurrence has
+/// no interval; an unfinished one has no duration).
+fn launch_span(value: Option<i64>) -> String {
+    match value {
+        Some(ms) if ms >= 0 => format::duration(std::time::Duration::from_millis(ms as u64)),
+        _ => "—".into(),
+    }
+}
+
+/// The clock the page reads "last seen" against: the newest snapshot's own
+/// sample time, so the column agrees with every other age on screen.
+fn launch_now_ms(app: &App) -> i64 {
+    app.snapshot
+        .as_ref()
+        .map(|snapshot| snapshot.system.timestamp_ms)
+        .unwrap_or_else(|| chrono::Utc::now().timestamp_millis())
+}
+
+fn launch_capture(app: &App) -> LaunchCaptureStatus {
+    app.snapshot
+        .as_ref()
+        .map(|snapshot| snapshot.launch_capture.clone())
+        .unwrap_or_default()
+}
+
+/// The capture-health strip: what the pipeline has seen, whether new
+/// command lines are being captured, the filter in force, and — never
+/// silently — how much was lost.
+fn launch_footer_text(app: &App) -> String {
+    let status = launch_capture(app);
+    let mut parts = vec![format!(
+        "starts {}  ·  stops {}  ·  persisted {}",
+        status.starts_seen, status.stops_seen, status.persisted
+    )];
+    parts.push(if status.cmdline_session_active {
+        format!("command lines {}", status.cmdlines_captured)
+    } else {
+        "command-line capture off".into()
+    });
+    if app.launch_console_only {
+        parts.push("filter: console hosts".into());
+    }
+    let lost = status
+        .dropped_channel
+        .saturating_add(status.etw_events_lost)
+        .saturating_add(status.malformed_events);
+    if lost > 0 {
+        parts.push(format!("capture incomplete ({lost} lost)"));
+    }
+    parts.join("  ·  ")
+}
+
+/// The detail block under the occurrence list: what this one launch was,
+/// how it ended, and — plainly — the parts PC Pulse could not observe.
+/// Pure so the copy can be pinned byte-exactly by tests.
+fn launch_detail_lines(app: &App, now_ms: i64) -> Vec<Line<'static>> {
+    let Some(occurrence) = app.selected_launch_occurrence() else {
+        return vec![Line::styled(
+            "No occurrence selected",
+            Style::default().fg(palette().muted),
+        )];
+    };
+    let alive = app.live_launch_pid().is_some();
+    let mut lines = vec![
+        Line::styled(
+            format!(
+                "pid {}  ·  session {}",
+                occurrence.pid, occurrence.session_id
+            ),
+            Style::default().fg(palette().text).bold(),
+        ),
+        detail_line("Started", format::timestamp(occurrence.start_time_ms)),
+        match occurrence.stop_time_ms {
+            Some(stop_ms) => detail_line("Stopped", format::timestamp(stop_ms)),
+            None => detail_line("Stopped", "running".into()),
+        },
+        detail_line(
+            "Duration",
+            launch_span(
+                occurrence
+                    .stop_time_ms
+                    .map(|stop_ms| stop_ms.saturating_sub(occurrence.start_time_ms)),
+            ),
+        ),
+        detail_line(
+            "Exit code",
+            match occurrence.exit_code {
+                Some(code) => code.to_string(),
+                None => "—".into(),
+            },
+        ),
+        detail_line("Age", format::age(occurrence.start_time_ms, now_ms)),
+    ];
+    if occurrence.window_state == WindowState::Unobserved {
+        lines.push(Line::styled(
+            LAUNCH_WINDOW_UNOBSERVED,
+            Style::default().fg(palette().muted),
+        ));
+    } else {
+        lines.push(detail_line(
+            "Window",
+            match occurrence.window_state {
+                WindowState::Windowed => "windowed".into(),
+                WindowState::NeverWindowed => "never windowed".into(),
+                WindowState::Running => "running — not final yet".into(),
+                WindowState::Unobserved => String::new(),
+            },
+        ));
+    }
+    lines.push(Line::raw(""));
+    // The note explains the lineage that follows it, so it goes first.
+    lines.push(if alive {
+        Line::styled(
+            "still running — Enter/h hunts it, l traces its lineage",
+            Style::default().fg(palette().ok),
+        )
+    } else {
+        Line::styled(LAUNCH_PROCESS_EXITED, Style::default().fg(palette().muted))
+    });
+    if occurrence.lineage.is_empty() {
+        lines.push(Line::styled(
+            format!(
+                "parent exited before capture (pid {})",
+                occurrence.parent_pid
+            ),
+            Style::default().fg(palette().muted),
+        ));
+    } else {
+        let chain = occurrence
+            .lineage
+            .iter()
+            .map(|entry| format!("{} (pid {})", entry.name, entry.pid))
+            .collect::<Vec<_>>()
+            .join(" ← ");
+        lines.push(Line::styled(chain, Style::default().fg(palette().info)));
+    }
+    lines.push(Line::raw(""));
+    if let Some(command_line) = &occurrence.command_line {
+        lines.push(Line::styled(
+            command_line.clone(),
+            Style::default().fg(palette().alt),
+        ));
+    }
+    // Stored lines outlive the setting that captured them, so this is
+    // about *new* capture and belongs here either way.
+    if !launch_capture(app).cmdline_session_active {
+        lines.push(Line::styled(
+            LAUNCH_CAPTURE_OFF,
+            Style::default().fg(palette().muted),
+        ));
+    }
+    lines
+}
+
+fn render_launches(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
+    let (groups_area, detail_area, footer_area) = launches_regions(area);
+    let now_ms = launch_now_ms(app);
+    render_launch_groups(frame, app, inset(groups_area), now_ms);
+    render_launch_detail(frame, app, detail_area, now_ms);
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            format!(" {}", launch_footer_text(app)),
+            Style::default().fg(palette().muted),
+        ))
+        .block(accent_panel(" ⎙ LAUNCH CAPTURE ", palette().info)),
+        footer_area,
+    );
+}
+
+fn render_launch_groups(frame: &mut Frame<'_>, app: &mut App, area: Rect, now_ms: i64) {
+    if app.launch_groups.is_empty() {
+        let message = match &app.launch_error {
+            Some(error) => format!("Launch history unavailable: {error}"),
+            None if app.launch_console_only => {
+                "No console-host launches recorded in the last 7 days.".into()
+            }
+            None => "No launches recorded in the last 7 days.".into(),
+        };
+        frame.render_widget(
+            Paragraph::new(Text::from(message))
+                .wrap(Wrap { trim: false })
+                .style(Style::default().fg(palette().muted).bg(palette().surface))
+                .block(accent_panel(" ⟲ RECURRENCE ", palette().info)),
+            area,
+        );
+        return;
+    }
+    let rows = app
+        .launch_groups
+        .iter()
+        .enumerate()
+        .map(|(index, group)| {
+            Row::new(vec![
+                Cell::from(format::truncate(&group.exe_name, 18)),
+                Cell::from(format::truncate(&group.launcher_summary, 14)),
+                Cell::from(group.count.to_string()),
+                Cell::from(format::age(group.last_ms, now_ms)),
+                Cell::from(launch_span(group.median_interval_ms)),
+                Cell::from(launch_span(group.mean_duration_ms)),
+                Cell::from(format!(
+                    "{}{}",
+                    launch_window_glyph(group),
+                    if group.console_host { " [console]" } else { "" }
+                )),
+            ])
+            .style(Style::default().fg(palette().text).bg(
+                if index.is_multiple_of(2) {
+                    palette().surface
+                } else {
+                    palette().surface_raised
+                },
+            ))
+        })
+        .collect::<Vec<_>>();
+    let title = format!(
+        " ⟲ RECURRENCE · {} groups · 7 days{} ",
+        app.launch_groups.len(),
+        if app.launch_console_only {
+            " · filter: console hosts"
+        } else {
+            ""
+        }
+    );
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(18),
+            Constraint::Length(14),
+            Constraint::Length(5),
+            Constraint::Length(8),
+            Constraint::Length(8),
+            Constraint::Length(8),
+            Constraint::Length(12),
+        ],
+    )
+    .header(
+        Row::new(vec![
+            Cell::from("EXECUTABLE"),
+            Cell::from("LAUNCHER"),
+            Cell::from("N"),
+            Cell::from("LAST"),
+            Cell::from("EVERY"),
+            Cell::from("MEAN DUR"),
+            Cell::from("WINDOW"),
+        ])
+        .style(
+            Style::default()
+                .fg(palette().info)
+                .bg(palette().surface_raised)
+                .bold(),
+        )
+        .bottom_margin(1),
+    )
+    .block(accent_panel(
+        &title,
+        if app.launch_detail_focused {
+            palette().muted
+        } else {
+            palette().info
+        },
+    ))
+    .row_highlight_style(row_highlight_style())
+    .highlight_symbol("▌ ")
+    .highlight_spacing(HighlightSpacing::Always);
+    frame.render_stateful_widget(table, area, &mut app.launch_state);
+}
+
+fn render_launch_detail(frame: &mut Frame<'_>, app: &mut App, column: Rect, now_ms: i64) {
+    let rows = launch_detail_rows(column);
+    let occurrence_rows = app
+        .launch_occurrences
+        .iter()
+        .enumerate()
+        .map(|(index, occurrence)| {
+            Row::new(vec![
+                Cell::from(format::timestamp(occurrence.start_time_ms)),
+                Cell::from(match occurrence.stop_time_ms {
+                    Some(stop_ms) => {
+                        launch_span(Some(stop_ms.saturating_sub(occurrence.start_time_ms)))
+                    }
+                    None => "running".into(),
+                }),
+                Cell::from(match occurrence.exit_code {
+                    Some(code) => code.to_string(),
+                    None => "—".into(),
+                }),
+            ])
+            .style(Style::default().fg(palette().text).bg(
+                if index.is_multiple_of(2) {
+                    palette().surface
+                } else {
+                    palette().surface_raised
+                },
+            ))
+        })
+        .collect::<Vec<_>>();
+    // The launcher chain is a chain of *names*: two different binaries that
+    // happen to share a name group together, and the title says so rather
+    // than implying the path was matched.
+    let title = match app.selected_launch_group() {
+        Some(group) => format!(
+            " ◇ OCCURRENCES · launcher names: {} ",
+            if group.lineage_sig.is_empty() {
+                "unknown".to_string()
+            } else {
+                format::truncate(&group.lineage_sig, 28)
+            }
+        ),
+        None => " ◇ OCCURRENCES ".to_string(),
+    };
+    let table = Table::new(
+        occurrence_rows,
+        [
+            Constraint::Length(21),
+            Constraint::Length(10),
+            Constraint::Length(6),
+        ],
+    )
+    .header(
+        Row::new(vec![
+            Cell::from("STARTED"),
+            Cell::from("RAN FOR"),
+            Cell::from("EXIT"),
+        ])
+        .style(
+            Style::default()
+                .fg(palette().alt)
+                .bg(palette().surface_raised)
+                .bold(),
+        )
+        .bottom_margin(1),
+    )
+    .block(accent_panel(
+        &title,
+        if app.launch_detail_focused {
+            palette().alt
+        } else {
+            palette().muted
+        },
+    ))
+    .row_highlight_style(row_highlight_style())
+    .highlight_symbol("▌ ")
+    .highlight_spacing(HighlightSpacing::Always);
+    frame.render_stateful_widget(table, rows[0], &mut app.launch_occurrence_state);
+    frame.render_widget(
+        Paragraph::new(Text::from(launch_detail_lines(app, now_ms)))
+            .wrap(Wrap { trim: false })
+            .style(Style::default().fg(palette().text).bg(palette().surface))
+            .block(accent_panel(" ◈ LAUNCH RECORD ", palette().alt)),
+        rows[1],
+    );
+}
+
 /// Key/description rows for both help panes. Descriptions are short enough
 /// to sit on one line at ≥100 terminal columns; anything that still must
 /// wrap does so through [`help_lines`]' hanging indent, so the two-column
 /// grid never sheds orphan full-width words.
 const HELP_GLOBAL: [(&str, &str); 13] = [
-    ("1–8", "jump to a page"),
+    ("1–9", "jump to a page"),
     ("Tab / Shift-Tab", "next / previous page"),
     ("j / k, ↑ / ↓", "move selection"),
     ("PgUp / PgDn", "move ten rows"),
@@ -6422,7 +6889,7 @@ const HELP_GLOBAL: [(&str, &str); 13] = [
     ("q / Ctrl-C", "quit"),
     ("?", "keys overlay on any page"),
 ];
-const HELP_CONTEXTUAL: [(&str, &str); 23] = [
+const HELP_CONTEXTUAL: [(&str, &str); 27] = [
     ("/", "filter name / path / PID"),
     ("o", "cycle process sort"),
     ("g", "agent-only process focus"),
@@ -6454,6 +6921,16 @@ const HELP_CONTEXTUAL: [(&str, &str); 23] = [
         "choose a video file; Del / Backspace turns it off",
     ),
     ("s", "save settings"),
+    ("c on Launches", "filter the list to console hosts"),
+    ("o on Launches", "move the cursor to the occurrence list"),
+    (
+        "Enter / h on Launches",
+        "hunt the launch, when that exact process is still running",
+    ),
+    (
+        "l on Launches",
+        "show the still-running launch in the lineage tree",
+    ),
     ("Esc", "cancel input / modal"),
 ];
 
@@ -6683,8 +7160,11 @@ fn page_hints(page: Page) -> &'static str {
             "Enter ask  ·  e edit last  ·  n new  ·  h vault (r rename · d delete)  ·  y copy  ·  [ ] evidence"
         }
         Page::Settings => "Enter edit  ·  s commit  ·  r revert",
-        Page::Help => "1–8 route  ·  Tab cycle  ·  ? overlay anywhere",
+        Page::Help => "1–9 route  ·  Tab cycle  ·  ? overlay anywhere",
         Page::Hardware => "temperatures + clocks resample every 5s  ·  r refresh",
+        Page::Launches => {
+            "j/k groups  ·  o occurrences  ·  c console filter  ·  Enter/h hunt  ·  l lineage  ·  r refresh"
+        }
     }
 }
 
@@ -7010,7 +7490,8 @@ mod tests {
     use super::*;
     use crate::app::{HardwareTrace, TreeRow};
     use pcpulse_service::models::{
-        GpuMetrics, LiveSample, ProcessMetric, ProcessNode, Snapshot, SystemMetric, ThermalZone,
+        GpuMetrics, LaunchEvent, LineageEntry, LiveSample, ProcessMetric, ProcessNode, Snapshot,
+        SystemMetric, ThermalZone,
     };
     use ratatui::{Terminal, backend::TestBackend, buffer::Buffer};
     use std::collections::VecDeque;
@@ -8284,11 +8765,15 @@ mod tests {
             "[6] ASK",
             "[7] TUNE",
             "[8] GAUGE",
+            "[9] LAUNCH",
             "[?] KEYS",
         ] {
             assert!(text.contains(key), "missing bezel key {key}");
         }
-        assert!(!text.contains("[9]"), "no bezel key carries a 9");
+        assert!(
+            !text.contains("[10]"),
+            "KEYS is the appendix: no bezel key carries a tenth digit"
+        );
         // Annunciator lamps: one per finding class plus the SYS catch-all.
         assert!(
             row_text(backend.buffer(), 0)
@@ -8449,7 +8934,7 @@ mod tests {
                 .any(|cell| cell.bg == palette().text)
         );
         // The folio carries the page number, hints, and the status.
-        assert!(text.contains("№01/09 OBSERVE"));
+        assert!(text.contains("№01/10 OBSERVE"));
         assert!(text.contains("t profile"));
         assert!(text.contains("Settings saved"));
     }
@@ -8842,8 +9327,10 @@ mod tests {
             let _theme = theme::test_support::activate(theme::ThemeId::Avionics);
             let mut app = sample_app();
             let tabs = regions(area).tabs;
-            assert_eq!(rail_key_at(tabs.y + 8, tabs), Some(Page::Help));
-            assert!(handle_mouse(&mut app, click(tabs.x + 2, tabs.y + 8), area));
+            // The appendix is the last bezel key, wherever Page::ALL puts it.
+            let row = tabs.y + page_index(Page::Help) as u16;
+            assert_eq!(rail_key_at(row, tabs), Some(Page::Help));
+            assert!(handle_mouse(&mut app, click(tabs.x + 2, row), area));
             assert_eq!(app.page, Page::Help);
         }
         // Ledger: the printed masthead index's "? KEYS" entry.
@@ -11434,6 +11921,302 @@ mod tests {
         assert!(
             backdrop < surface && surface < raised,
             "the chrome layers must stay stacked: {backdrop} < {surface} < {raised}"
+        );
+    }
+
+    // ---- Launch history ------------------------------------------------
+
+    fn line_text(line: &Line<'_>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    fn launch_group_fixture(
+        exe_name: &str,
+        exe_path: &str,
+        lineage_sig: &str,
+        count: usize,
+        console_host: bool,
+    ) -> LaunchGroup {
+        LaunchGroup {
+            exe_name: exe_name.into(),
+            exe_path: exe_path.into(),
+            lineage_sig: lineage_sig.into(),
+            launcher_summary: lineage_sig
+                .split('<')
+                .next()
+                .filter(|value| !value.is_empty())
+                .unwrap_or("unknown")
+                .into(),
+            count,
+            first_ms: 1_799_000_000_000,
+            last_ms: 1_799_999_400_000,
+            median_interval_ms: Some(300_000),
+            mean_duration_ms: Some(9_000),
+            max_duration_ms: Some(21_000),
+            windowed: count,
+            never_windowed: 0,
+            unobserved: 0,
+            running: 0,
+            console_host,
+        }
+    }
+
+    /// An app parked on LAUNCHES with two recorded groups, the second of
+    /// them a console host, and one occurrence in the drill-down.
+    fn launches_app() -> App {
+        let mut app = sample_app();
+        app.page = Page::Launches;
+        app.launch_groups = vec![
+            launch_group_fixture(
+                "notepad.exe",
+                r"c:\windows\system32\notepad.exe",
+                "explorer.exe",
+                12,
+                false,
+            ),
+            launch_group_fixture(
+                "ripgrep.exe",
+                r"c:\tools\ripgrep.exe",
+                "cmd.exe<explorer.exe",
+                7,
+                true,
+            ),
+        ];
+        app.launch_state.select(Some(0));
+        app.launch_key = Some((
+            r"c:\windows\system32\notepad.exe".into(),
+            "explorer.exe".into(),
+        ));
+        app.launch_occurrences = vec![LaunchEvent {
+            pid: 8801,
+            start_time_ms: 1_799_999_400_000,
+            stop_time_ms: Some(1_799_999_409_000),
+            exit_code: Some(0),
+            exe_name: "notepad.exe".into(),
+            exe_path: r"c:\windows\system32\notepad.exe".into(),
+            raw_image_path: None,
+            session_id: 1,
+            parent_pid: 900,
+            lineage: vec![LineageEntry {
+                pid: 900,
+                name: "explorer.exe".into(),
+                path: Some(r"c:\windows\explorer.exe".into()),
+            }],
+            window_state: WindowState::Windowed,
+            console_host: false,
+            command_line: None,
+        }];
+        app.launch_occurrence_state.select(Some(0));
+        app
+    }
+
+    #[test]
+    fn launches_lists_its_groups_with_counts_and_the_console_tag() {
+        let _guard = theme::test_support::activate(theme::ThemeId::Vitals);
+        let mut app = launches_app();
+        let text = buffer_text(render(&mut app).buffer());
+        assert!(text.contains("notepad.exe"), "the exe name");
+        assert!(text.contains("explorer.exe"), "the launcher summary");
+        assert!(text.contains("ripgrep.exe"), "the second group");
+        assert!(text.contains("[console]"), "the console-host tag");
+        // The window glyph legend and the counts both print.
+        assert!(text.contains('▣'), "the windowed glyph");
+    }
+
+    #[test]
+    fn launches_route_chrome_carries_the_page_across_every_profile() {
+        {
+            let _guard = theme::test_support::activate(theme::ThemeId::Vitals);
+            let mut app = launches_app();
+            assert!(buffer_text(render(&mut app).buffer()).contains("LAUNCHES"));
+        }
+        {
+            let _guard = theme::test_support::activate(theme::ThemeId::Ledger);
+            let mut app = launches_app();
+            assert!(buffer_text(render(&mut app).buffer()).contains("LAUNCHES"));
+        }
+        {
+            // The avionics rail prints the digit on its bezel key.
+            let _guard = theme::test_support::activate(theme::ThemeId::Avionics);
+            let mut app = sample_app();
+            app.handle_key(ratatui::crossterm::event::KeyEvent::new(
+                ratatui::crossterm::event::KeyCode::Char('9'),
+                ratatui::crossterm::event::KeyModifiers::NONE,
+            ));
+            assert_eq!(app.page, Page::Launches);
+            assert!(buffer_text(render(&mut app).buffer()).contains("[9] LAUNCH"));
+        }
+    }
+
+    #[test]
+    fn launch_detail_pins_the_uncertainty_copy_byte_exactly() {
+        let _guard = theme::test_support::activate(theme::ThemeId::Vitals);
+        let mut app = launches_app();
+        // An occurrence that outlived nothing the sampler ever saw, whose
+        // pid is not alive now, with command-line capture off.
+        app.launch_occurrences[0].window_state = WindowState::Unobserved;
+        app.launch_occurrences[0].pid = 65_001;
+        if let Some(snapshot) = app.snapshot.as_mut() {
+            snapshot.launch_capture.cmdline_session_active = false;
+        }
+        let lines = launch_detail_lines(&app, 1_800_000_000_000);
+        let rendered: Vec<String> = lines.iter().map(line_text).collect();
+
+        assert!(
+            rendered
+                .iter()
+                .any(|line| line
+                    == "window state unobserved — lived less than one sampling interval"),
+            "{rendered:#?}"
+        );
+        assert!(
+            rendered
+                .iter()
+                .any(|line| line == "process has exited — showing recorded lineage"),
+            "{rendered:#?}"
+        );
+        assert!(
+            rendered.iter().any(|line| line
+                == "Command-line capture is off — PC Pulse can identify the executable and launcher, but not the exact command or script."),
+            "{rendered:#?}"
+        );
+
+        // The dead-process note sits above the recorded lineage it explains.
+        let note = rendered
+            .iter()
+            .position(|line| line == "process has exited — showing recorded lineage")
+            .expect("dead-process note");
+        let lineage = rendered
+            .iter()
+            .position(|line| line.contains("explorer.exe"))
+            .expect("recorded lineage");
+        assert!(note < lineage, "{rendered:#?}");
+    }
+
+    #[test]
+    fn a_stored_command_line_still_shows_while_capture_is_off() {
+        let _guard = theme::test_support::activate(theme::ThemeId::Vitals);
+        let mut app = launches_app();
+        app.launch_occurrences[0].command_line = Some("notepad.exe c:\\notes.txt".into());
+        if let Some(snapshot) = app.snapshot.as_mut() {
+            snapshot.launch_capture.cmdline_session_active = false;
+        }
+        let rendered: Vec<String> = launch_detail_lines(&app, 1_800_000_000_000)
+            .iter()
+            .map(line_text)
+            .collect();
+        assert!(
+            rendered
+                .iter()
+                .any(|line| line.contains("notepad.exe c:\\notes.txt")),
+            "a line captured while the setting was on is still served: {rendered:#?}"
+        );
+        assert!(
+            rendered.iter().any(|line| line
+                == "Command-line capture is off — PC Pulse can identify the executable and launcher, but not the exact command or script."),
+            "and the off-state sentence still covers *new* capture: {rendered:#?}"
+        );
+    }
+
+    #[test]
+    fn the_launch_footer_reports_loss_and_the_console_filter() {
+        let mut app = launches_app();
+        if let Some(snapshot) = app.snapshot.as_mut() {
+            snapshot.launch_capture = LaunchCaptureStatus {
+                starts_seen: 40,
+                stops_seen: 38,
+                persisted: 40,
+                dropped_channel: 2,
+                etw_events_lost: 3,
+                malformed_events: 1,
+                ..LaunchCaptureStatus::default()
+            };
+        }
+        let quiet = launch_footer_text(&app);
+        assert!(quiet.contains("capture incomplete (6 lost)"), "{quiet}");
+        assert!(
+            !quiet.contains("filter: console hosts"),
+            "no filter is claimed while none is on: {quiet}"
+        );
+
+        app.launch_console_only = true;
+        let filtered = launch_footer_text(&app);
+        assert!(filtered.contains("filter: console hosts"), "{filtered}");
+    }
+
+    #[test]
+    fn a_clean_capture_never_claims_loss() {
+        let app = launches_app();
+        let footer = launch_footer_text(&app);
+        assert!(!footer.contains("capture incomplete"), "{footer}");
+    }
+
+    #[test]
+    fn launch_clicks_land_on_the_table_they_were_aimed_at() {
+        let _guard = theme::test_support::activate(theme::ThemeId::Vitals);
+        let area = Rect::new(0, 0, 150, 46);
+        let mut app = launches_app();
+        // Enough occurrences that a mis-mapped click below the table would
+        // have a real row index to land on.
+        let template = app.launch_occurrences[0].clone();
+        for step in 1..40u32 {
+            let mut occurrence = template.clone();
+            occurrence.pid = 9_000 + step;
+            occurrence.start_time_ms -= i64::from(step) * 60_000;
+            app.launch_occurrences.push(occurrence);
+        }
+        let click = |column: u16, row: u16| MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row,
+            modifiers: ratatui::crossterm::event::KeyModifiers::NONE,
+        };
+        let body = regions(area).body;
+        let (groups, detail, _) = launches_regions(body);
+
+        // The second group's row.
+        let groups_table = inset(groups);
+        assert!(handle_mouse(
+            &mut app,
+            click(groups_table.x + 2, groups_table.y + 4),
+            area
+        ));
+        assert_eq!(app.launch_state.selected(), Some(1));
+        assert!(!app.launch_detail_focused);
+
+        // ...and a click in the record pane below the occurrence table is
+        // not an occurrence row, however many rows the list has.
+        app.launch_occurrence_state.select(Some(0));
+        let record = launch_detail_rows(detail)[1];
+        assert!(!handle_mouse(
+            &mut app,
+            click(record.x + 2, record.y + 2),
+            area
+        ));
+        assert_eq!(app.launch_occurrence_state.selected(), Some(0));
+    }
+
+    #[test]
+    fn the_window_glyph_never_guesses_past_what_was_observed() {
+        let mut group = launch_group_fixture("a.exe", r"c:\a.exe", "", 4, false);
+        group.windowed = 1;
+        group.never_windowed = 3;
+        assert_eq!(launch_window_glyph(&group), "▣", "any windowed wins");
+        group.windowed = 0;
+        assert_eq!(launch_window_glyph(&group), "▢");
+        group.never_windowed = 1;
+        group.unobserved = 3;
+        assert_eq!(launch_window_glyph(&group), "?");
+        group.never_windowed = 0;
+        group.unobserved = 0;
+        group.running = 4;
+        assert_eq!(
+            launch_window_glyph(&group),
+            "?",
+            "nothing has been observed yet: '?' is the honest answer"
         );
     }
 }

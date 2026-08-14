@@ -13,10 +13,11 @@ use chrono::Utc;
 use crossbeam_channel::{Receiver, Sender, bounded, select};
 use pcpulse_service::{
     config::Settings,
+    launches::LaunchGroup,
     models::{
         Alert, DiagnosticLogResponse, DiagnosticLogStatus, HardwareMetrics, HistoryResponse,
-        LiveSample, OptimizationPlan, ProcessMetric, ProcessNode, Rating, RatingVerdict, Severity,
-        Snapshot, SystemMetric,
+        LaunchEvent, LiveSample, OptimizationPlan, ProcessMetric, ProcessNode, Rating,
+        RatingVerdict, Severity, Snapshot, SystemMetric,
     },
     quality::{PolicyOffsets, derive_offsets},
     // The engine's own bound on how much rating history the policy is
@@ -60,6 +61,15 @@ const LIVE_MAX_HZ: u32 = 8;
 /// Two left clicks on the same finding row within this window count as a
 /// double-click and open an investigation.
 const DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(400);
+/// How many launch groups the LAUNCHES page asks for — the service's own
+/// transport clamp, so the page sees everything the protocol will serve.
+const LAUNCH_GROUP_LIMIT: usize = 500;
+/// How many occurrences one group's drill-down asks for. Well under the
+/// service's 1000 clamp on purpose: the handler scans its whole seven-day
+/// window per request, and the drill-down is a reading surface, not an
+/// archive — 200 rows is more than a pane can show and a fraction of the
+/// work the ceiling would cost.
+const LAUNCH_OCCURRENCE_LIMIT: usize = 200;
 /// The status line a running background conversion owns, and the prefix the
 /// worker's per-percent updates extend. Shared so that "is a conversion
 /// already speaking?" is a check against the real string rather than a
@@ -74,6 +84,10 @@ const CHOOSING_STATUS: &str = "Choosing a video…";
 pub const RATING_NUDGE_STATUS: &str = "rate how this machine feels — press f";
 /// What the statusline says once the service has stored a rating.
 pub const RATING_RECORDED_STATUS: &str = "rating recorded — thanks";
+/// What the status line says when a LAUNCHES jump has nowhere live to go.
+/// The detail pane makes the same point in its own words; this is the
+/// keystroke's own acknowledgement that it was heard and had no target.
+pub const LAUNCH_EXITED_STATUS: &str = "that launch has exited — showing its recorded lineage";
 /// The nudge is shown at most once a day (spec UX).
 pub const RATING_NUDGE_INTERVAL_MS: i64 = 24 * 3_600_000;
 /// …and only after the trailing hour held at least this many heavy minutes.
@@ -102,13 +116,14 @@ pub enum Page {
     Settings,
     Help,
     Hardware,
+    Launches,
 }
 
 impl Page {
     /// Every page in tab order. The KEYS reference deliberately sits last —
     /// it is the appendix, reached by Tab wrap-around or its printed "?"
     /// entry, and it is the only page without a digit key.
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::Overview,
         Self::Processes,
         Self::Tree,
@@ -117,6 +132,7 @@ impl Page {
         Self::Analyzer,
         Self::Settings,
         Self::Hardware,
+        Self::Launches,
         Self::Help,
     ];
 
@@ -131,6 +147,7 @@ impl Page {
             Self::Settings => "Settings",
             Self::Help => "Keys",
             Self::Hardware => "Gauges",
+            Self::Launches => "Launches",
         }
     }
 }
@@ -783,6 +800,21 @@ pub enum WorkerCommand {
     /// Re-read the rating history the incidents pane derives its displayed
     /// policy offsets from.
     RefreshRatings,
+    /// Re-read the LAUNCHES groups list. Cheap enough for page entry and
+    /// the `r` refresh: the service groups an already-indexed window.
+    RefreshLaunchGroups {
+        console_hosts_only: bool,
+    },
+    /// One group's occurrences. Sent only when the selected group changes:
+    /// the service walks its whole 7-day window per request, so this must
+    /// never ride along with a periodic refresh. `exe_path`/`lineage_sig`
+    /// are passed through byte-exactly as `getLaunchGroups` served them —
+    /// the stored values are already lowercased and are matched literally,
+    /// so re-casing or normalizing them would match nothing.
+    RefreshLaunchOccurrences {
+        exe_path: String,
+        lineage_sig: String,
+    },
     /// One launch-time release check against GitHub; sent only when the
     /// `updateChecks` preference is on and the 20-hour cadence is due.
     CheckUpdate,
@@ -832,6 +864,19 @@ pub enum WorkerEvent {
     /// swallowed rather than shown, because nothing the user did asked for
     /// this fetch.
     Ratings(Result<Vec<Rating>, String>),
+    /// The LAUNCHES groups list. `Err` carries the reason (including the
+    /// unknown-command error a pre-launch-history service answers with) so
+    /// the page can say why it is empty instead of implying nothing ever
+    /// launched.
+    LaunchGroups(Result<Vec<LaunchGroup>, String>),
+    /// One group's occurrences, tagged with the key they were asked for:
+    /// the selection can move while a request is in flight, and a reply for
+    /// a group that is no longer selected must be dropped, not displayed.
+    LaunchOccurrences {
+        exe_path: String,
+        lineage_sig: String,
+        result: Result<Vec<LaunchEvent>, String>,
+    },
     Action(Result<String, String>),
     /// The launch-time release check: `Ok(Some)` = a newer release with a
     /// downloadable MSI, `Ok(None)` = up to date, `Err` = offline, rate
@@ -1033,6 +1078,28 @@ fn worker_loop(commands: Receiver<WorkerCommand>, events: Sender<WorkerEvent>) {
                             client.ratings(POLICY_OFFSET_RATINGS).map_err(error_text),
                         ));
                     }
+                    Ok(WorkerCommand::RefreshLaunchGroups { console_hosts_only }) => {
+                        let result = client
+                            .launch_groups(console_hosts_only, LAUNCH_GROUP_LIMIT)
+                            .map(|response| response.groups)
+                            .map_err(error_text);
+                        let _ = events.send(WorkerEvent::LaunchGroups(result));
+                    }
+                    Ok(WorkerCommand::RefreshLaunchOccurrences { exe_path, lineage_sig }) => {
+                        let result = client
+                            .launch_occurrences(
+                                exe_path.clone(),
+                                lineage_sig.clone(),
+                                LAUNCH_OCCURRENCE_LIMIT,
+                            )
+                            .map(|response| response.events)
+                            .map_err(error_text);
+                        let _ = events.send(WorkerEvent::LaunchOccurrences {
+                            exe_path,
+                            lineage_sig,
+                            result,
+                        });
+                    }
                     Ok(WorkerCommand::CheckUpdate) => {
                         // Fire-and-forget on its own thread so a slow or
                         // stalled HTTPS exchange never delays snapshots.
@@ -1226,6 +1293,28 @@ pub struct App {
     /// empty until the first `getRatings` answers (an older collector never
     /// fills it).
     pub ratings: Vec<Rating>,
+    /// LAUNCHES: recorded launches bucketed by `(exe_path, lineage_sig)`,
+    /// as the service grouped them. Never re-sorted here — the ordering is
+    /// the service's 24-hour recurrence ranking.
+    pub launch_groups: Vec<LaunchGroup>,
+    /// The selected group's occurrences, newest first, or empty while a
+    /// fetch is in flight.
+    pub launch_occurrences: Vec<LaunchEvent>,
+    /// Which group `launch_occurrences` was asked for, byte-exact as the
+    /// service served it. Also the guard that drops a reply arriving after
+    /// the selection has moved on.
+    pub(crate) launch_key: Option<(String, String)>,
+    /// The `c` filter: fetch only groups whose launches were console hosts.
+    /// A filter, never a verdict — a console host is not a suspect.
+    pub launch_console_only: bool,
+    /// `o` moves the cursor between the groups table and the occurrence
+    /// list, so `j`/`k` and the wheel drive whichever the operator is
+    /// reading.
+    pub launch_detail_focused: bool,
+    /// Why the groups list is empty, when it is empty for a reason —
+    /// notably the unknown-command error a pre-1.20 collector answers with.
+    /// Shown in the page's own panel rather than the shared status line.
+    pub launch_error: Option<String>,
     /// The '?' keys overlay: `Some(scroll)` while open. Deliberately not an
     /// [`InputMode`] variant — the effects layer diffs `InputMode` through
     /// its own `ModeKind`, and the overlay is chrome, not an input state.
@@ -1290,6 +1379,12 @@ pub struct App {
     pub process_state: TableState,
     pub tree_state: TableState,
     pub alert_state: TableState,
+    pub launch_state: TableState,
+    pub launch_occurrence_state: TableState,
+    /// A pid a LAUNCHES jump asked the LINEAGE page to select, held until
+    /// that page's tree actually arrives — the fetch is a round trip, and on
+    /// a first visit there is no tree to select in yet.
+    pending_tree_pid: Option<u32>,
     /// Most recent left click on a finding row, for double-click detection.
     alert_last_click: Option<(usize, Instant)>,
     pub plan_action_state: ListState,
@@ -1381,6 +1476,12 @@ impl App {
             mode: InputMode::Normal,
             rating_offsets: PolicyOffsets::default(),
             ratings: Vec::new(),
+            launch_groups: Vec::new(),
+            launch_occurrences: Vec::new(),
+            launch_key: None,
+            launch_console_only: false,
+            launch_detail_focused: false,
+            launch_error: None,
             help_overlay: None,
             client_prefs: UiPrefs::default(),
             background: None,
@@ -1401,6 +1502,9 @@ impl App {
             process_state: TableState::default().with_selected(0),
             tree_state: TableState::default().with_selected(0),
             alert_state: TableState::default().with_selected(0),
+            launch_state: TableState::default().with_selected(0),
+            launch_occurrence_state: TableState::default().with_selected(0),
+            pending_tree_pid: None,
             alert_last_click: None,
             plan_action_state: ListState::default().with_selected(Some(0)),
             setting_state: TableState::default().with_selected(0),
@@ -1508,6 +1612,11 @@ impl App {
                     self.tree.clear();
                     flatten_tree(&nodes, 0, &mut self.tree);
                     self.clamp_selection();
+                    // A LAUNCHES `l` jump lands here before the tree it
+                    // asked for exists; honor its pid now that it does.
+                    if let Some(pid) = self.pending_tree_pid.take() {
+                        self.select_tree_pid(pid);
+                    }
                 }
                 WorkerEvent::Diagnostics(Ok(diagnostics)) => {
                     self.diagnostics = diagnostics;
@@ -1563,6 +1672,53 @@ impl App {
                 // fetch, so it fails silently rather than parking an error
                 // banner on a perfectly working older collector.
                 WorkerEvent::Ratings(Err(_)) => {}
+                WorkerEvent::LaunchGroups(Ok(groups)) => {
+                    self.launch_error = None;
+                    self.launch_groups = groups;
+                    if self.launch_state.selected().is_none() && !self.launch_groups.is_empty() {
+                        self.launch_state.select(Some(0));
+                    }
+                    self.clamp_selection();
+                    // The selected group may be a different one than before
+                    // the refresh (the service re-ranks by recent activity),
+                    // so the drill-down follows it — and only then.
+                    self.sync_launch_occurrences();
+                }
+                // Kept on the page rather than the status line: an empty
+                // list because the collector predates launch history is a
+                // different fact from an empty list because nothing ran.
+                WorkerEvent::LaunchGroups(Err(error)) => {
+                    self.launch_groups.clear();
+                    self.launch_occurrences.clear();
+                    self.launch_occurrence_state.select(None);
+                    self.launch_key = None;
+                    self.launch_error = Some(error);
+                    self.clamp_selection();
+                }
+                WorkerEvent::LaunchOccurrences {
+                    exe_path,
+                    lineage_sig,
+                    result,
+                } => {
+                    // A reply for a group the selection has already left is
+                    // stale by definition: showing it would attach one
+                    // group's occurrences to another's row.
+                    if self.launch_key.as_ref() != Some(&(exe_path.clone(), lineage_sig.clone())) {
+                        continue;
+                    }
+                    match result {
+                        Ok(events) => {
+                            self.launch_occurrences = events;
+                            self.launch_occurrence_state
+                                .select((!self.launch_occurrences.is_empty()).then_some(0));
+                        }
+                        Err(error) => {
+                            self.launch_occurrences.clear();
+                            self.launch_occurrence_state.select(None);
+                            self.launch_error = Some(error);
+                        }
+                    }
+                }
                 WorkerEvent::Action(Ok(message)) => {
                     self.status = message;
                     self.status_is_error = false;
@@ -1981,9 +2137,9 @@ impl App {
             KeyCode::Tab | KeyCode::Right if self.page != Page::Settings => self.change_page(1),
             KeyCode::BackTab | KeyCode::Left if self.page != Page::Settings => self.change_page(-1),
             KeyCode::Char('?') => self.help_overlay = Some(0),
-            // Digits address the first eight pages only; the KEYS page has
+            // Digits address the first nine pages only; the KEYS page has
             // no digit — Tab wraps to it, and '?' opens the quick overlay.
-            KeyCode::Char(value @ '1'..='8') => {
+            KeyCode::Char(value @ '1'..='9') => {
                 self.select_page(Page::ALL[(value as u8 - b'1') as usize]);
             }
             KeyCode::Esc if self.page == Page::Analyzer && self.analyzer_running => {
@@ -2054,6 +2210,26 @@ impl App {
             }
             KeyCode::Char('x') if matches!(self.page, Page::Processes | Page::Tree) => {
                 self.begin_termination();
+            }
+            KeyCode::Char('c') if self.page == Page::Launches => {
+                self.toggle_launch_console_filter();
+            }
+            KeyCode::Char('o') if self.page == Page::Launches => {
+                self.launch_detail_focused = !self.launch_detail_focused;
+            }
+            // Read-only jumps: they change which page is looking at the
+            // process, never the process itself.
+            KeyCode::Enter | KeyCode::Char('h') if self.page == Page::Launches => {
+                if !self.jump_to_live_launch(Page::Processes) {
+                    self.status = LAUNCH_EXITED_STATUS.into();
+                    self.status_is_error = false;
+                }
+            }
+            KeyCode::Char('l') if self.page == Page::Launches => {
+                if !self.jump_to_live_launch(Page::Tree) {
+                    self.status = LAUNCH_EXITED_STATUS.into();
+                    self.status_is_error = false;
+                }
             }
             KeyCode::Char('a') if self.page == Page::Alerts => self.acknowledge_selected(),
             KeyCode::Char('z') if self.page == Page::Alerts => self.archive_selected(),
@@ -2500,11 +2676,140 @@ impl App {
             }),
             Page::Analyzer => Some(WorkerCommand::RefreshAnalyzer),
             Page::Settings => Some(WorkerCommand::LoadSettings),
+            Page::Launches => Some(WorkerCommand::RefreshLaunchGroups {
+                console_hosts_only: self.launch_console_only,
+            }),
             _ => None,
         };
         if let Some(command) = command {
             let _ = self.worker.commands.try_send(command);
         }
+    }
+
+    pub fn selected_launch_group(&self) -> Option<&LaunchGroup> {
+        self.launch_state
+            .selected()
+            .and_then(|index| self.launch_groups.get(index))
+    }
+
+    pub fn selected_launch_occurrence(&self) -> Option<&LaunchEvent> {
+        self.launch_occurrence_state
+            .selected()
+            .and_then(|index| self.launch_occurrences.get(index))
+    }
+
+    /// Point the drill-down at whichever group is selected now, fetching its
+    /// occurrences only if that is a different group than the one already
+    /// loaded. The guard is the point: `getLaunchOccurrences` costs the
+    /// service a walk of its whole seven-day window, so it must not fire on
+    /// every keystroke, refresh, or repaint.
+    pub(crate) fn sync_launch_occurrences(&mut self) {
+        let key = self
+            .selected_launch_group()
+            .map(|group| (group.exe_path.clone(), group.lineage_sig.clone()));
+        if key == self.launch_key {
+            return;
+        }
+        self.launch_occurrences.clear();
+        self.launch_occurrence_state.select(None);
+        self.launch_key = key.clone();
+        if let Some((exe_path, lineage_sig)) = key {
+            let _ = self
+                .worker
+                .commands
+                .try_send(WorkerCommand::RefreshLaunchOccurrences {
+                    exe_path,
+                    lineage_sig,
+                });
+        }
+    }
+
+    /// `c`: narrow the groups list to launches that were console hosts —
+    /// stated as a filter, because a console window is a fact about how a
+    /// program ran, not a verdict about it.
+    pub(crate) fn toggle_launch_console_filter(&mut self) {
+        self.launch_console_only = !self.launch_console_only;
+        self.launch_groups.clear();
+        self.launch_state.select(Some(0));
+        // The filter changes which groups exist, so whatever the drill-down
+        // holds is about to be answered for by a fresh selection.
+        self.launch_occurrences.clear();
+        self.launch_occurrence_state.select(None);
+        self.launch_key = None;
+        self.launch_detail_focused = false;
+        self.refresh_page();
+    }
+
+    /// The pid of the selected occurrence *if that exact launch is still
+    /// running* — matched on pid **and** start time, both of which come from
+    /// the same process-creation FILETIME on either side. Pid alone would be
+    /// a lie the moment Windows reuses one, which on a busy machine is the
+    /// common case for the short-lived launches this page is full of.
+    pub(crate) fn live_launch_pid(&self) -> Option<u32> {
+        let occurrence = self.selected_launch_occurrence()?;
+        let snapshot = self.snapshot.as_ref()?;
+        snapshot
+            .processes
+            .iter()
+            .find(|process| {
+                process.pid == occurrence.pid && process.started_at_ms == occurrence.start_time_ms
+            })
+            .map(|process| process.pid)
+    }
+
+    /// `Enter`/`h` (HUNT) and `l` (LINEAGE): follow a launch that is still
+    /// alive onto the page that can act on it. A launch that has exited
+    /// stays here — there is nothing live to select, and the recorded
+    /// lineage the detail pane already shows is the honest answer.
+    pub(crate) fn jump_to_live_launch(&mut self, page: Page) -> bool {
+        let Some(pid) = self.live_launch_pid() else {
+            return false;
+        };
+        self.select_page(page);
+        match page {
+            Page::Processes => {
+                // A live pid is in the current snapshot by definition, but
+                // the filter in force may still hide its row; clearing it
+                // is what makes the jump land where it says it does.
+                if !self
+                    .visible_processes()
+                    .iter()
+                    .any(|process| process.pid == pid)
+                {
+                    self.process_filter.clear();
+                    self.agents_only = false;
+                }
+                if let Some(index) = self
+                    .visible_processes()
+                    .iter()
+                    .position(|process| process.pid == pid)
+                {
+                    self.process_state.select(Some(index));
+                }
+            }
+            Page::Tree => {
+                // `select_page` just asked for a fresh tree; if the one in
+                // hand already holds the pid this lands immediately, and
+                // otherwise the reply carries it.
+                let landed = self.select_tree_pid(pid);
+                self.pending_tree_pid = (!landed).then_some(pid);
+            }
+            _ => {}
+        }
+        true
+    }
+
+    /// Selects `pid` in the LINEAGE table, reporting whether it was there.
+    fn select_tree_pid(&mut self, pid: u32) -> bool {
+        let Some(index) = self
+            .visible_tree_rows()
+            .iter()
+            .position(|row| row.process.pid == pid)
+        else {
+            return false;
+        };
+        self.tree_state.select(Some(index));
+        true
     }
 
     pub(crate) fn begin_termination(&mut self) {
@@ -3082,6 +3387,18 @@ impl App {
                 }
             }
             Page::Settings => move_table(&mut self.setting_state, SettingField::ALL.len(), delta),
+            Page::Launches => {
+                if self.launch_detail_focused {
+                    move_table(
+                        &mut self.launch_occurrence_state,
+                        self.launch_occurrences.len(),
+                        delta,
+                    );
+                } else {
+                    move_table(&mut self.launch_state, self.launch_groups.len(), delta);
+                    self.sync_launch_occurrences();
+                }
+            }
             _ => {}
         }
     }
@@ -3092,6 +3409,11 @@ impl App {
         clamp_table(&mut self.process_state, process_count);
         clamp_table(&mut self.tree_state, self.tree.len());
         clamp_table(&mut self.alert_state, alert_count);
+        clamp_table(&mut self.launch_state, self.launch_groups.len());
+        clamp_table(
+            &mut self.launch_occurrence_state,
+            self.launch_occurrences.len(),
+        );
         clamp_list(&mut self.chat_session_state, self.chat_sessions.len() + 1);
         let action_count = self.plans.first().map_or(0, |plan| plan.actions.len());
         clamp_list(&mut self.plan_action_state, action_count);
@@ -3927,6 +4249,7 @@ fn write_clipboard_via_clip(text: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pcpulse_service::models::{LineageEntry, WindowState};
 
     #[test]
     #[ignore = "dev harness: prices the App::drain_events snapshot-ingest path; run with --ignored --nocapture"]
@@ -4007,14 +4330,14 @@ mod tests {
     }
 
     #[test]
-    fn key_8_routes_to_gauges_and_keys_sits_last_without_a_digit() {
+    fn digits_route_the_nine_addressable_pages_and_keys_sits_last_without_one() {
         let mut app = App::new_inert();
         app.handle_key(KeyEvent::new(KeyCode::Char('8'), KeyModifiers::NONE));
         assert_eq!(app.page, Page::Hardware);
-        // '9' addresses nothing: the KEYS page has no digit.
+        // '9' is LAUNCHES, the last page with a digit.
         app.handle_key(KeyEvent::new(KeyCode::Char('9'), KeyModifiers::NONE));
-        assert_eq!(app.page, Page::Hardware);
-        // Tab from GAUGES reaches the KEYS appendix, then wraps to Overview.
+        assert_eq!(app.page, Page::Launches);
+        // Tab from LAUNCHES reaches the KEYS appendix, then wraps to Overview.
         app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         assert_eq!(app.page, Page::Help);
         app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
@@ -4022,10 +4345,16 @@ mod tests {
         // Shift-Tab reaches KEYS from Overview.
         app.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE));
         assert_eq!(app.page, Page::Help);
-        assert_eq!(Page::ALL.len(), 9);
+        // ...and one more step back is LAUNCHES: it sits immediately before
+        // the appendix in the cycle.
+        app.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE));
+        assert_eq!(app.page, Page::Launches);
+        assert_eq!(Page::ALL.len(), 10);
         assert_eq!(Page::ALL[7], Page::Hardware);
-        assert_eq!(Page::ALL[8], Page::Help);
+        assert_eq!(Page::ALL[8], Page::Launches);
+        assert_eq!(Page::ALL[9], Page::Help);
         assert_eq!(Page::Help.title(), "Keys");
+        assert_eq!(Page::Launches.title(), "Launches");
         // '?' still opens the quick overlay rather than routing pages.
         app.handle_key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE));
         app.handle_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE));
@@ -6967,5 +7296,264 @@ mod tests {
         let (elapsed, budget) = app.analyzer_progress().unwrap();
         assert!(elapsed <= 1);
         assert!((30..=1_800).contains(&budget));
+    }
+
+    // ---- Launch history -------------------------------------------------
+
+    pub(crate) fn launch_group(exe_path: &str, lineage_sig: &str, count: usize) -> LaunchGroup {
+        LaunchGroup {
+            exe_name: exe_path.rsplit('\\').next().unwrap_or(exe_path).to_string(),
+            exe_path: exe_path.into(),
+            lineage_sig: lineage_sig.into(),
+            launcher_summary: lineage_sig
+                .split('<')
+                .next()
+                .filter(|value| !value.is_empty())
+                .unwrap_or("unknown")
+                .to_string(),
+            count,
+            first_ms: 1_800_000_000_000,
+            last_ms: 1_800_000_600_000,
+            median_interval_ms: Some(60_000),
+            mean_duration_ms: Some(4_000),
+            max_duration_ms: Some(9_000),
+            windowed: count,
+            never_windowed: 0,
+            unobserved: 0,
+            running: 0,
+            console_host: false,
+        }
+    }
+
+    pub(crate) fn launch_occurrence(pid: u32, start_time_ms: i64) -> LaunchEvent {
+        LaunchEvent {
+            pid,
+            start_time_ms,
+            stop_time_ms: Some(start_time_ms + 4_000),
+            exit_code: Some(0),
+            exe_name: "notepad.exe".into(),
+            exe_path: r"c:\windows\system32\notepad.exe".into(),
+            raw_image_path: None,
+            session_id: 1,
+            parent_pid: 900,
+            lineage: vec![LineageEntry {
+                pid: 900,
+                name: "explorer.exe".into(),
+                path: Some(r"c:\windows\explorer.exe".into()),
+            }],
+            window_state: WindowState::Windowed,
+            console_host: false,
+            command_line: None,
+        }
+    }
+
+    fn snapshot_with_live_process(pid: u32, started_at_ms: i64) -> Snapshot {
+        let mut snapshot = Snapshot::default();
+        snapshot.processes.push(ProcessMetric {
+            timestamp_ms: 1_800_000_600_000,
+            pid,
+            parent_pid: 900,
+            name: "notepad.exe".into(),
+            executable_path: r"C:\Windows\System32\notepad.exe".into(),
+            cpu_percent: 1.0,
+            working_set_bytes: 32 * 1024 * 1024,
+            private_bytes: 0,
+            handle_count: 20,
+            thread_count: 4,
+            read_bytes_per_sec: 0.0,
+            write_bytes_per_sec: 0.0,
+            total_read_bytes: 0,
+            total_write_bytes: 0,
+            started_at_ms,
+            session_id: 1,
+            responsive: true,
+            has_visible_window: true,
+            launch_duration_ms: None,
+            is_agent_candidate: false,
+        });
+        snapshot
+    }
+
+    #[test]
+    fn entering_launches_fetches_groups_and_c_toggles_the_console_filter() {
+        let (mut app, commands, _events) = app_with_live_channels();
+        app.select_page(Page::Launches);
+        assert!(
+            matches!(
+                commands.try_recv(),
+                Ok(WorkerCommand::RefreshLaunchGroups {
+                    console_hosts_only: false
+                })
+            ),
+            "entering the page fetches the unfiltered groups"
+        );
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+        assert!(app.launch_console_only);
+        assert!(
+            matches!(
+                commands.try_recv(),
+                Ok(WorkerCommand::RefreshLaunchGroups {
+                    console_hosts_only: true
+                })
+            ),
+            "the toggle re-fetches with the console-hosts-only flag set"
+        );
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+        assert!(!app.launch_console_only);
+        assert!(matches!(
+            commands.try_recv(),
+            Ok(WorkerCommand::RefreshLaunchGroups {
+                console_hosts_only: false
+            })
+        ));
+    }
+
+    #[test]
+    fn occurrences_are_fetched_only_when_the_selected_group_changes() {
+        let (mut app, commands, _events) = app_with_live_channels();
+        app.page = Page::Launches;
+        app.launch_groups = vec![
+            launch_group(r"c:\windows\system32\notepad.exe", "explorer.exe", 4),
+            launch_group(r"c:\tools\ripgrep.exe", "cmd.exe<explorer.exe", 2),
+        ];
+        app.launch_state.select(Some(0));
+        app.sync_launch_occurrences();
+        match commands.try_recv() {
+            Ok(WorkerCommand::RefreshLaunchOccurrences {
+                exe_path,
+                lineage_sig,
+            }) => {
+                // Byte-exact passthrough of the stored (lowercased) values:
+                // the service matches them literally.
+                assert_eq!(exe_path, r"c:\windows\system32\notepad.exe");
+                assert_eq!(lineage_sig, "explorer.exe");
+            }
+            other => panic!("expected an occurrence fetch, got {other:?}"),
+        }
+
+        // Re-syncing without a selection change asks for nothing: the
+        // handler walks the whole 7-day window per request.
+        app.sync_launch_occurrences();
+        assert!(commands.try_recv().is_err());
+
+        app.move_selection(1);
+        match commands.try_recv() {
+            Ok(WorkerCommand::RefreshLaunchOccurrences {
+                exe_path,
+                lineage_sig,
+            }) => {
+                assert_eq!(exe_path, r"c:\tools\ripgrep.exe");
+                assert_eq!(lineage_sig, "cmd.exe<explorer.exe");
+            }
+            other => panic!("expected the second group's fetch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn enter_hunts_the_live_process_and_l_shows_its_lineage() {
+        let mut app = App::new_inert();
+        app.snapshot = Some(snapshot_with_live_process(4242, 1_800_000_000_000));
+        app.page = Page::Launches;
+        app.launch_groups = vec![launch_group(
+            r"c:\windows\system32\notepad.exe",
+            "explorer.exe",
+            1,
+        )];
+        app.launch_state.select(Some(0));
+        app.launch_occurrences = vec![launch_occurrence(4242, 1_800_000_000_000)];
+        app.launch_occurrence_state.select(Some(0));
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.page, Page::Processes);
+        assert_eq!(
+            app.selected_process().map(|process| process.pid),
+            Some(4242)
+        );
+
+        app.page = Page::Launches;
+        app.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE));
+        assert_eq!(app.page, Page::Tree);
+    }
+
+    #[test]
+    fn a_dead_occurrence_never_leaves_the_launches_page() {
+        let mut app = App::new_inert();
+        // Same pid, different start time: pid reuse must not be mistaken
+        // for the recorded launch still being alive.
+        app.snapshot = Some(snapshot_with_live_process(4242, 1_799_000_000_000));
+        app.page = Page::Launches;
+        app.launch_groups = vec![launch_group(
+            r"c:\windows\system32\notepad.exe",
+            "explorer.exe",
+            1,
+        )];
+        app.launch_state.select(Some(0));
+        app.launch_occurrences = vec![launch_occurrence(4242, 1_800_000_000_000)];
+        app.launch_occurrence_state.select(Some(0));
+
+        assert_eq!(app.live_launch_pid(), None);
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.page, Page::Launches);
+        app.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE));
+        assert_eq!(app.page, Page::Launches);
+        app.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE));
+        assert_eq!(app.page, Page::Launches);
+    }
+
+    #[test]
+    fn a_stale_occurrence_reply_for_another_group_is_dropped() {
+        let (mut app, _commands, events) = app_with_live_channels();
+        app.page = Page::Launches;
+        app.launch_groups = vec![launch_group(
+            r"c:\windows\system32\notepad.exe",
+            "explorer.exe",
+            1,
+        )];
+        app.launch_state.select(Some(0));
+        app.sync_launch_occurrences();
+
+        events
+            .send(WorkerEvent::LaunchOccurrences {
+                exe_path: r"c:\tools\ripgrep.exe".into(),
+                lineage_sig: "cmd.exe".into(),
+                result: Ok(vec![launch_occurrence(7, 1_800_000_000_000)]),
+            })
+            .unwrap();
+        app.drain_events();
+        assert!(
+            app.launch_occurrences.is_empty(),
+            "a reply keyed on a group that is no longer selected must be dropped"
+        );
+
+        events
+            .send(WorkerEvent::LaunchOccurrences {
+                exe_path: r"c:\windows\system32\notepad.exe".into(),
+                lineage_sig: "explorer.exe".into(),
+                result: Ok(vec![launch_occurrence(4242, 1_800_000_000_000)]),
+            })
+            .unwrap();
+        app.drain_events();
+        assert_eq!(app.launch_occurrences.len(), 1);
+        assert_eq!(app.launch_occurrence_state.selected(), Some(0));
+    }
+
+    #[test]
+    fn the_launches_page_never_arms_a_termination() {
+        let mut app = App::new_inert();
+        app.snapshot = Some(snapshot_with_live_process(4242, 1_800_000_000_000));
+        app.page = Page::Launches;
+        app.launch_groups = vec![launch_group(
+            r"c:\windows\system32\notepad.exe",
+            "explorer.exe",
+            1,
+        )];
+        app.launch_state.select(Some(0));
+        app.launch_occurrences = vec![launch_occurrence(4242, 1_800_000_000_000)];
+        app.launch_occurrence_state.select(Some(0));
+        app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert!(matches!(app.mode, InputMode::Normal));
+        assert_eq!(app.page, Page::Launches);
     }
 }
