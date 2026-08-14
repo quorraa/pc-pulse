@@ -3294,12 +3294,25 @@ impl App {
             // immediately and the worker reports the count on the status
             // line once the pipe answers, exactly like a rating submission.
             SettingField::DeleteCommandLines => {
-                let _ = self
+                // Claim progress only if the request is actually on its way.
+                // Dropping the send error left the status line promising a
+                // delete that was never queued -- it sat at "Deleting…"
+                // forever while the captured lines stayed on disk, and the
+                // one thing the person could not learn is that they need to
+                // press Enter again.
+                if self
                     .worker
                     .commands
-                    .try_send(WorkerCommand::DeleteCommandLines);
-                self.status = "Deleting captured command lines…".into();
-                self.status_is_error = false;
+                    .try_send(WorkerCommand::DeleteCommandLines)
+                    .is_ok()
+                {
+                    self.status = "Deleting captured command lines…".into();
+                    self.status_is_error = false;
+                } else {
+                    self.set_error(
+                        "delete not queued — command queue is busy, press enter again".into(),
+                    );
+                }
             }
             // This prefills with what the person would type, not with the
             // display value: a bare number rather than "auto (matches clip)".
@@ -6037,6 +6050,43 @@ mod tests {
         assert!(
             matches!(sent.as_slice(), [WorkerCommand::DeleteCommandLines]),
             "{sent:?}"
+        );
+    }
+
+    #[test]
+    fn a_full_command_queue_reports_that_the_delete_was_not_queued() {
+        let (mut app, commands) = app_with_captive_worker();
+        // Fill the worker queue so the delete cannot be enqueued at all.
+        while app
+            .worker
+            .commands
+            .try_send(WorkerCommand::RefreshAlerts)
+            .is_ok()
+        {}
+
+        app.page = Page::Settings;
+        let row = app
+            .visible_setting_fields()
+            .iter()
+            .position(|field| *field == SettingField::DeleteCommandLines)
+            .expect("the delete row is on the TUNE page");
+        app.setting_state.select(Some(row));
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(app.status_is_error, "{}", app.status);
+        assert!(
+            !app.status.contains("Deleting"),
+            "a dropped request must not claim progress it never made: {}",
+            app.status
+        );
+        assert!(app.status.contains("not queued"), "{}", app.status);
+        let sent: Vec<WorkerCommand> = commands.try_iter().collect();
+        assert!(
+            !sent
+                .iter()
+                .any(|command| matches!(command, WorkerCommand::DeleteCommandLines)),
+            "the delete really was dropped: {sent:?}"
         );
     }
 

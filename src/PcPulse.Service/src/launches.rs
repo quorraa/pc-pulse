@@ -703,6 +703,58 @@ impl CmdlineJoiner {
         Some((entry.redacted, entry.redacted_fields))
     }
 
+    /// Attaches captures to launches that were **already finalized and saved on
+    /// an earlier tick**, per [`RecentLaunches`]. The reverse of [`attach`]:
+    /// there is no `LaunchEvent` left to attach to, so the match is returned
+    /// as a standalone [`LateJoinedCmdline`] for the caller to encrypt and
+    /// store against the launch's `(pid, start_time_ms)` key.
+    ///
+    /// Matching is the same rule [`attach`] uses -- same pid, start times
+    /// within [`CMDLINE_JOIN_WINDOW_MS`] -- and each identity claims at most
+    /// one capture, which is removed from the ring so it can never be
+    /// attached twice.
+    ///
+    /// Identities are walked oldest-first, and each takes the *closest*
+    /// remaining capture, so when two launches of one pid sit in the ring
+    /// together neither can steal the other's line out from under it.
+    ///
+    /// [`attach`]: Self::attach
+    pub fn attach_to_recent(&mut self, recent: &RecentLaunches) -> Vec<LateJoinedCmdline> {
+        let mut out = Vec::new();
+        for identity in recent.iter() {
+            if self.entries.is_empty() {
+                break;
+            }
+            let Some(index) = self
+                .entries
+                .iter()
+                .enumerate()
+                .filter(|(_, entry)| {
+                    entry.pid == identity.pid
+                        && delta_ms(entry.start_ms, identity.start_time_ms)
+                            <= CMDLINE_JOIN_WINDOW_MS
+                })
+                .min_by_key(|(_, entry)| delta_ms(entry.start_ms, identity.start_time_ms))
+                .map(|(index, _)| index)
+            else {
+                continue;
+            };
+            let Some(entry) = self.entries.remove(index) else {
+                continue;
+            };
+            out.push(LateJoinedCmdline {
+                // The launch row's own start, not the capture's: this is the
+                // storage key the row is filed under, and the two clocks
+                // differ by up to the join window by construction.
+                pid: identity.pid,
+                start_time_ms: identity.start_time_ms,
+                redacted: entry.redacted,
+                redacted_fields: entry.redacted_fields,
+            });
+        }
+        out
+    }
+
     /// Drops every pending capture. Called when the opt-in setting is turned
     /// off, so nothing captured before the flip can still be persisted after
     /// it.
@@ -725,6 +777,125 @@ impl CmdlineJoiner {
 /// panics).
 fn delta_ms(a: i64, b: i64) -> i64 {
     a.saturating_sub(b).saturating_abs()
+}
+
+/// Cap on the recently-finalized launch ring. Entries are identities only
+/// (three integers, no command line and no path), and each lives for
+/// [`RECENT_LAUNCH_RETAIN_MS`], so this is generous slack that exists to
+/// bound memory on a machine churning starts rather than to be reached.
+const RECENT_LAUNCH_CAP: usize = 1024;
+/// How long a finalized launch stays eligible for a late-arriving command
+/// line. The race this covers is one flush tick wide (~1s per session); ten
+/// seconds is that with room for a stalled tick, and short enough that a
+/// reused pid cannot plausibly collide inside it.
+const RECENT_LAUNCH_RETAIN_MS: i64 = 10_000;
+
+/// The identity of a launch row already written to `launch_events`: enough
+/// to file a command line against it later, and nothing more.
+///
+/// Deliberately not the row itself. Late reconciliation needs only the
+/// storage key, and holding the event would put the user's executable paths
+/// in a second live buffer for no gain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LaunchIdentity {
+    pub pid: u32,
+    /// The launch's own start time -- the second half of its storage key.
+    pub start_time_ms: i64,
+    /// Wall-clock time the row was saved. Drives retention only; it is *not*
+    /// the join key, which is `start_time_ms`.
+    pub saved_at_ms: i64,
+}
+
+/// A capture matched to a launch that was already saved on an earlier tick.
+/// The redaction has already happened (the joiner redacts at the door); the
+/// caller encrypts this and stores it against `(pid, start_time_ms)`.
+pub struct LateJoinedCmdline {
+    pub pid: u32,
+    pub start_time_ms: i64,
+    pub redacted: String,
+    pub redacted_fields: u32,
+}
+
+/// Ring of launches finalized within the last [`RECENT_LAUNCH_RETAIN_MS`],
+/// so a command line that arrives *after* its launch row was saved can still
+/// be filed against it.
+///
+/// The race this exists to close: the manifest session (start/stop events)
+/// and the MOF session (command lines) flush on independent ~1s timers, so a
+/// short-lived launch can start, stop, be drained, joined against nothing,
+/// saved and removed from the tracker one tick *before* its command line is
+/// finalized. The capture then arrived to find nothing left to claim and
+/// aged out as `cmdlinesUnmatchedEvicted` -- the shortest-lived launches,
+/// exactly the ones a command line explains best, were the ones that
+/// systematically lost theirs.
+///
+/// No `launch_events` update is needed when a late match lands: the row
+/// carries no command line at all (the runtime clears it before saving --
+/// `launch_events` payloads are plain JSON on disk), and `getLaunchOccurrences`
+/// serves command lines by looking each occurrence's `(pid, start_time_ms)`
+/// up in `launch_cmdlines` at request time. Writing the blob is the whole
+/// job.
+#[derive(Default)]
+pub struct RecentLaunches {
+    entries: VecDeque<LaunchIdentity>,
+}
+
+impl RecentLaunches {
+    pub fn new() -> Self {
+        Self {
+            entries: VecDeque::new(),
+        }
+    }
+
+    /// Remembers a launch row just written to storage. Callers pass only
+    /// launches that did *not* already get a command line this tick -- one
+    /// that did has nothing left to claim.
+    pub fn remember(&mut self, pid: u32, start_time_ms: i64, saved_at_ms: i64) {
+        self.entries.push_back(LaunchIdentity {
+            pid,
+            start_time_ms,
+            saved_at_ms,
+        });
+        while self.entries.len() > RECENT_LAUNCH_CAP {
+            self.entries.pop_front();
+        }
+    }
+
+    /// Drops identities past [`RECENT_LAUNCH_RETAIN_MS`]. Entries are kept in
+    /// `remember` order, which is save order, so this scans from the front
+    /// and stops at the first one young enough to keep.
+    ///
+    /// Nothing is counted here: an identity expiring unclaimed is the normal
+    /// case (most launches never had a command line waiting for them), not a
+    /// join failure. The failure that *is* worth counting stayed where it
+    /// was -- an unclaimed *capture* aging out of the joiner
+    /// (`cmdlinesUnmatchedEvicted`).
+    pub fn evict_older_than(&mut self, now_ms: i64) {
+        while let Some(entry) = self.entries.front() {
+            if now_ms.saturating_sub(entry.saved_at_ms) <= RECENT_LAUNCH_RETAIN_MS {
+                break;
+            }
+            self.entries.pop_front();
+        }
+    }
+
+    /// Oldest first -- the order [`CmdlineJoiner::attach_to_recent`] resolves
+    /// competing identities in.
+    pub fn iter(&self) -> impl Iterator<Item = &LaunchIdentity> {
+        self.entries.iter()
+    }
+
+    /// Drops every remembered identity. Called when command-line capture is
+    /// turned off or forgotten, so a launch finalized before the flip cannot
+    /// pick up a line after it.
+    pub fn clear(&mut self) {
+        self.entries.clear();
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -1531,6 +1702,181 @@ mod tests {
         let mut ev = launch_event(1, 0);
         assert!(joiner.attach(&mut ev).is_none());
         assert_eq!(joiner.len(), 0);
+    }
+
+    // -- Late-join reconciliation (fix round 6, P2) --------------------
+    //
+    // The manifest session (start/stop) and the MOF session (command lines)
+    // flush on independent ~1s timers. A short-lived launch could therefore
+    // be started, stopped, drained, joined against an empty joiner, saved and
+    // removed a whole tick *before* its command line was finalized -- and the
+    // capture then arrived with nothing left to claim and aged out.
+    // `RecentLaunches` keeps the identity of just-saved launches around long
+    // enough for the straggler to find it.
+
+    #[test]
+    fn late_join_recovers_a_cmdline_that_arrived_a_tick_after_its_launch_was_saved() {
+        let mut joiner = CmdlineJoiner::new();
+        let mut recent = RecentLaunches::new();
+
+        // Tick 1: the launch flushes and is saved with nothing to join.
+        let mut ev = launch_event(500, 10_000);
+        assert!(joiner.attach(&mut ev).is_none(), "nothing captured yet");
+        recent.remember(ev.pid, ev.start_time_ms, 10_050);
+
+        // Tick 2: the MOF session finally hands over the command line.
+        joiner.offer(500, 10_200, r"c:\x.exe --flag");
+        let late = joiner.attach_to_recent(&recent);
+
+        assert_eq!(late.len(), 1);
+        assert_eq!(late[0].pid, 500);
+        assert_eq!(
+            late[0].start_time_ms, 10_000,
+            "filed under the launch row's own start, which is its storage key"
+        );
+        assert_eq!(late[0].redacted, r"c:\x.exe --flag");
+        assert_eq!(joiner.len(), 0, "a claimed capture leaves the ring");
+    }
+
+    #[test]
+    fn late_join_uses_the_same_two_second_window_as_the_live_join() {
+        let mut joiner = CmdlineJoiner::new();
+        let mut recent = RecentLaunches::new();
+        recent.remember(500, 10_000, 10_000);
+
+        joiner.offer(500, 12_001, "beyond the window");
+        assert!(
+            joiner.attach_to_recent(&recent).is_empty(),
+            "2 001 ms apart must not match"
+        );
+        assert_eq!(joiner.len(), 1, "a non-match must not consume the capture");
+
+        joiner.offer(500, 12_000, "on the edge");
+        let late = joiner.attach_to_recent(&recent);
+        assert_eq!(late.len(), 1);
+        assert_eq!(late[0].redacted, "on the edge", "exactly 2 000 ms matches");
+    }
+
+    #[test]
+    fn late_join_matches_only_the_same_pid_and_claims_one_capture_per_identity() {
+        let mut joiner = CmdlineJoiner::new();
+        let mut recent = RecentLaunches::new();
+        recent.remember(500, 10_000, 10_000);
+
+        joiner.offer(999, 10_000, "other pid");
+        joiner.offer(500, 11_000, "far");
+        joiner.offer(500, 10_100, "near");
+
+        let late = joiner.attach_to_recent(&recent);
+        assert_eq!(late.len(), 1, "one identity claims at most one capture");
+        assert_eq!(late[0].redacted, "near", "the closest start wins");
+        assert_eq!(joiner.len(), 2, "the other two are untouched");
+
+        // Re-running with the same identity does claim the remaining `far`
+        // capture -- but the already-claimed one can never come back.
+        let again = joiner.attach_to_recent(&recent);
+        assert_eq!(again.len(), 1);
+        assert_eq!(again[0].redacted, "far");
+    }
+
+    #[test]
+    fn late_join_redacts_before_the_capture_is_ever_stored() {
+        let mut joiner = CmdlineJoiner::new();
+        let mut recent = RecentLaunches::new();
+        recent.remember(1, 0, 0);
+        joiner.offer(1, 0, "tool.exe --api_key hunter2");
+
+        let late = joiner.attach_to_recent(&recent);
+        assert_eq!(late.len(), 1);
+        assert!(
+            !late[0].redacted.contains("hunter2"),
+            "late joins must not bypass redaction: {}",
+            late[0].redacted
+        );
+        assert!(late[0].redacted_fields >= 1);
+    }
+
+    #[test]
+    fn recent_launch_identities_expire_on_the_clock() {
+        let mut recent = RecentLaunches::new();
+        recent.remember(1, 0, 1_000);
+        recent.remember(2, 0, 1_000 + RECENT_LAUNCH_RETAIN_MS);
+
+        // At the retention edge the oldest still stays: expiry is for
+        // identities *past* the window, not at it.
+        recent.evict_older_than(1_000 + RECENT_LAUNCH_RETAIN_MS);
+        assert_eq!(recent.len(), 2);
+
+        recent.evict_older_than(1_001 + RECENT_LAUNCH_RETAIN_MS);
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent.iter().next().map(|entry| entry.pid), Some(2));
+
+        // An expired identity can no longer claim anything.
+        let mut joiner = CmdlineJoiner::new();
+        joiner.offer(1, 0, "too late");
+        assert!(joiner.attach_to_recent(&recent).is_empty());
+        assert_eq!(joiner.len(), 1);
+    }
+
+    #[test]
+    fn recent_launch_ring_is_bounded_and_drops_the_oldest_first() {
+        let mut recent = RecentLaunches::new();
+        for index in 0..(RECENT_LAUNCH_CAP + 5) {
+            recent.remember(index as u32, index as i64, index as i64);
+        }
+        assert_eq!(recent.len(), RECENT_LAUNCH_CAP);
+        assert_eq!(
+            recent.iter().next().map(|entry| entry.pid),
+            Some(5),
+            "the five oldest identities were dropped, not the newest"
+        );
+    }
+
+    #[test]
+    fn clearing_recent_launches_stops_any_further_late_join() {
+        let mut joiner = CmdlineJoiner::new();
+        let mut recent = RecentLaunches::new();
+        recent.remember(1, 0, 0);
+        recent.clear();
+        joiner.offer(1, 0, "x");
+        assert!(
+            joiner.attach_to_recent(&recent).is_empty(),
+            "a forgotten identity must not pick up a line afterwards"
+        );
+    }
+
+    #[test]
+    fn late_join_on_an_empty_ring_or_empty_joiner_is_a_no_op() {
+        let mut joiner = CmdlineJoiner::new();
+        let empty = RecentLaunches::new();
+        joiner.offer(1, 0, "x");
+        assert!(joiner.attach_to_recent(&empty).is_empty());
+        assert_eq!(joiner.len(), 1, "no identity, no claim");
+
+        let mut recent = RecentLaunches::new();
+        recent.remember(7, 0, 0);
+        let mut drained = CmdlineJoiner::new();
+        assert!(drained.attach_to_recent(&recent).is_empty());
+    }
+
+    #[test]
+    fn the_live_join_still_gets_first_refusal_over_late_reconciliation() {
+        // Ordering guard for the tick: `attach` (this tick's flushable rows)
+        // runs before `attach_to_recent` (rows saved on earlier ticks), so a
+        // capture that a launch flushing *right now* can claim is never
+        // stolen by an older identity for the same pid.
+        let mut joiner = CmdlineJoiner::new();
+        let mut recent = RecentLaunches::new();
+        recent.remember(500, 10_000, 10_000);
+        joiner.offer(500, 10_500, "the line");
+
+        let mut flushing_now = launch_event(500, 10_600);
+        let (line, _) = joiner.attach(&mut flushing_now).expect("live join wins");
+        assert_eq!(line, "the line");
+        assert!(
+            joiner.attach_to_recent(&recent).is_empty(),
+            "nothing left for the older identity to take"
+        );
     }
 
     #[test]

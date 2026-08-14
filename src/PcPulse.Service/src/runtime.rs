@@ -6,7 +6,7 @@ use crate::{
     etw::{CmdlineCollector, EtwCollector, EtwHealth},
     etw_props::ParsedProcessEvent,
     eventlog::EventLogCollector,
-    launches::{CmdlineJoiner, LaunchTracker, LiveProcessInfo},
+    launches::{CmdlineJoiner, LaunchTracker, LiveProcessInfo, RecentLaunches},
     metrics::{
         MetricCollector,
         dumps::{DumpEngine, WindowsDumpSource},
@@ -938,6 +938,10 @@ fn sampling_loop(
     // setting is on (it is cleared the moment it goes off).
     let mut launches = LaunchTracker::new();
     let mut joiner = CmdlineJoiner::new();
+    // Identities of launches saved on recent ticks, so a command line whose
+    // MOF flush landed a tick after its launch row was already finalized can
+    // still be filed against it. See [`RecentLaunches`].
+    let mut recent_launches = RecentLaunches::new();
     // Seeded from the shared counter's current value (rather than 0) so a
     // `deleteCommandLines` request that landed before this loop iteration
     // even started does not trigger a spurious clear on the very first
@@ -1092,6 +1096,9 @@ fn sampling_loop(
         } else if cmdline_session.take().is_some() {
             cmdline_totals.session_ended();
             joiner.clear();
+            // Identities go with the captures: a launch finalized while the
+            // setting was on must not pick up a line after it went off.
+            recent_launches.clear();
             next_cmdline_session_retry = Instant::now();
         }
         if let Some(collector) = cmdline_session.as_ref() {
@@ -1156,19 +1163,72 @@ fn sampling_loop(
         let forget_generation = state.cmdline_forget_generation.load(Ordering::SeqCst);
         if forget_generation_advanced(&mut last_forget_generation, forget_generation) {
             joiner.clear();
+            recent_launches.clear();
         }
         // Attaching only happens while the opt-in is active; with it off the
         // joiner is empty anyway, but the guard keeps that a policy rather
         // than an accident.
-        let mut joined = if settings.capture_command_lines && cmdline_session.is_some() {
+        let capture_active = settings.capture_command_lines && cmdline_session.is_some();
+        let mut joined = if capture_active {
             join_command_lines(&mut joiner, &mut flushable)
         } else {
             Vec::new()
         };
-        if !flushable.is_empty()
-            && let Err(error) = state.storage.save_launches(&flushable)
-        {
-            eprintln!("failed to persist launch events: {error:#}");
+        let launches_saved = if flushable.is_empty() {
+            false
+        } else {
+            match state.storage.save_launches(&flushable) {
+                Ok(()) => true,
+                Err(error) => {
+                    eprintln!("failed to persist launch events: {error:#}");
+                    false
+                }
+            }
+        };
+        // Late-join reconciliation. The manifest session and the MOF session
+        // flush on independent ~1s timers, so a short-lived launch can be
+        // started, stopped, drained, joined against nothing and saved a tick
+        // *before* its command line is finalized -- and the capture then
+        // arrived to find nothing left to claim and aged out
+        // (`cmdlinesUnmatchedEvicted`). Remembering the identity of every
+        // launch just saved *without* a line lets the straggler still land.
+        //
+        // Order matters twice here. Remembering happens only after
+        // `save_launches` succeeded, so a command line is never filed against
+        // a launch row that is not on disk. And `attach_to_recent` runs after
+        // `join_command_lines`, so this tick's own flushing rows always get
+        // first refusal on a capture and an older identity for the same pid
+        // can never take it from them.
+        //
+        // The saved `launch_events` row needs no update: it carries no
+        // command line at all (cleared before save -- those payloads are
+        // plain JSON on disk), and `getLaunchOccurrences` serves command lines
+        // by looking each occurrence's `(pid, start_time_ms)` up in
+        // `launch_cmdlines` per request. Writing the blob below is the whole
+        // job.
+        if capture_active {
+            if launches_saved {
+                for event in &flushable {
+                    let already_joined = joined.iter().any(|line| {
+                        line.pid == event.pid && line.start_time_ms == event.start_time_ms
+                    });
+                    if !already_joined {
+                        recent_launches.remember(event.pid, event.start_time_ms, timestamp_ms);
+                    }
+                }
+            }
+            recent_launches.evict_older_than(timestamp_ms);
+            joined.extend(
+                joiner
+                    .attach_to_recent(&recent_launches)
+                    .into_iter()
+                    .map(|late| JoinedCmdline {
+                        pid: late.pid,
+                        start_time_ms: late.start_time_ms,
+                        redacted: late.redacted,
+                        redacted_fields: late.redacted_fields,
+                    }),
+            );
         }
         // Second read of the same counter, immediately before the only code
         // that writes command lines to disk. The check above happens before
@@ -1190,6 +1250,7 @@ fn sampling_loop(
         let forget_generation = state.cmdline_forget_generation.load(Ordering::SeqCst);
         if forget_generation_advanced(&mut last_forget_generation, forget_generation) {
             joiner.clear();
+            recent_launches.clear();
             joined.clear();
         }
         for line in &joined {

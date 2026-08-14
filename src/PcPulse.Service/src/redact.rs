@@ -23,6 +23,18 @@ const MAX_SCAN_BYTES: usize = 32 * 1024;
 /// persisted, redacted or not.
 const TRUNCATED_MARKER: &str = "…[truncated]";
 
+/// Credential words, compared against a *normalized* key (see
+/// [`normalize_key`]): separators are stripped before comparison, so a single
+/// entry covers every `-`/`_`/run-together spelling of it (`apikey`,
+/// `api-key`, `api_key`). The `api-key` entry is therefore redundant with
+/// `apikey` and kept only as documentation of the shape being matched.
+///
+/// `x-api-key` is spelled out rather than derived: pass 1 compares by
+/// *equality* against this list (see [`is_vocab_word`]), so a conventionally
+/// prefixed header name only matches if it is listed. Deriving it instead by
+/// substring containment is what would over-redact ordinary flags —
+/// `--sas-token` and `--session-name` both contain a vocabulary word and
+/// neither names a secret.
 const VOCAB: &[&str] = &[
     "password",
     "passwd",
@@ -31,6 +43,7 @@ const VOCAB: &[&str] = &[
     "token",
     "apikey",
     "api-key",
+    "x-api-key",
     "auth",
     "credential",
     "bearer",
@@ -67,9 +80,28 @@ fn truncate_at_char_boundary(input: &str, max_bytes: usize) -> &str {
     &input[..end]
 }
 
+/// Whether a pass-1 key word names a credential: the word is normalized
+/// ([`normalize_key`] — lowercased, `_` and `-` stripped) and compared for
+/// **equality** against the equally-normalized vocabulary.
+///
+/// Normalizing is what closes the round-5 leak: the flag and `key=value`
+/// forms used to compare the key *literally* against `VOCAB`, so `--api_key
+/// hunter2` matched nothing (the list carried `apikey` and `api-key`, not
+/// `api_key`) and a sub-20-char secret sailed past pass 2's opaque-run
+/// threshold as well. The URL-query pass had already been normalized in
+/// round 3; this brings pass 1 in line with it.
+///
+/// Equality, deliberately, and not the containment
+/// [`is_vocab_key_normalized`] uses for query keys. Pass 1's forms fire on
+/// *ordinary command-line flags*, where containment would swallow the
+/// following argument of anything whose name merely mentions a credential
+/// word: `--session-name foo` (normalizes to `sessionname`, which contains
+/// `session`), `--sas-token <url>`, `--token-file path`. Query keys can
+/// afford containment because a query key that mentions a credential
+/// essentially always *is* one; a CLI flag cannot.
 fn is_vocab_word(word: &str) -> bool {
-    let lower = word.to_ascii_lowercase();
-    VOCAB.iter().any(|v| *v == lower)
+    let normalized = normalize_key(word);
+    !normalized.is_empty() && VOCAB.iter().any(|v| normalize_key(v) == normalized)
 }
 
 /// For each character position, whether it lies inside an (unescaped)
@@ -1283,5 +1315,82 @@ mod tests {
         assert!(!r.contains("john"), "{r}");
         assert!(!r.contains("smith"), "{r}");
         assert_eq!(n, 1);
+    }
+
+    // -- Security review, fix round 6 -----------------------------------
+    //
+    // P1 leak: pass 1 compared the matched key *literally* against `VOCAB`,
+    // which carries `apikey` and `api-key` but not `api_key`. A short secret
+    // (`hunter2`, well under pass 2's 20-char opaque-run threshold) under an
+    // underscore-spelled key therefore reached storage in the clear —
+    // encrypted at rest, but disclosed to anyone viewing the occurrence.
+    // Pass 1 now normalizes the key the same way the URL-query pass has
+    // since round 3, and compares by equality.
+
+    #[test]
+    fn r6_underscore_spelled_api_key_flag_form_is_redacted() {
+        let (r, n) = redact_command_line("tool --api_key hunter2");
+        assert!(!r.contains("hunter2"), "{r}");
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn r6_underscore_spelled_api_key_equals_form_is_redacted() {
+        let (r, n) = redact_command_line("tool --api_key=hunter2");
+        assert!(!r.contains("hunter2"), "{r}");
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn r6_underscore_spelled_api_key_colon_form_is_redacted() {
+        let (r, n) = redact_command_line("tool api_key: hunter2");
+        assert!(!r.contains("hunter2"), "{r}");
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn r6_header_style_x_api_key_flag_is_redacted() {
+        let (r, n) = redact_command_line("tool --x-api-key abc");
+        assert!(!r.contains("abc"), "{r}");
+        assert_eq!(n, 1);
+        // …and every separator spelling of the same header name.
+        for s in ["tool --x_api_key abc", "tool --xapikey abc"] {
+            let (r, n) = redact_command_line(s);
+            assert!(!r.contains("abc"), "{s} -> {r}");
+            assert_eq!(n, 1, "{s} -> {r}");
+        }
+    }
+
+    // The other half of the ruling: normalization must *not* become
+    // containment. These flags all contain a vocabulary word once separators
+    // are stripped, and none of them names a secret — pass 1 must leave both
+    // the flag and its argument alone.
+    #[test]
+    fn r6_normalization_does_not_over_redact_ordinary_flags() {
+        for s in [
+            "app --session-name foo",
+            "app --tokenizer bpe",
+            "app --token-file notes.txt",
+        ] {
+            assert_eq!(
+                redact_command_line(s),
+                (s.to_string(), 0),
+                "pass 1 must not fire on {s}"
+            );
+        }
+    }
+
+    // Regression guard for the exact input that ruled containment out: the
+    // Azure SAS case's own `--sas-token` flag normalizes to `sastoken`,
+    // which *contains* `token`. Under containment pass 1 would eat the whole
+    // quoted URL as the flag's value, destroying the `sig=` redaction that
+    // round 3 (N1) was added to prove.
+    #[test]
+    fn r6_sas_token_flag_does_not_swallow_its_url_argument() {
+        let (r, _n) = redact_command_line(
+            "az storage blob url --sas-token \"https://acct.blob.core.windows.net/container/blob.txt?sv=2021-01-01&sig=aBcDeF1234567890aBcDeF1234567890\"",
+        );
+        assert!(r.contains("sv=2021-01-01"), "{r}");
+        assert!(r.contains("sig=\u{2039}redacted\u{203a}"), "{r}");
     }
 }
