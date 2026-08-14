@@ -1,6 +1,6 @@
 [package]
 name = "pcpulse-service"
-version = "1.19.0"
+version = "1.20.0"
 edition = "2024"
 license = "MIT"
 description = "Low-overhead Windows performance collector for PC Pulse"
@@ -34,6 +34,7 @@ features = [
   "Win32_Foundation",
   "Win32_Security",
   "Win32_Security_Authorization",
+  "Win32_Security_Cryptography",
   "Win32_Storage_FileSystem",
   "Win32_System_Com",
   "Win32_System_Diagnostics_Etw",

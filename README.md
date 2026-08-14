@@ -44,6 +44,18 @@ The same calibration applies to the collector's watch over itself: its CPU, memo
 
 PC Pulse also now inventories the hardware itself — CPU, system, BIOS, memory, storage, and GPUs — over vendor-neutral WMI, independent of whatever telemetry happens to be readable. A GPU with no working sensor path (no NVML, say) still shows up as present in inventory even while its live gauge honestly reports unavailable: not being able to measure something is never confused with not having it.
 
+## Launch history
+
+PC Pulse records every process start and stop continuously — not just the ones that survive the 2-second sampling cadence — so a console window that flashes for 300ms and is gone still shows up. This is **always on**, and it is metadata only: executable name and normalized path, PID and parent PID, session ID, start/stop time, up to five ancestors of launcher lineage, and a window-visibility state (`windowed`, `never windowed`, `unobserved`, or `running`). The **Launches** page (`9`) groups these by executable and launcher lineage so recurring popups and their exact trigger are obvious at a glance; `c` filters to console hosts, and `o`/`Enter`/`l` drill into an occurrence's process or lineage.
+
+Command-line capture — the actual text of each launch, not just which executable ran — is a **separate, default-off opt-in**, because a command line can carry credentials, tokens, or personal paths that plain launch metadata never does. Turn it on from Settings' "Command-line capture" row, which carries this disclosure verbatim:
+
+> Command lines can contain credentials, tokens, and personal paths. Captured lines are redacted, encrypted at rest, kept N hours, and deletable at any time. Off: PC Pulse identifies the executable and launcher, but not the exact command or script.
+
+When it is on, each captured line passes through a credential-pattern redactor (`‹redacted›` in place of matched secrets — the original is dropped, not reversible) before being encrypted at rest with DPAPI and decrypted only per request, never cached in plaintext. Two independent retention clocks are in effect at all times: launch-history rows (the always-on metadata) age out after **7 days**; captured command lines age out on their own clock, "Cmdline retention (hours)" in Settings, from **1 to 168 hours** (default 24) — out-of-range entries there are clamped to the nearest valid hour rather than rejected. "Delete captured command lines" in Settings wipes every captured line immediately, independent of retention, and reports how many were deleted on the status line; launch history itself is untouched by that action. Turning capture off stops *new* capture only — lines already captured while it was on stay governed by their own retention clock until they age out or are explicitly deleted.
+
+A few limits are stated rather than hidden: the underlying ETW session flushes in roughly one-second batches, so the fastest parent-child chains can occasionally outlive their own recorder — lineage is then partial, and says so rather than guessing. Window state for processes that live and die faster than the 2-second visibility sampler can ever see them is genuinely unobservable; `unobserved` is the honest answer, not a defect. Enabling capture applies only to future launches — it cannot reconstruct command lines for processes that already ran while it was off. And the opt-in capture session draws from a shared pool of 8 system-logger sessions per machine; if that pool is exhausted, capture fails soft (a health metric and a UI note) rather than taking anything else down.
+
 ## Performance ratings
 
 Press `f` and answer in one keystroke — `g` good, `a` acceptable, `s` sluggish, `Esc` cancels. Each rating is filed against the workload PC Pulse saw over the trailing ten minutes — light, moderate, or heavy — so it only ever teaches the notification policy what "acceptable" means for *that* load level on *this* machine: a `good` given while the machine is idle can never lower the bar for what counts as acceptable under demanding load, and a `sluggish` given under heavy load is taken just as seriously no matter how many easy days came before it. Ratings tune only the notification policy's confidence and persistence floors — in ±0.05 steps, bounded to ±0.15, decaying with a 30-day half-life — never the learned baselines, detector thresholds, or severities those floors gate. Every rating also stores a redacted, size-capped performance digest — the same rollups, top processes, and incident evidence Oracle works from — building the labeled corpus a future optimization agent will train on. PC Pulse may nudge you to rate after a demanding stretch: a plain statusline message, at most once a day, and never while it's still learning your machine.
@@ -65,7 +77,7 @@ The TUI ships three presentation profiles: **vitals** (default), a patient-monit
 
 *Screenshots come from the deterministic render gallery (`cargo test -p pcpulse-tui --lib dev_render_gallery -- --ignored` with `PCPULSE_GALLERY_DIR` set).*
 
-Nine views:
+Ten views:
 
 1. **Observe** — shared CPU/memory pressure field, multi-resource suspect ranking, threshold vectors, load ribbon, agent footprint, collector budget, incident tape.
 2. **Processes** — dense sortable process table, name/path/PID filtering, full process inspector.
@@ -75,13 +87,18 @@ Nine views:
 6. **Oracle** — evidence-aware chat with the dedicated systems analyzer and the live Windows diagnostic feed.
 7. **Settings** — all detector thresholds and notification state, plain-language explanations, plus per-user CLIENT settings (theme, motion effects, refresh rate, Oracle time budget, update checks).
 8. **Gauges** — thermal-zone and GPU temperature meters with live history sparklines, plus CPU/GPU clocks and GPU utilization; degrades to an honest unavailable state when sensors are denied.
-9. **Keys** — the complete keyboard reference. This page has no digit key: it sits last in the `Tab` cycle and its tab entry prints `?`; pressing `?` anywhere opens the same reference as an overlay.
+9. **Launches** — every process start and stop, grouped by executable and launcher lineage, with recurrence intervals and a console-host filter; see [Launch history](#launch-history) below.
+10. **Keys** — the complete keyboard reference. This page has no digit key: it sits last in the `Tab` cycle and its tab entry prints `?`; pressing `?` anywhere opens the same reference as an overlay.
 
 Important keys:
 
 | Key | Action |
 |---|---|
-| `1`–`8`, `Tab`, `Shift-Tab` | Navigate pages; the Keys page has no digit and sits last in the `Tab` cycle |
+| `1`–`9`, `Tab`, `Shift-Tab` | Navigate pages; the Keys page has no digit and sits last in the `Tab` cycle |
+| `c` on Launches | Filter the list to console hosts |
+| `o` on Launches | Move the cursor to the occurrence list |
+| `Enter` / `h` on Launches | Hunt the launch, when that exact process is still running |
+| `l` on Launches | Show the still-running launch in the lineage tree |
 | `j`/`k`, arrows, `PgUp`/`PgDn` | Move selection |
 | `/` | Filter the process table |
 | `o` | Cycle CPU/memory/I/O/handle/thread/age/name sorting |
@@ -189,7 +206,7 @@ For development installs, `scripts\Uninstall-Service.ps1` removes everything; pa
 
 ## Storage, privacy, and security
 
-Everything stays local: bounded SQLite history and service settings in `%ProgramData%\PcPulse` (`history.db`, `settings.json`; configurable 1–365 day retention), per-user chat history and UI preferences in `%LOCALAPPDATA%\PcPulse` (`chat-history.json`, `ui-prefs.json`). Diagnostic event fields are bounded and redacted before persistence — user-profile paths become `%USERPROFILE%` and credential-like values are removed. PC Pulse never collects the Security event log, process command lines, environment variables, file contents, browser data, or keystrokes. The collector has no network path; the client's only network touchpoints are an explicit Oracle question or `analyze` run (which sends the redacted evidence bundle to the user's ChatGPT-authenticated Codex session), an explicit deep crash-dump analysis (Microsoft's public symbol server), and the TUI's rate-limited release update check against GitHub, which is switched off from Settings' CLIENT section. The named pipe rejects remote clients, caps messages at 1 MiB, and grants access only to LocalSystem, administrators, and interactive users; termination requires `confirmed: true` and always refuses PID 0, PID 4, and the collector itself.
+Everything stays local: bounded SQLite history and service settings in `%ProgramData%\PcPulse` (`history.db`, `settings.json`; configurable 1–365 day retention), per-user chat history and UI preferences in `%LOCALAPPDATA%\PcPulse` (`chat-history.json`, `ui-prefs.json`). Diagnostic event fields are bounded and redacted before persistence — user-profile paths become `%USERPROFILE%` and credential-like values are removed. PC Pulse never collects the Security event log, environment variables, file contents, browser data, or keystrokes. Process command lines are collected only when "Command-line capture" is explicitly turned on in Settings (default off, see [Launch history](#launch-history)); redacted and DPAPI-encrypted, on their own retention clock, deletable on demand. The collector has no network path; the client's only network touchpoints are an explicit Oracle question or `analyze` run (which sends the redacted evidence bundle to the user's ChatGPT-authenticated Codex session), an explicit deep crash-dump analysis (Microsoft's public symbol server), and the TUI's rate-limited release update check against GitHub, which is switched off from Settings' CLIENT section. The named pipe rejects remote clients, caps messages at 1 MiB, and grants access only to LocalSystem, administrators, and interactive users; termination requires `confirmed: true` and always refuses PID 0, PID 4, and the collector itself.
 
 ## Documentation
 

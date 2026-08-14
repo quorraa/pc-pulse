@@ -116,6 +116,10 @@ impl VisualState {
                 .then(|| app.chat_session_state.selected())
                 .flatten(),
             Page::Settings => app.setting_state.selected(),
+            // Whichever LAUNCHES cursor the operator is driving: the
+            // effects layer only needs to see that *a* selection moved.
+            Page::Launches if app.launch_detail_focused => app.launch_occurrence_state.selected(),
+            Page::Launches => app.launch_state.selected(),
             _ => None,
         };
         let active_alerts = app

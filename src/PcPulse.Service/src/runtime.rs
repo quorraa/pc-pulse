@@ -3,8 +3,10 @@ use crate::{
     analysis::{AgentContextSource, build_agent_context},
     baselines::BaselineStore,
     config::Settings,
-    etw::EtwCollector,
+    etw::{CmdlineCollector, EtwCollector, EtwHealth},
+    etw_props::ParsedProcessEvent,
     eventlog::EventLogCollector,
+    launches::{CmdlineJoiner, LaunchTracker, LiveProcessInfo},
     metrics::{
         MetricCollector,
         dumps::{DumpEngine, WindowsDumpSource},
@@ -13,8 +15,9 @@ use crate::{
         live::LiveEngine,
     },
     models::{
-        DiagnosticLogResponse, DiagnosticLogStatus, OpenIncidentRef, PipeRequest, PipeResponse,
-        ProcessMetric, ProcessNode, Rating, RatingVerdict, Snapshot, SystemMetric,
+        DiagnosticLogResponse, DiagnosticLogStatus, LaunchCaptureStatus, LaunchEvent,
+        OpenIncidentRef, PipeRequest, PipeResponse, ProcessMetric, ProcessNode, Rating,
+        RatingVerdict, Snapshot, SystemMetric,
     },
     pipe,
     quality::{Calibration, derive_offsets},
@@ -29,7 +32,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex, RwLock,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread,
     time::{Duration, Instant},
@@ -59,6 +62,26 @@ pub struct AppState {
     /// Activity-gated high-rate telemetry for smooth-mode clients: zero
     /// idle cost, started by the first `live` request, stopped on idle.
     pub live: LiveEngine,
+    /// Bumped by the `deleteCommandLines` handler immediately *before* it
+    /// clears the persisted table. The sampling loop reads this twice per
+    /// tick -- once before that tick's join and again immediately before the
+    /// persist loop -- and on a change clears its in-flight `CmdlineJoiner`
+    /// and abandons the batch, so lines joined during the deleting tick
+    /// cannot be inserted after the wipe has already returned. Without this
+    /// signal, a capture the joiner was already holding for a launch pending
+    /// its flush (e.g. inside the 60s "still running" window) could still
+    /// land in storage moments after the user asked to forget everything.
+    /// A plain counter rather than a bool: two deletes
+    /// in quick succession must not collapse into a single observed change
+    /// if the loop's tick happens to land between them in a way a bool
+    /// could miss (it can't, in practice, but the counter makes that true
+    /// by construction rather than by timing luck).
+    pub cmdline_forget_generation: AtomicU64,
+    /// Captured command lines that failed to decrypt when served through
+    /// `getLaunchOccurrences` (e.g. a machine-key change after a
+    /// reinstall). Folded into `LaunchCaptureStatus.cmdlinesDecryptFailures`
+    /// once per sampling-loop tick; see that field's doc comment.
+    pub cmdlines_decrypt_failures: AtomicU64,
 }
 
 impl AppState {
@@ -272,9 +295,122 @@ impl AppState {
                     self.storage.ratings(limit.min(POLICY_OFFSET_RATINGS))?,
                 )?)
             }
+            PipeRequest::GetLaunchGroups {
+                from_ms,
+                console_hosts_only,
+                limit,
+            } => {
+                let now_ms = Utc::now().timestamp_millis();
+                let from_ms = from_ms.unwrap_or(now_ms - LAUNCH_HISTORY_DEFAULT_WINDOW_MS);
+                let limit = limit
+                    .unwrap_or(GET_LAUNCH_GROUPS_MAX_LIMIT)
+                    .min(GET_LAUNCH_GROUPS_MAX_LIMIT);
+                let events = self.storage.launch_events(from_ms)?;
+                let groups = crate::launches::group_launches(
+                    &events,
+                    console_hosts_only.unwrap_or(false),
+                    limit,
+                );
+                Ok(json!({ "groups": groups }))
+            }
+            PipeRequest::GetLaunchOccurrences {
+                exe_path,
+                lineage_sig,
+                from_ms,
+                limit,
+            } => {
+                let now_ms = Utc::now().timestamp_millis();
+                let from_ms = from_ms.unwrap_or(now_ms - LAUNCH_HISTORY_DEFAULT_WINDOW_MS);
+                let limit = limit
+                    .unwrap_or(GET_LAUNCH_OCCURRENCES_MAX_LIMIT)
+                    .min(GET_LAUNCH_OCCURRENCES_MAX_LIMIT);
+                // `load_launch_events` already orders by start_time_ms DESC
+                // (newest first), so filtering preserves that order.
+                let mut events = self.storage.launch_events(from_ms)?;
+                events.retain(|event| {
+                    event.exe_path == exe_path
+                        && crate::launches::lineage_sig(&event.lineage) == lineage_sig
+                });
+                events.truncate(limit);
+
+                // Privacy: launch_events payloads never carry command lines
+                // (the runtime clears them before save). A command line is
+                // decrypted here, per request, for this response only -- it
+                // is never written back or cached. A decrypt failure (e.g. a
+                // post-reinstall machine-key change) leaves the occurrence's
+                // `command_line` absent rather than failing the whole
+                // request; it is counted (`launchCapture.cmdlinesDecryptFailures`,
+                // folded in from the shared counter below) and logged once
+                // per request, not once per row -- a client asking for up to
+                // 1000 occurrences must not be able to flood the log by
+                // amplifying a single bad decrypt across every row it reads.
+                let mut cmdlines_attempted: u32 = 0;
+                let mut request_decrypt_failures: u32 = 0;
+                let mut first_failure_code: Option<u32> = None;
+                for event in &mut events {
+                    if let Some(blob) = self
+                        .storage
+                        .load_launch_cmdline(event.pid, event.start_time_ms)?
+                    {
+                        cmdlines_attempted += 1;
+                        match crate::dpapi::unprotect(&blob) {
+                            Ok(plaintext) => {
+                                event.command_line =
+                                    Some(String::from_utf8_lossy(&plaintext).into_owned());
+                            }
+                            Err(code) => {
+                                request_decrypt_failures += 1;
+                                first_failure_code.get_or_insert(code);
+                            }
+                        }
+                    }
+                }
+                if request_decrypt_failures > 0 {
+                    self.cmdlines_decrypt_failures
+                        .fetch_add(u64::from(request_decrypt_failures), Ordering::Relaxed);
+                    let first_failure_code = first_failure_code.unwrap_or(0);
+                    eprintln!(
+                        "failed to decrypt {request_decrypt_failures} of {cmdlines_attempted} captured command lines (first error 0x{first_failure_code:08x})"
+                    );
+                }
+
+                Ok(json!({ "events": events }))
+            }
+            PipeRequest::DeleteCommandLines => {
+                // Bumped *before* the table delete, deliberately. The signal
+                // tells the sampling loop's in-flight `CmdlineJoiner` to drop
+                // whatever it is holding: a launch pending its 60s "still
+                // running" flush may have a redacted line captured before
+                // this request landed, which would otherwise persist moments
+                // after the user asked to forget everything. Bumping first
+                // means the delete can only ever run against rows the loop
+                // had already committed, never against rows it is about to
+                // write -- the loop re-reads this counter immediately before
+                // its persist loop and abandons the batch if it moved. Were
+                // the order reversed, lines joined during this same tick
+                // could be inserted after the wipe had already returned.
+                // A side effect of ordering it this way, and the right one:
+                // if the delete below fails, the counter has already moved,
+                // so the loop still drops its in-flight captures. A wipe
+                // that could not finish is no reason to keep writing new
+                // lines. See `cmdline_forget_generation`'s doc comment and
+                // `forget_generation_advanced`.
+                self.cmdline_forget_generation
+                    .fetch_add(1, Ordering::SeqCst);
+                let deleted = self.storage.delete_all_launch_cmdlines()?;
+                Ok(json!({ "deleted": deleted }))
+            }
         }
     }
 }
+
+/// Default lookback window for `getLaunchGroups`/`getLaunchOccurrences` when
+/// the caller omits `fromMs`.
+const LAUNCH_HISTORY_DEFAULT_WINDOW_MS: i64 = 7 * 24 * 3600 * 1000;
+/// Transport-safe cap on `getLaunchGroups`'s `limit`.
+const GET_LAUNCH_GROUPS_MAX_LIMIT: usize = 500;
+/// Transport-safe cap on `getLaunchOccurrences`'s `limit`.
+const GET_LAUNCH_OCCURRENCES_MAX_LIMIT: usize = 1_000;
 
 #[derive(Debug)]
 struct IssuedContext {
@@ -523,6 +659,8 @@ pub fn run(data_dir: &Path, stop: crossbeam_channel::Receiver<()>) -> Result<()>
         issued_contexts: Mutex::new(VecDeque::new()),
         settings_path,
         live: LiveEngine::windows(),
+        cmdline_forget_generation: AtomicU64::new(0),
+        cmdlines_decrypt_failures: AtomicU64::new(0),
     });
     // What the user's past ratings have made of the notification policy. Read
     // once here so the first evaluation after a restart already honors it.
@@ -609,6 +747,151 @@ fn observe_heavy_minute(
     marks.len().min(u16::MAX as usize) as u16
 }
 
+/// How often the command-line retention clock runs. Command lines have their
+/// own (`commandLineRetentionHours`) window, deliberately shorter and
+/// separate from the daily prune everything else rides on.
+const CMDLINE_PRUNE_INTERVAL: Duration = Duration::from_secs(3_600);
+/// How long the loop waits before retrying a command-line session that
+/// failed to start (typically the machine's eight system-logger slots being
+/// full). Long enough that a permanently full pool costs one log line and a
+/// `StartTraceW` call every five minutes, not one per tick.
+const CMDLINE_SESSION_RETRY: Duration = Duration::from_secs(300);
+
+/// One ETW session's loss counters, read as absolute per-session totals.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+struct EtwCounters {
+    dropped_channel: u64,
+    etw_events_lost: u64,
+    malformed_events: u64,
+    events_lost_query_failures: u64,
+}
+
+impl EtwCounters {
+    fn read(health: &EtwHealth) -> Self {
+        Self {
+            dropped_channel: health.dropped_channel.load(Ordering::Relaxed),
+            etw_events_lost: health.etw_events_lost.load(Ordering::Relaxed),
+            malformed_events: health.malformed_events.load(Ordering::Relaxed),
+            events_lost_query_failures: health.events_lost_query_failures.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Accumulates one ETW session's counters into service-lifetime totals.
+///
+/// `EtwHealth`'s counters are absolute **per collector session** and restart
+/// at zero whenever the collector is rebuilt (see [`EtwHealth`]). A naive
+/// `current - previous` underflows across such a restart, so every fold here
+/// goes through [`EtwCounterTotals::fold`]: a decrease is read as a restart
+/// and the new absolute value counts as the delta, never as negative loss.
+/// The service-lifetime totals this produces are what the snapshot reports,
+/// so a restart of the ETW collector never rewinds the operator's view of
+/// how much was lost.
+#[derive(Debug, Default)]
+struct EtwCounterTotals {
+    last: EtwCounters,
+    total: EtwCounters,
+}
+
+impl EtwCounterTotals {
+    fn observe(&mut self, current: EtwCounters) {
+        Self::fold(
+            &mut self.total.dropped_channel,
+            &mut self.last.dropped_channel,
+            current.dropped_channel,
+        );
+        Self::fold(
+            &mut self.total.etw_events_lost,
+            &mut self.last.etw_events_lost,
+            current.etw_events_lost,
+        );
+        Self::fold(
+            &mut self.total.malformed_events,
+            &mut self.last.malformed_events,
+            current.malformed_events,
+        );
+        Self::fold(
+            &mut self.total.events_lost_query_failures,
+            &mut self.last.events_lost_query_failures,
+            current.events_lost_query_failures,
+        );
+    }
+
+    fn fold(total: &mut u64, last: &mut u64, current: u64) {
+        let delta = if current < *last {
+            // The session restarted: everything it reports now is new loss.
+            current
+        } else {
+            current - *last
+        };
+        *total = total.saturating_add(delta);
+        *last = current;
+    }
+
+    /// The session this was tracking has gone away; the next one starts its
+    /// counters from zero.
+    fn session_ended(&mut self) {
+        self.last = EtwCounters::default();
+    }
+
+    fn totals(&self) -> EtwCounters {
+        self.total
+    }
+}
+
+/// One joined command line, ready to be stored encrypted.
+struct JoinedCmdline {
+    pid: u32,
+    start_time_ms: i64,
+    redacted: String,
+    redacted_fields: u32,
+}
+
+/// Attaches captured command lines to the launch rows about to be persisted
+/// and returns what to store encrypted.
+///
+/// Every row is left with `command_line: None` on the way out. `launch_events`
+/// payloads are plain JSON on disk, so a command line left on the row would
+/// be a second, *unencrypted* at-rest copy of exactly the data the design
+/// takes care to redact and DPAPI-protect. The only stored copy is the blob
+/// in `launch_cmdlines`; clients get it back through the service's
+/// per-request decrypt path.
+fn join_command_lines(
+    joiner: &mut CmdlineJoiner,
+    events: &mut [LaunchEvent],
+) -> Vec<JoinedCmdline> {
+    let mut joined = Vec::new();
+    for event in events.iter_mut() {
+        if let Some((redacted, redacted_fields)) = joiner.attach(event) {
+            joined.push(JoinedCmdline {
+                pid: event.pid,
+                start_time_ms: event.start_time_ms,
+                redacted,
+                redacted_fields,
+            });
+        }
+        event.command_line = None;
+    }
+    joined
+}
+
+/// Whether the shared `cmdline_forget_generation` counter has moved since
+/// the last value the sampling loop observed (`seen`, updated in place).
+/// Fires exactly once per bump: a value read twice in a row without an
+/// intervening bump reports no change, so `joiner.clear()` in the loop is
+/// called only on the tick that actually follows a `deleteCommandLines`
+/// request. Factored out as a pure comparison -- no lock, no I/O -- purely
+/// so this edge-detection is unit-testable without spinning up the
+/// sampling loop's real OS collectors.
+fn forget_generation_advanced(seen: &mut u64, current: u64) -> bool {
+    if current == *seen {
+        false
+    } else {
+        *seen = current;
+        true
+    }
+}
+
 fn sampling_loop(
     state: &Arc<AppState>,
     mut baselines: BaselineStore,
@@ -650,6 +933,31 @@ fn sampling_loop(
     // Which minutes of the trailing hour were heavy; see
     // [`observe_heavy_minute`]. Feeds the client's rating nudge.
     let mut heavy_minutes: VecDeque<i64> = VecDeque::new();
+    // Launch history. The tracker turns this tick's drained ETW start/stop
+    // events into rows; the joiner holds command lines only while the opt-in
+    // setting is on (it is cleared the moment it goes off).
+    let mut launches = LaunchTracker::new();
+    let mut joiner = CmdlineJoiner::new();
+    // Seeded from the shared counter's current value (rather than 0) so a
+    // `deleteCommandLines` request that landed before this loop iteration
+    // even started does not trigger a spurious clear on the very first
+    // tick -- harmless either way since the joiner starts empty, but this
+    // keeps the "on change" contract honest.
+    let mut last_forget_generation = state.cmdline_forget_generation.load(Ordering::SeqCst);
+    let mut cmdline_session: Option<CmdlineCollector> = None;
+    let mut next_cmdline_session_retry = Instant::now();
+    // Due immediately: a service that restarts more often than hourly must
+    // still enforce the command-line retention window, and anything already
+    // past it should go on this run's first sample, not an hour into it.
+    let mut next_cmdline_prune = Instant::now();
+    let mut process_totals = EtwCounterTotals::default();
+    let mut cmdline_totals = EtwCounterTotals::default();
+    let mut cmdlines_captured: u64 = 0;
+    let mut cmdlines_redacted_fields: u64 = 0;
+    let mut cmdlines_persist_failures: u64 = 0;
+    // One line per failure mode, not one per event: a broken DPAPI or a
+    // failing insert repeats every tick and must not flood the log.
+    let mut cmdline_protect_logged = false;
     loop {
         let started = Instant::now();
         let settings = state
@@ -659,7 +967,13 @@ fn sampling_loop(
             .clone();
         if etw.is_none() && Instant::now() >= next_etw_retry {
             match EtwCollector::start() {
-                Ok(collector) => etw = Some(collector),
+                Ok(collector) => {
+                    // Fresh session, fresh (zeroed) counters: tell the
+                    // accumulator so the new session's totals are counted
+                    // from zero rather than diffed against the old one's.
+                    process_totals.session_ended();
+                    etw = Some(collector);
+                }
                 Err(error) => {
                     eprintln!("ETW retry failed: {error:#}");
                     next_etw_retry = Instant::now() + Duration::from_secs(60);
@@ -749,6 +1063,206 @@ fn sampling_loop(
                 .map_err(|_| anyhow!("baseline lock poisoned"))?;
             live.clone_from(&baselines.machine);
         }
+
+        // ---- Launch history --------------------------------------------
+        // Opt-in command-line capture, toggled live. While the setting is
+        // off there is no session at all, so no command line ever enters
+        // this process -- turning it off also drops whatever the joiner was
+        // still holding, so nothing captured before the flip can be
+        // persisted after it.
+        if settings.capture_command_lines {
+            if cmdline_session.is_none() && Instant::now() >= next_cmdline_session_retry {
+                match CmdlineCollector::start() {
+                    Ok(collector) => {
+                        cmdline_totals.session_ended();
+                        cmdline_session = Some(collector);
+                    }
+                    Err(error) => {
+                        // Fail soft: the machine allows eight system-logger
+                        // sessions in total, and an exhausted pool means no
+                        // command lines, never a failed sample.
+                        eprintln!(
+                            "command-line capture session unavailable; \
+                             continuing without command lines: {error:#}"
+                        );
+                        next_cmdline_session_retry = Instant::now() + CMDLINE_SESSION_RETRY;
+                    }
+                }
+            }
+        } else if cmdline_session.take().is_some() {
+            cmdline_totals.session_ended();
+            joiner.clear();
+            next_cmdline_session_retry = Instant::now();
+        }
+        if let Some(collector) = cmdline_session.as_ref() {
+            for captured in collector.take_cmdlines() {
+                // `offer` redacts before storing; the raw line dies here.
+                joiner.offer(captured.pid, captured.start_ms, &captured.command_line);
+            }
+            // The MOF session sees every process on the machine, while only
+            // tracked launches ever claim a line, so the ring must age out on
+            // the clock and not merely under cap pressure -- otherwise stale
+            // entries at the front push out captures still waiting for their
+            // launch row to flush.
+            joiner.evict_older_than(timestamp_ms);
+        }
+        // Drain the process-event queue every tick. The bounded channel is
+        // the only thing between the ETW callback and this loop: a tick that
+        // skips the drain costs events once 4096 pile up (`droppedChannel`).
+        if let Some(collector) = etw.as_ref() {
+            let by_pid: HashMap<u32, &ProcessMetric> = processes
+                .iter()
+                .map(|process| (process.pid, process))
+                .collect();
+            let live_lookup = |pid: u32| -> Option<LiveProcessInfo> {
+                by_pid.get(&pid).map(|process| LiveProcessInfo {
+                    name: process.name.clone(),
+                    path: (!process.executable_path.is_empty())
+                        .then(|| process.executable_path.clone()),
+                    parent_pid: process.parent_pid,
+                })
+            };
+            for event in collector.take_process_events() {
+                match event {
+                    ParsedProcessEvent::Start(props) => launches.on_start(props, &live_lookup),
+                    // Note the missing `timestamp_ms`: a stop is stamped with
+                    // the *event's* own time, which the props now carry. The
+                    // kernel session flushes on a 1s timer and this loop
+                    // drains on its own interval, so this tick's wall clock
+                    // can trail the real exit by seconds -- for a 300ms popup
+                    // that difference is the whole measurement.
+                    ParsedProcessEvent::Stop(props) => launches.on_stop(props),
+                }
+            }
+        }
+        // The window sweep this sample already performed: `has_visible_window`
+        // is the enumeration result for every sampled pid, which is exactly
+        // what decides a launch's final window state.
+        for process in &processes {
+            launches.observe_window(process.pid, process.has_visible_window);
+        }
+        // Runs every tick even with ETW down, so pending rows still age out.
+        let mut flushable = launches.drain_flushable(timestamp_ms);
+        // First of this tick's two forget checks. A `deleteCommandLines`
+        // request may have landed since the last tick: clear whatever the
+        // joiner is still holding *before* this tick's join, so a capture
+        // taken for a launch that was still pending its flush when the user
+        // asked to forget cannot slip into storage after the delete
+        // completed. This runs unconditionally, not gated on
+        // `capture_command_lines`, so a delete during a window where capture
+        // just got toggled off still catches whatever the joiner had left
+        // over. The second check sits just before the persist loop and
+        // covers a delete that lands *during* this tick.
+        let forget_generation = state.cmdline_forget_generation.load(Ordering::SeqCst);
+        if forget_generation_advanced(&mut last_forget_generation, forget_generation) {
+            joiner.clear();
+        }
+        // Attaching only happens while the opt-in is active; with it off the
+        // joiner is empty anyway, but the guard keeps that a policy rather
+        // than an accident.
+        let mut joined = if settings.capture_command_lines && cmdline_session.is_some() {
+            join_command_lines(&mut joiner, &mut flushable)
+        } else {
+            Vec::new()
+        };
+        if !flushable.is_empty()
+            && let Err(error) = state.storage.save_launches(&flushable)
+        {
+            eprintln!("failed to persist launch events: {error:#}");
+        }
+        // Second read of the same counter, immediately before the only code
+        // that writes command lines to disk. The check above happens before
+        // the join; a delete landing in between would find the table already
+        // empty and then watch this tick insert the lines it just joined --
+        // a wipe that returned "done" while fresh rows were still arriving.
+        // Re-reading here closes that window: the batch is dropped and the
+        // joiner cleared, so those captures never reach storage at all.
+        //
+        // A residual window remains, between this load and the inserts
+        // below: a delete landing in those few microseconds still races. It
+        // is accepted rather than locked away, because closing it properly
+        // means holding the delete against the whole persist loop (DPAPI
+        // encryption plus a write per line) and the payoff is bounded --
+        // worst case a handful of lines survive a wipe by one tick, and the
+        // *next* tick's first check clears the joiner regardless. What the
+        // re-read removes is the systematic case: an entire tick's join
+        // landing after the delete, every time the two coincide.
+        let forget_generation = state.cmdline_forget_generation.load(Ordering::SeqCst);
+        if forget_generation_advanced(&mut last_forget_generation, forget_generation) {
+            joiner.clear();
+            joined.clear();
+        }
+        for line in &joined {
+            // Redacted already; encrypted here, so the only at-rest copy of
+            // a command line is a DPAPI blob.
+            match crate::dpapi::protect(line.redacted.as_bytes()) {
+                Ok(blob) => match state.storage.save_launch_cmdline(
+                    line.pid,
+                    line.start_time_ms,
+                    timestamp_ms,
+                    &blob,
+                ) {
+                    Ok(()) => {
+                        cmdlines_captured += 1;
+                        cmdlines_redacted_fields += u64::from(line.redacted_fields);
+                    }
+                    Err(error) => {
+                        // The join already consumed the capture, so this is
+                        // unrecoverable loss: counted, not just logged once.
+                        cmdlines_persist_failures += 1;
+                        if !cmdline_protect_logged {
+                            cmdline_protect_logged = true;
+                            eprintln!("failed to persist a captured command line: {error:#}");
+                        }
+                    }
+                },
+                Err(status) => {
+                    cmdlines_persist_failures += 1;
+                    if !cmdline_protect_logged {
+                        cmdline_protect_logged = true;
+                        eprintln!(
+                            "DPAPI encryption of a captured command line failed with status \
+                             0x{status:08x}; command lines will not be stored"
+                        );
+                    }
+                }
+            }
+        }
+        if let Some(collector) = etw.as_ref() {
+            process_totals.observe(EtwCounters::read(collector.health()));
+        }
+        if let Some(collector) = cmdline_session.as_ref() {
+            cmdline_totals.observe(EtwCounters::read(collector.health()));
+        }
+        let launch_capture = {
+            let process_etw = process_totals.totals();
+            let cmdline_etw = cmdline_totals.totals();
+            LaunchCaptureStatus {
+                dropped_channel: process_etw
+                    .dropped_channel
+                    .saturating_add(cmdline_etw.dropped_channel),
+                etw_events_lost: process_etw
+                    .etw_events_lost
+                    .saturating_add(cmdline_etw.etw_events_lost),
+                malformed_events: process_etw
+                    .malformed_events
+                    .saturating_add(cmdline_etw.malformed_events),
+                events_lost_query_failures: process_etw
+                    .events_lost_query_failures
+                    .saturating_add(cmdline_etw.events_lost_query_failures),
+                cmdline_session_active: cmdline_session.is_some(),
+                cmdlines_captured,
+                cmdlines_redacted_fields,
+                cmdlines_unmatched_evicted: joiner.unmatched_evicted(),
+                cmdlines_persist_failures,
+                // Driven by `getLaunchOccurrences` request traffic, not by
+                // anything this loop itself does -- just republished here
+                // each tick like the rest of this struct.
+                cmdlines_decrypt_failures: state.cmdlines_decrypt_failures.load(Ordering::Relaxed),
+                ..launches.status()
+            }
+        };
+
         forensics.observe(&evaluation.active, timestamp_ms);
         forensics.decorate(&mut evaluation.active);
         forensics.decorate(&mut evaluation.changed);
@@ -801,6 +1315,9 @@ fn sampling_loop(
             // hour was heavy enough to be worth asking about.
             snapshot.demand = Some(demand);
             snapshot.heavy_minutes_trailing_hour = Some(heavy_minutes_trailing_hour);
+            // Launch-capture health, with this tick's ETW loss counters
+            // already merged in (see `EtwCounterTotals`).
+            snapshot.launch_capture = launch_capture;
         }
         if Instant::now() >= next_system_write {
             state.storage.insert_system(&system)?;
@@ -826,6 +1343,18 @@ fn sampling_loop(
         if Instant::now() >= next_prune {
             state.storage.prune(&settings, timestamp_ms)?;
             next_prune = Instant::now() + Duration::from_secs(24 * 60 * 60);
+        }
+        if Instant::now() >= next_cmdline_prune {
+            // Command lines run on their own, much shorter clock than the
+            // daily prune everything else uses. Runs whether or not capture
+            // is currently on: turning the setting off must not leave
+            // already-captured lines sitting past their retention.
+            let cutoff_ms =
+                timestamp_ms - i64::from(settings.command_line_retention_hours) * 3_600_000;
+            if let Err(error) = state.storage.prune_launch_cmdlines(cutoff_ms) {
+                eprintln!("failed to prune captured command lines: {error:#}");
+            }
+            next_cmdline_prune = Instant::now() + CMDLINE_PRUNE_INTERVAL;
         }
         if Instant::now() >= next_baseline_save {
             state
@@ -1002,6 +1531,229 @@ mod tests {
         assert!((entries[0].offset - 0.05).abs() < 1e-9);
     }
 
+    fn launch_event(pid: u32, start_time_ms: i64) -> LaunchEvent {
+        LaunchEvent {
+            pid,
+            start_time_ms,
+            stop_time_ms: None,
+            exit_code: None,
+            exe_name: "x.exe".into(),
+            exe_path: r"c:\x.exe".into(),
+            raw_image_path: None,
+            session_id: 1,
+            parent_pid: 4,
+            lineage: Vec::new(),
+            window_state: crate::models::WindowState::Running,
+            console_host: false,
+            command_line: None,
+        }
+    }
+
+    #[test]
+    fn etw_counter_totals_accumulate_deltas_and_survive_a_collector_restart() {
+        let mut totals = EtwCounterTotals::default();
+        totals.observe(EtwCounters {
+            dropped_channel: 10,
+            etw_events_lost: 4,
+            malformed_events: 1,
+            events_lost_query_failures: 0,
+        });
+        totals.observe(EtwCounters {
+            dropped_channel: 25,
+            etw_events_lost: 4,
+            malformed_events: 3,
+            events_lost_query_failures: 2,
+        });
+        assert_eq!(
+            totals.totals(),
+            EtwCounters {
+                dropped_channel: 25,
+                etw_events_lost: 4,
+                malformed_events: 3,
+                events_lost_query_failures: 2,
+            }
+        );
+
+        // The collector died and was rebuilt: its counters restart at zero.
+        // A naive `current - previous` would underflow here; the totals must
+        // instead keep what was already counted and add the new session's
+        // absolute values as they arrive.
+        totals.observe(EtwCounters {
+            dropped_channel: 3,
+            etw_events_lost: 0,
+            malformed_events: 0,
+            events_lost_query_failures: 0,
+        });
+        assert_eq!(
+            totals.totals(),
+            EtwCounters {
+                dropped_channel: 28,
+                etw_events_lost: 4,
+                malformed_events: 3,
+                events_lost_query_failures: 2,
+            },
+            "a restart must never rewind or underflow the reported loss"
+        );
+        totals.observe(EtwCounters {
+            dropped_channel: 5,
+            ..EtwCounters::default()
+        });
+        assert_eq!(totals.totals().dropped_channel, 30);
+    }
+
+    #[test]
+    fn etw_counter_totals_count_a_fresh_session_from_zero() {
+        // The loop announces a deliberate restart (a new collector built
+        // after ETW came back), so the new session's first read is counted
+        // in full even if it happens to equal the dead session's last one.
+        let mut totals = EtwCounterTotals::default();
+        totals.observe(EtwCounters {
+            dropped_channel: 7,
+            ..EtwCounters::default()
+        });
+        totals.session_ended();
+        totals.observe(EtwCounters {
+            dropped_channel: 7,
+            ..EtwCounters::default()
+        });
+        assert_eq!(totals.totals().dropped_channel, 14);
+    }
+
+    #[test]
+    fn joined_command_lines_never_ride_along_in_the_launch_event_payload() {
+        // The redacted line goes to the encrypted table only. A copy left on
+        // the LaunchEvent would be written to `launch_events` as plain JSON
+        // -- a second, unencrypted at-rest copy of the very data the design
+        // redacts and DPAPI-protects.
+        let mut joiner = CmdlineJoiner::new();
+        joiner.offer(500, 10_000, "tool.exe --password hunter2");
+        let mut events = vec![launch_event(500, 10_100), launch_event(600, 10_100)];
+        let joined = join_command_lines(&mut joiner, &mut events);
+
+        assert_eq!(joined.len(), 1);
+        assert_eq!(joined[0].pid, 500);
+        assert_eq!(joined[0].start_time_ms, 10_100);
+        assert!(!joined[0].redacted.contains("hunter2"));
+        assert!(joined[0].redacted_fields >= 1);
+        assert!(
+            events.iter().all(|event| event.command_line.is_none()),
+            "no command line may be persisted in the launch_events payload"
+        );
+        let payload = serde_json::to_string(&events[0]).unwrap();
+        assert!(!payload.contains("commandLine"), "{payload}");
+    }
+
+    #[test]
+    fn clearing_the_joiner_before_join_drops_a_pending_capture() {
+        // Fix round 1 (I3): the sampling loop must clear its in-flight
+        // `CmdlineJoiner` *before* that tick's `join_command_lines` call
+        // whenever `deleteCommandLines` bumped the shared forget-generation
+        // counter since the last tick -- otherwise a capture the joiner was
+        // already holding for a launch still pending its 60s flush could
+        // still land in storage moments after the user asked to forget
+        // everything. This pins the ordering directly: offer a capture,
+        // clear (simulating the epoch-change branch), then join -- the
+        // capture must not attach.
+        let mut joiner = CmdlineJoiner::new();
+        joiner.offer(500, 10_000, "tool.exe --password hunter2");
+        joiner.clear();
+        let mut events = vec![launch_event(500, 10_100)];
+        let joined = join_command_lines(&mut joiner, &mut events);
+
+        assert!(
+            joined.is_empty(),
+            "a capture offered before the clear must not survive it"
+        );
+        assert!(events[0].command_line.is_none());
+    }
+
+    #[test]
+    fn a_delete_landing_after_the_join_still_discards_that_tick_s_lines() {
+        // Final fix wave (FW2): the pre-join clear above is not enough on
+        // its own. A `deleteCommandLines` that lands *after* this tick's
+        // join but before its inserts would find the table already empty and
+        // then watch these very lines be written -- a wipe that returned
+        // "done" while fresh rows were still arriving. The loop therefore
+        // re-reads the counter immediately before the persist loop and
+        // abandons the batch. This pins that second check, in the same shape
+        // the loop uses it.
+        let mut joiner = CmdlineJoiner::new();
+        joiner.offer(500, 10_000, "tool.exe --password hunter2");
+        let mut events = vec![launch_event(500, 10_100)];
+        let mut seen = 0u64;
+        // First check: nothing has happened yet, so the join proceeds.
+        assert!(!forget_generation_advanced(&mut seen, 0));
+        let mut joined = join_command_lines(&mut joiner, &mut events);
+        assert_eq!(joined.len(), 1, "the join must have produced a line");
+
+        // The delete lands here, mid-tick, and bumps the counter.
+        let generation = 1;
+        // Second check, immediately before the persist loop.
+        if forget_generation_advanced(&mut seen, generation) {
+            joiner.clear();
+            joined.clear();
+        }
+        assert!(
+            joined.is_empty(),
+            "lines joined during the deleting tick must never reach storage"
+        );
+        // And the joiner is emptied too, so nothing it was still holding
+        // survives into the next tick either.
+        let mut later = vec![launch_event(500, 10_100)];
+        assert!(join_command_lines(&mut joiner, &mut later).is_empty());
+    }
+
+    #[test]
+    fn forget_generation_advanced_fires_exactly_once_per_bump() {
+        let mut seen = 0u64;
+        // No bump yet (still 0): no change observed.
+        assert!(!forget_generation_advanced(&mut seen, 0));
+        // Bumped to 1: fires once.
+        assert!(forget_generation_advanced(&mut seen, 1));
+        // Re-reading the same value (no new delete since): does not re-fire.
+        assert!(!forget_generation_advanced(&mut seen, 1));
+        assert!(!forget_generation_advanced(&mut seen, 1));
+        // A second delete bumps it again: fires again.
+        assert!(forget_generation_advanced(&mut seen, 2));
+        assert!(!forget_generation_advanced(&mut seen, 2));
+    }
+
+    #[test]
+    fn delete_command_lines_bumps_the_forget_generation_counter() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = test_state(&directory);
+        assert_eq!(
+            state
+                .cmdline_forget_generation
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+
+        match state.handle(PipeRequest::DeleteCommandLines) {
+            PipeResponse::Ok { .. } => {}
+            PipeResponse::Error { code, message } => {
+                panic!("deleteCommandLines failed: {code} {message}")
+            }
+        }
+        assert_eq!(
+            state
+                .cmdline_forget_generation
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the handler must bump the counter so the sampling loop's \
+             next tick clears its in-flight joiner"
+        );
+
+        state.handle(PipeRequest::DeleteCommandLines);
+        assert_eq!(
+            state
+                .cmdline_forget_generation
+                .load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "a second delete must bump it again, not saturate or reset"
+        );
+    }
+
     #[test]
     fn builds_parent_child_tree() {
         let tree = build_process_tree(&[process(10, 0), process(11, 10), process(12, 11)]);
@@ -1020,6 +1772,8 @@ mod tests {
             issued_contexts: Mutex::new(VecDeque::new()),
             settings_path: directory.path().join("settings.json"),
             live: LiveEngine::windows(),
+            cmdline_forget_generation: AtomicU64::new(0),
+            cmdlines_decrypt_failures: AtomicU64::new(0),
         }
     }
 
@@ -1569,5 +2323,365 @@ mod tests {
             (0..10).map(|i| full_sample_at(0.0, i * 1_000)).collect();
         let light_calibration = build_calibration(&light_window, &baselines);
         assert_eq!(light_calibration.demand, DemandBucket::Light);
+    }
+
+    // -- Launch history pipe commands (Task 8) -------------------------
+
+    #[test]
+    fn launch_history_commands_use_the_pinned_serde_spelling() {
+        let groups = serde_json::to_string(&PipeRequest::GetLaunchGroups {
+            from_ms: None,
+            console_hosts_only: None,
+            limit: None,
+        })
+        .unwrap();
+        assert!(
+            groups.contains("\"command\":\"getLaunchGroups\""),
+            "wire: {groups}"
+        );
+
+        let occurrences = serde_json::to_string(&PipeRequest::GetLaunchOccurrences {
+            exe_path: r"c:\a.exe".into(),
+            lineage_sig: "explorer.exe".into(),
+            from_ms: None,
+            limit: None,
+        })
+        .unwrap();
+        assert!(
+            occurrences.contains("\"command\":\"getLaunchOccurrences\""),
+            "wire: {occurrences}"
+        );
+        assert!(
+            occurrences.contains("\"exe_path\":\"c:\\\\a.exe\""),
+            "wire: {occurrences}"
+        );
+        assert!(
+            occurrences.contains("\"lineage_sig\":\"explorer.exe\""),
+            "wire: {occurrences}"
+        );
+
+        let delete = serde_json::to_string(&PipeRequest::DeleteCommandLines).unwrap();
+        assert!(
+            delete.contains("\"command\":\"deleteCommandLines\""),
+            "wire: {delete}"
+        );
+
+        // Requests parse with only fromMs/consoleHostsOnly/limit omitted too
+        // -- the request-side optional fields the brief pins.
+        let parsed: PipeRequest = serde_json::from_str(r#"{"command":"getLaunchGroups"}"#).unwrap();
+        assert!(matches!(
+            parsed,
+            PipeRequest::GetLaunchGroups {
+                from_ms: None,
+                console_hosts_only: None,
+                limit: None
+            }
+        ));
+    }
+
+    fn launch_event_with_lineage(
+        pid: u32,
+        start_time_ms: i64,
+        exe_path: &str,
+        lineage_names: &[&str],
+    ) -> LaunchEvent {
+        let mut event = launch_event(pid, start_time_ms);
+        event.exe_path = exe_path.to_string();
+        event.exe_name = exe_path.rsplit(['\\', '/']).next().unwrap().to_string();
+        event.console_host = crate::launches::is_console_host(&event.exe_name);
+        event.lineage = lineage_names
+            .iter()
+            .enumerate()
+            .map(|(index, name)| crate::models::LineageEntry {
+                pid: 900 + index as u32,
+                name: name.to_string(),
+                path: None,
+            })
+            .collect();
+        event.window_state = crate::models::WindowState::NeverWindowed;
+        event.stop_time_ms = Some(start_time_ms + 500);
+        event
+    }
+
+    #[test]
+    fn get_launch_groups_serves_grouped_stored_events() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = test_state(&directory);
+        let now_ms = Utc::now().timestamp_millis();
+
+        let events = vec![
+            launch_event_with_lineage(1, now_ms - 1_000, r"c:\a.exe", &["explorer.exe"]),
+            launch_event_with_lineage(2, now_ms - 500, r"c:\a.exe", &["explorer.exe"]),
+            launch_event_with_lineage(3, now_ms, r"c:\b.exe", &["cmd.exe"]),
+        ];
+        state.storage.save_launches(&events).unwrap();
+
+        let response = state.handle(PipeRequest::GetLaunchGroups {
+            from_ms: None,
+            console_hosts_only: None,
+            limit: None,
+        });
+        let data = match response {
+            PipeResponse::Ok { data } => data,
+            PipeResponse::Error { code, message } => {
+                panic!("getLaunchGroups failed: {code} {message}")
+            }
+        };
+        let groups: Vec<crate::launches::LaunchGroup> =
+            serde_json::from_value(data["groups"].clone()).unwrap();
+        assert_eq!(groups.len(), 2);
+        let a_group = groups.iter().find(|g| g.exe_path == r"c:\a.exe").unwrap();
+        assert_eq!(a_group.count, 2);
+        assert_eq!(a_group.lineage_sig, "explorer.exe");
+    }
+
+    #[test]
+    fn get_launch_groups_console_hosts_only_filters() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = test_state(&directory);
+        let now_ms = Utc::now().timestamp_millis();
+
+        let events = vec![
+            launch_event_with_lineage(1, now_ms, r"c:\windows\system32\cmd.exe", &[]),
+            launch_event_with_lineage(2, now_ms, r"c:\a.exe", &[]),
+        ];
+        state.storage.save_launches(&events).unwrap();
+
+        let response = state.handle(PipeRequest::GetLaunchGroups {
+            from_ms: None,
+            console_hosts_only: Some(true),
+            limit: None,
+        });
+        let data = match response {
+            PipeResponse::Ok { data } => data,
+            PipeResponse::Error { code, message } => {
+                panic!("getLaunchGroups failed: {code} {message}")
+            }
+        };
+        let groups: Vec<crate::launches::LaunchGroup> =
+            serde_json::from_value(data["groups"].clone()).unwrap();
+        assert_eq!(groups.len(), 1);
+        assert!(groups[0].console_host);
+    }
+
+    #[test]
+    fn get_launch_groups_limit_is_clamped_to_the_transport_bound() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = test_state(&directory);
+        let response = state.handle(PipeRequest::GetLaunchGroups {
+            from_ms: None,
+            console_hosts_only: None,
+            limit: Some(1_000_000),
+        });
+        // Nothing is stored, so the clamp itself can only be verified by
+        // reading the code path succeeding without error for an absurd ask
+        // -- the exhaustive over-cap behavior is covered at the
+        // `group_launches` unit level (`limit_truncates_after_sorting_not_before`).
+        match response {
+            PipeResponse::Ok { .. } => {}
+            PipeResponse::Error { code, message } => {
+                panic!("getLaunchGroups failed: {code} {message}")
+            }
+        }
+    }
+
+    #[test]
+    fn get_launch_occurrences_returns_only_the_matching_group_newest_first() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = test_state(&directory);
+        let now_ms = Utc::now().timestamp_millis();
+
+        let events = vec![
+            launch_event_with_lineage(1, now_ms - 2_000, r"c:\a.exe", &["explorer.exe"]),
+            launch_event_with_lineage(2, now_ms - 1_000, r"c:\a.exe", &["explorer.exe"]),
+            // Different lineage under the same exe: must not appear.
+            launch_event_with_lineage(3, now_ms, r"c:\a.exe", &["cmd.exe"]),
+            // Different exe entirely: must not appear.
+            launch_event_with_lineage(4, now_ms, r"c:\b.exe", &["explorer.exe"]),
+        ];
+        state.storage.save_launches(&events).unwrap();
+
+        let response = state.handle(PipeRequest::GetLaunchOccurrences {
+            exe_path: r"c:\a.exe".into(),
+            lineage_sig: "explorer.exe".into(),
+            from_ms: None,
+            limit: None,
+        });
+        let data = match response {
+            PipeResponse::Ok { data } => data,
+            PipeResponse::Error { code, message } => {
+                panic!("getLaunchOccurrences failed: {code} {message}")
+            }
+        };
+        let events: Vec<LaunchEvent> = serde_json::from_value(data["events"].clone()).unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].pid, 2, "newest first");
+        assert_eq!(events[1].pid, 1);
+    }
+
+    #[test]
+    fn get_launch_occurrences_populates_command_line_from_the_encrypted_store() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = test_state(&directory);
+        let now_ms = Utc::now().timestamp_millis();
+
+        let event = launch_event_with_lineage(1, now_ms, r"c:\a.exe", &[]);
+        state
+            .storage
+            .save_launches(std::slice::from_ref(&event))
+            .unwrap();
+        let blob = crate::dpapi::protect(b"c:\\a.exe --flag").unwrap();
+        state
+            .storage
+            .save_launch_cmdline(event.pid, event.start_time_ms, now_ms, &blob)
+            .unwrap();
+
+        let response = state.handle(PipeRequest::GetLaunchOccurrences {
+            exe_path: r"c:\a.exe".into(),
+            lineage_sig: String::new(),
+            from_ms: None,
+            limit: None,
+        });
+        let data = match response {
+            PipeResponse::Ok { data } => data,
+            PipeResponse::Error { code, message } => {
+                panic!("getLaunchOccurrences failed: {code} {message}")
+            }
+        };
+        let events: Vec<LaunchEvent> = serde_json::from_value(data["events"].clone()).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].command_line.as_deref(), Some("c:\\a.exe --flag"));
+    }
+
+    #[test]
+    fn get_launch_occurrences_without_a_captured_command_line_leaves_it_absent() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = test_state(&directory);
+        let now_ms = Utc::now().timestamp_millis();
+
+        let event = launch_event_with_lineage(1, now_ms, r"c:\a.exe", &[]);
+        state.storage.save_launches(&[event]).unwrap();
+
+        let response = state.handle(PipeRequest::GetLaunchOccurrences {
+            exe_path: r"c:\a.exe".into(),
+            lineage_sig: String::new(),
+            from_ms: None,
+            limit: None,
+        });
+        let data = match response {
+            PipeResponse::Ok { data } => data,
+            PipeResponse::Error { code, message } => {
+                panic!("getLaunchOccurrences failed: {code} {message}")
+            }
+        };
+        let events: Vec<LaunchEvent> = serde_json::from_value(data["events"].clone()).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].command_line, None);
+    }
+
+    #[test]
+    fn get_launch_occurrences_counts_decrypt_failures_without_failing_the_request() {
+        // Fix round 1 (I1+I2): a decrypt failure must (a) not fail the
+        // request, (b) leave only that occurrence's `command_line` absent,
+        // and (c) increment the shared counter the sampling loop folds into
+        // `launchCapture.cmdlinesDecryptFailures` -- once per failed row,
+        // not once per request.
+        let directory = tempfile::tempdir().unwrap();
+        let state = test_state(&directory);
+        let now_ms = Utc::now().timestamp_millis();
+
+        let good = launch_event_with_lineage(1, now_ms - 1_000, r"c:\a.exe", &[]);
+        let bad = launch_event_with_lineage(2, now_ms, r"c:\a.exe", &[]);
+        state
+            .storage
+            .save_launches(&[good.clone(), bad.clone()])
+            .unwrap();
+        let blob = crate::dpapi::protect(b"c:\\a.exe --flag").unwrap();
+        state
+            .storage
+            .save_launch_cmdline(good.pid, good.start_time_ms, now_ms, &blob)
+            .unwrap();
+        // Not a real DPAPI blob at all, so `dpapi::unprotect` genuinely
+        // fails rather than this test faking the failure path.
+        state
+            .storage
+            .save_launch_cmdline(bad.pid, bad.start_time_ms, now_ms, b"not a real dpapi blob")
+            .unwrap();
+
+        assert_eq!(
+            state
+                .cmdlines_decrypt_failures
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+
+        let response = state.handle(PipeRequest::GetLaunchOccurrences {
+            exe_path: r"c:\a.exe".into(),
+            lineage_sig: String::new(),
+            from_ms: None,
+            limit: None,
+        });
+        let data = match response {
+            PipeResponse::Ok { data } => data,
+            PipeResponse::Error { code, message } => {
+                panic!("getLaunchOccurrences failed: {code} {message}")
+            }
+        };
+        let events: Vec<LaunchEvent> = serde_json::from_value(data["events"].clone()).unwrap();
+        assert_eq!(
+            events.len(),
+            2,
+            "a decrypt failure on one row must not fail the whole request"
+        );
+        let good_event = events.iter().find(|event| event.pid == good.pid).unwrap();
+        assert_eq!(good_event.command_line.as_deref(), Some("c:\\a.exe --flag"));
+        let bad_event = events.iter().find(|event| event.pid == bad.pid).unwrap();
+        assert_eq!(bad_event.command_line, None);
+
+        assert_eq!(
+            state
+                .cmdlines_decrypt_failures
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the shared counter must be incremented once per failed row"
+        );
+    }
+
+    #[test]
+    fn delete_command_lines_removes_captured_blobs_but_leaves_launch_events_intact() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = test_state(&directory);
+        let now_ms = Utc::now().timestamp_millis();
+
+        let event = launch_event_with_lineage(1, now_ms, r"c:\a.exe", &[]);
+        state
+            .storage
+            .save_launches(std::slice::from_ref(&event))
+            .unwrap();
+        let blob = crate::dpapi::protect(b"c:\\a.exe --flag").unwrap();
+        state
+            .storage
+            .save_launch_cmdline(event.pid, event.start_time_ms, now_ms, &blob)
+            .unwrap();
+
+        let response = state.handle(PipeRequest::DeleteCommandLines);
+        let deleted = match response {
+            PipeResponse::Ok { data } => data["deleted"].as_u64().unwrap(),
+            PipeResponse::Error { code, message } => {
+                panic!("deleteCommandLines failed: {code} {message}")
+            }
+        };
+        assert_eq!(deleted, 1);
+        assert_eq!(
+            state
+                .storage
+                .load_launch_cmdline(event.pid, event.start_time_ms)
+                .unwrap(),
+            None
+        );
+        // The launch_events row is untouched: they never carried a command
+        // line in the first place.
+        let events = state.storage.launch_events(0).unwrap();
+        assert_eq!(events.len(), 1);
     }
 }

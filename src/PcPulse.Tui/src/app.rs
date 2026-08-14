@@ -13,10 +13,11 @@ use chrono::Utc;
 use crossbeam_channel::{Receiver, Sender, bounded, select};
 use pcpulse_service::{
     config::Settings,
+    launches::LaunchGroup,
     models::{
         Alert, DiagnosticLogResponse, DiagnosticLogStatus, HardwareMetrics, HistoryResponse,
-        LiveSample, OptimizationPlan, ProcessMetric, ProcessNode, Rating, RatingVerdict, Severity,
-        Snapshot, SystemMetric,
+        LaunchEvent, LiveSample, OptimizationPlan, ProcessMetric, ProcessNode, Rating,
+        RatingVerdict, Severity, Snapshot, SystemMetric,
     },
     quality::{PolicyOffsets, derive_offsets},
     // The engine's own bound on how much rating history the policy is
@@ -60,6 +61,25 @@ const LIVE_MAX_HZ: u32 = 8;
 /// Two left clicks on the same finding row within this window count as a
 /// double-click and open an investigation.
 const DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(400);
+/// How many launch groups the LAUNCHES page asks for — the service's own
+/// transport clamp, so the page sees everything the protocol will serve.
+const LAUNCH_GROUP_LIMIT: usize = 500;
+/// How many occurrences one group's drill-down asks for. Well under the
+/// service's 1000 clamp on purpose: the handler scans its whole seven-day
+/// window per request, and the drill-down is a reading surface, not an
+/// archive — 200 rows is more than a pane can show and a fraction of the
+/// work the ceiling would cost.
+const LAUNCH_OCCURRENCE_LIMIT: usize = 200;
+/// How long the LAUNCHES selection must hold still before its occurrences
+/// are fetched. Every `j`/`k` and every wheel notch moves the selection by
+/// a row, and each fetch costs the service a seven-day scan plus up to
+/// [`LAUNCH_OCCURRENCE_LIMIT`] DPAPI decrypts on its one serial worker —
+/// scrolling a list must not queue one of those per row it passes over.
+/// A deadline rather than a loop-iteration count: the main loop's cadence
+/// swings between 16 ms and 250 ms depending on what else is animating,
+/// so counting turns of it would mean a settle time that changes with the
+/// theme.
+pub(crate) const LAUNCH_SETTLE: Duration = Duration::from_millis(250);
 /// The status line a running background conversion owns, and the prefix the
 /// worker's per-percent updates extend. Shared so that "is a conversion
 /// already speaking?" is a check against the real string rather than a
@@ -74,6 +94,25 @@ const CHOOSING_STATUS: &str = "Choosing a video…";
 pub const RATING_NUDGE_STATUS: &str = "rate how this machine feels — press f";
 /// What the statusline says once the service has stored a rating.
 pub const RATING_RECORDED_STATUS: &str = "rating recorded — thanks";
+/// What the status line says when a LAUNCHES jump has nowhere live to go.
+/// The detail pane makes the same point in its own words; this is the
+/// keystroke's own acknowledgement that it was heard and had no target.
+pub const LAUNCH_EXITED_STATUS: &str = "that launch has exited — showing its recorded lineage";
+/// The same refusal when a live process *does* hold the pid but its start
+/// time does not match. Worded to agree with the detail pane's pinned
+/// sentence: the two are describing one fact, and a status line claiming
+/// "exited" over a pane saying "cannot be confirmed" is the console
+/// contradicting itself.
+pub const LAUNCH_UNCONFIRMED_STATUS: &str =
+    "that pid is in use — this launch's identity cannot be confirmed";
+/// ...and when there is no occurrence to judge yet, because the drill-down
+/// is still settling or in flight. Saying "exited" here would be a verdict
+/// on a record that has not been read.
+pub const LAUNCH_LOADING_STATUS: &str = "still loading launch details";
+/// Said out loud when a HUNT jump drops the operator's own process filter
+/// to reach the row it promised: a filter that disappears without a word
+/// reads as a bug.
+pub const LAUNCH_JUMP_FILTER_CLEARED: &str = "Process filter cleared for the jump";
 /// The nudge is shown at most once a day (spec UX).
 pub const RATING_NUDGE_INTERVAL_MS: i64 = 24 * 3_600_000;
 /// …and only after the trailing hour held at least this many heavy minutes.
@@ -102,13 +141,14 @@ pub enum Page {
     Settings,
     Help,
     Hardware,
+    Launches,
 }
 
 impl Page {
     /// Every page in tab order. The KEYS reference deliberately sits last —
     /// it is the appendix, reached by Tab wrap-around or its printed "?"
     /// entry, and it is the only page without a digit key.
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::Overview,
         Self::Processes,
         Self::Tree,
@@ -117,6 +157,7 @@ impl Page {
         Self::Analyzer,
         Self::Settings,
         Self::Hardware,
+        Self::Launches,
         Self::Help,
     ];
 
@@ -131,8 +172,37 @@ impl Page {
             Self::Settings => "Settings",
             Self::Help => "Keys",
             Self::Hardware => "Gauges",
+            Self::Launches => "Launches",
         }
     }
+}
+
+/// Whether a LAUNCHES occurrence fetch goes out at once or waits for the
+/// selection to settle. See [`App::sync_launch_occurrences`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LaunchFetch {
+    /// A decision: a click, a focus change, a fresh groups reply.
+    Now,
+    /// A scroll: `j`/`k`, the wheel. Coalesced.
+    Settle,
+}
+
+/// Whether the process a recorded launch describes is still running.
+/// Deliberately three-valued: `PidInUse` is the case where a live process
+/// wears the occurrence's pid but its start time does not match, which is
+/// pid reuse *or* a process whose creation time the sampler could not read
+/// (`GetProcessTimes` denied — `metrics/win32.rs` then falls back to an
+/// ETW or sample timestamp). Those two are indistinguishable from here, and
+/// calling either of them "exited" would be a claim about a process that
+/// may well be alive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LaunchLiveness {
+    /// pid *and* start time match a process in the current snapshot.
+    Live,
+    /// A live process holds the pid, but the identity cannot be confirmed.
+    PidInUse,
+    /// Nothing in the current snapshot holds the pid.
+    Exited,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -347,6 +417,9 @@ pub enum SettingField {
     AgentAge,
     Notifications,
     AgentPatterns,
+    CaptureCommandLines,
+    CommandLineRetentionHours,
+    DeleteCommandLines,
 }
 
 impl SettingField {
@@ -366,7 +439,7 @@ impl SettingField {
     ];
 
     /// Service-validated detector settings, saved through the pipe with `s`.
-    pub const SERVICE: [Self; 19] = [
+    pub const SERVICE: [Self; 22] = [
         Self::SampleInterval,
         Self::Retention,
         Self::Sustained,
@@ -386,9 +459,12 @@ impl SettingField {
         Self::AgentAge,
         Self::Notifications,
         Self::AgentPatterns,
+        Self::CaptureCommandLines,
+        Self::CommandLineRetentionHours,
+        Self::DeleteCommandLines,
     ];
 
-    pub const ALL: [Self; 29] = [
+    pub const ALL: [Self; 32] = [
         Self::ClientTheme,
         Self::ClientEffects,
         Self::ClientRefresh,
@@ -418,6 +494,9 @@ impl SettingField {
         Self::AgentAge,
         Self::Notifications,
         Self::AgentPatterns,
+        Self::CaptureCommandLines,
+        Self::CommandLineRetentionHours,
+        Self::DeleteCommandLines,
     ];
 
     pub const fn is_client(self) -> bool {
@@ -467,6 +546,9 @@ impl SettingField {
             Self::AgentAge => "Abandoned agent age",
             Self::Notifications => "Native notifications",
             Self::AgentPatterns => "Agent patterns",
+            Self::CaptureCommandLines => "Command-line capture",
+            Self::CommandLineRetentionHours => "Cmdline retention (hours)",
+            Self::DeleteCommandLines => "Delete captured command lines",
         }
     }
 
@@ -493,6 +575,7 @@ impl SettingField {
             Self::Dpc | Self::Interrupt => "/s",
             Self::Unresponsive => "seconds",
             Self::AgentAge => "minutes",
+            Self::CommandLineRetentionHours => "hours",
             _ => "",
         }
     }
@@ -625,6 +708,27 @@ impl SettingField {
                 "Comma-separated name or path fragments that identify AI-agent processes, \
                  used by agent focus and abandoned-agent findings."
             }
+            // Disclosure copy, verbatim from the launch-history design spec.
+            // A pinned test asserts this string byte-for-byte; do not reword
+            // it without updating that test and the spec together.
+            Self::CaptureCommandLines => {
+                "Command lines can contain credentials, tokens, and personal paths. \
+                 Captured lines are redacted, encrypted at rest, kept N hours, and \
+                 deletable at any time. Off: PC Pulse identifies the executable and \
+                 launcher, but not the exact command or script."
+            }
+            Self::CommandLineRetentionHours => {
+                "How long captured, redacted command lines stay encrypted on disk before \
+                 automatic deletion, from 1 to 168 hours -- its own clock, independent of \
+                 the 7-day launch-event history. Out-of-range entries are clamped to the \
+                 nearest valid hour rather than rejected."
+            }
+            Self::DeleteCommandLines => {
+                "Immediately deletes every captured command line from disk, regardless of \
+                 its remaining retention. Enter runs it now; the number deleted appears on \
+                 the status line. Launch history itself (executable, lineage, timestamps) \
+                 is not affected."
+            }
         }
     }
 
@@ -666,6 +770,15 @@ impl SettingField {
             }
             .into(),
             Self::AgentPatterns => settings.agent_process_patterns.join(", "),
+            Self::CaptureCommandLines => if settings.capture_command_lines {
+                "on"
+            } else {
+                "off"
+            }
+            .into(),
+            Self::CommandLineRetentionHours => settings.command_line_retention_hours.to_string(),
+            // Not a stored value -- the row is a button, not a field.
+            Self::DeleteCommandLines => "press enter".into(),
         }
     }
 
@@ -725,6 +838,29 @@ impl SettingField {
                 }
                 settings.agent_process_patterns = values;
             }
+            Self::CaptureCommandLines => {
+                settings.capture_command_lines = match input.trim().to_ascii_lowercase().as_str() {
+                    "on" | "true" | "yes" | "1" => true,
+                    "off" | "false" | "no" | "0" => false,
+                    _ => return Err("enter on or off".into()),
+                }
+            }
+            // A stepper, not a strict range: an out-of-bounds hour count is
+            // clamped to the nearest valid value rather than rejected, the
+            // same forgiving UX as the background-dim row.
+            Self::CommandLineRetentionHours => {
+                let hours: u32 = input
+                    .trim()
+                    .parse()
+                    .map_err(|_| "enter a number from 1 to 168".to_string())?;
+                settings.command_line_retention_hours = hours.clamp(1, 168);
+            }
+            // The row never reaches a typed edit -- `begin_setting_edit`
+            // fires the delete action directly on Enter -- but the match
+            // must stay exhaustive.
+            Self::DeleteCommandLines => {
+                return Err("action row -- press Enter to run it".into());
+            }
         }
         Ok(())
     }
@@ -783,6 +919,25 @@ pub enum WorkerCommand {
     /// Re-read the rating history the incidents pane derives its displayed
     /// policy offsets from.
     RefreshRatings,
+    /// Re-read the LAUNCHES groups list. Cheap enough for page entry and
+    /// the `r` refresh: the service groups an already-indexed window.
+    RefreshLaunchGroups {
+        console_hosts_only: bool,
+    },
+    /// One group's occurrences. Sent only when the selected group changes:
+    /// the service walks its whole 7-day window per request, so this must
+    /// never ride along with a periodic refresh. `exe_path`/`lineage_sig`
+    /// are passed through byte-exactly as `getLaunchGroups` served them —
+    /// the stored values are already lowercased and are matched literally,
+    /// so re-casing or normalizing them would match nothing.
+    RefreshLaunchOccurrences {
+        exe_path: String,
+        lineage_sig: String,
+    },
+    /// The TUNE "Delete captured command lines" action row: wipes every
+    /// captured command line immediately, independent of retention. Launch
+    /// events themselves (executable, lineage, timestamps) are untouched.
+    DeleteCommandLines,
     /// One launch-time release check against GitHub; sent only when the
     /// `updateChecks` preference is on and the 20-hour cadence is due.
     CheckUpdate,
@@ -832,6 +987,19 @@ pub enum WorkerEvent {
     /// swallowed rather than shown, because nothing the user did asked for
     /// this fetch.
     Ratings(Result<Vec<Rating>, String>),
+    /// The LAUNCHES groups list. `Err` carries the reason (including the
+    /// unknown-command error a pre-launch-history service answers with) so
+    /// the page can say why it is empty instead of implying nothing ever
+    /// launched.
+    LaunchGroups(Result<Vec<LaunchGroup>, String>),
+    /// One group's occurrences, tagged with the key they were asked for:
+    /// the selection can move while a request is in flight, and a reply for
+    /// a group that is no longer selected must be dropped, not displayed.
+    LaunchOccurrences {
+        exe_path: String,
+        lineage_sig: String,
+        result: Result<Vec<LaunchEvent>, String>,
+    },
     Action(Result<String, String>),
     /// The launch-time release check: `Ok(Some)` = a newer release with a
     /// downloadable MSI, `Ok(None)` = up to date, `Err` = offline, rate
@@ -1033,6 +1201,45 @@ fn worker_loop(commands: Receiver<WorkerCommand>, events: Sender<WorkerEvent>) {
                             client.ratings(POLICY_OFFSET_RATINGS).map_err(error_text),
                         ));
                     }
+                    Ok(WorkerCommand::RefreshLaunchGroups { console_hosts_only }) => {
+                        let result = client
+                            .launch_groups(console_hosts_only, LAUNCH_GROUP_LIMIT)
+                            .map(|response| response.groups)
+                            .map_err(error_text);
+                        let _ = events.send(WorkerEvent::LaunchGroups(result));
+                    }
+                    Ok(WorkerCommand::RefreshLaunchOccurrences { exe_path, lineage_sig }) => {
+                        let result = client
+                            .launch_occurrences(
+                                exe_path.clone(),
+                                lineage_sig.clone(),
+                                LAUNCH_OCCURRENCE_LIMIT,
+                            )
+                            .map(|response| response.events)
+                            .map_err(error_text);
+                        let _ = events.send(WorkerEvent::LaunchOccurrences {
+                            exe_path,
+                            lineage_sig,
+                            result,
+                        });
+                    }
+                    Ok(WorkerCommand::DeleteCommandLines) => {
+                        // One pipe round trip, exactly like acknowledge and
+                        // the rating submission: the count the service
+                        // reports is the only honest source for "how many"
+                        // -- the client never estimates it.
+                        let result = client
+                            .delete_command_lines()
+                            .map(|response| {
+                                format!(
+                                    "Deleted {} captured command line{}",
+                                    response.deleted,
+                                    if response.deleted == 1 { "" } else { "s" }
+                                )
+                            })
+                            .map_err(error_text);
+                        let _ = events.send(WorkerEvent::Action(result));
+                    }
                     Ok(WorkerCommand::CheckUpdate) => {
                         // Fire-and-forget on its own thread so a slow or
                         // stalled HTTPS exchange never delays snapshots.
@@ -1226,6 +1433,44 @@ pub struct App {
     /// empty until the first `getRatings` answers (an older collector never
     /// fills it).
     pub ratings: Vec<Rating>,
+    /// LAUNCHES: recorded launches bucketed by `(exe_path, lineage_sig)`,
+    /// as the service grouped them. Never re-sorted here — the ordering is
+    /// the service's 24-hour recurrence ranking.
+    pub launch_groups: Vec<LaunchGroup>,
+    /// The selected group's occurrences, newest first, or empty while a
+    /// fetch is in flight.
+    pub launch_occurrences: Vec<LaunchEvent>,
+    /// Which group's occurrences were actually *requested*, byte-exact as
+    /// the service served the key. Also the guard that drops a reply
+    /// arriving after the selection has moved on. Only ever set once a
+    /// request is genuinely on the channel: a dropped send must not leave
+    /// this claiming an answer is coming, or the drill-down wedges.
+    pub(crate) launch_key: Option<(String, String)>,
+    /// Which group the *selection* points at, which leads `launch_key`
+    /// during the settle window below.
+    pub(crate) launch_wanted: Option<(String, String)>,
+    /// When the settled selection's fetch comes due. `None` = nothing
+    /// pending. See [`LAUNCH_SETTLE`].
+    launch_fetch_due: Option<Instant>,
+    /// False until a `getLaunchGroups` reply of any kind has landed for the
+    /// filter in force, so the page can say "loading" instead of asserting
+    /// that nothing ever launched.
+    pub launch_loaded: bool,
+    /// Why the drill-down is empty, when it is empty for a reason. Kept
+    /// apart from [`Self::launch_error`] so an occurrence failure is never
+    /// reported as the groups list having failed.
+    pub launch_occurrence_error: Option<String>,
+    /// The `c` filter: fetch only groups whose launches were console hosts.
+    /// A filter, never a verdict — a console host is not a suspect.
+    pub launch_console_only: bool,
+    /// `o` moves the cursor between the groups table and the occurrence
+    /// list, so `j`/`k` and the wheel drive whichever the operator is
+    /// reading.
+    pub launch_detail_focused: bool,
+    /// Why the groups list is empty, when it is empty for a reason —
+    /// notably the unknown-command error a pre-1.20 collector answers with.
+    /// Shown in the page's own panel rather than the shared status line.
+    pub launch_error: Option<String>,
     /// The '?' keys overlay: `Some(scroll)` while open. Deliberately not an
     /// [`InputMode`] variant — the effects layer diffs `InputMode` through
     /// its own `ModeKind`, and the overlay is chrome, not an input state.
@@ -1290,6 +1535,12 @@ pub struct App {
     pub process_state: TableState,
     pub tree_state: TableState,
     pub alert_state: TableState,
+    pub launch_state: TableState,
+    pub launch_occurrence_state: TableState,
+    /// A pid a LAUNCHES jump asked the LINEAGE page to select, held until
+    /// that page's tree actually arrives — the fetch is a round trip, and on
+    /// a first visit there is no tree to select in yet.
+    pending_tree_pid: Option<u32>,
     /// Most recent left click on a finding row, for double-click detection.
     alert_last_click: Option<(usize, Instant)>,
     pub plan_action_state: ListState,
@@ -1381,6 +1632,16 @@ impl App {
             mode: InputMode::Normal,
             rating_offsets: PolicyOffsets::default(),
             ratings: Vec::new(),
+            launch_groups: Vec::new(),
+            launch_occurrences: Vec::new(),
+            launch_key: None,
+            launch_wanted: None,
+            launch_fetch_due: None,
+            launch_loaded: false,
+            launch_occurrence_error: None,
+            launch_console_only: false,
+            launch_detail_focused: false,
+            launch_error: None,
             help_overlay: None,
             client_prefs: UiPrefs::default(),
             background: None,
@@ -1401,6 +1662,9 @@ impl App {
             process_state: TableState::default().with_selected(0),
             tree_state: TableState::default().with_selected(0),
             alert_state: TableState::default().with_selected(0),
+            launch_state: TableState::default().with_selected(0),
+            launch_occurrence_state: TableState::default().with_selected(0),
+            pending_tree_pid: None,
             alert_last_click: None,
             plan_action_state: ListState::default().with_selected(Some(0)),
             setting_state: TableState::default().with_selected(0),
@@ -1508,6 +1772,11 @@ impl App {
                     self.tree.clear();
                     flatten_tree(&nodes, 0, &mut self.tree);
                     self.clamp_selection();
+                    // A LAUNCHES `l` jump lands here before the tree it
+                    // asked for exists; honor its pid now that it does.
+                    if let Some(pid) = self.pending_tree_pid.take() {
+                        self.select_tree_pid(pid);
+                    }
                 }
                 WorkerEvent::Diagnostics(Ok(diagnostics)) => {
                     self.diagnostics = diagnostics;
@@ -1563,6 +1832,62 @@ impl App {
                 // fetch, so it fails silently rather than parking an error
                 // banner on a perfectly working older collector.
                 WorkerEvent::Ratings(Err(_)) => {}
+                WorkerEvent::LaunchGroups(Ok(groups)) => {
+                    self.launch_error = None;
+                    self.launch_loaded = true;
+                    self.launch_groups = groups;
+                    if self.launch_state.selected().is_none() && !self.launch_groups.is_empty() {
+                        self.launch_state.select(Some(0));
+                    }
+                    self.clamp_selection();
+                    // The selected group may be a different one than before
+                    // the refresh (the service re-ranks by recent activity),
+                    // so the drill-down follows it — and only then. A reply
+                    // is a decision, not a scroll: no settle window.
+                    self.sync_launch_occurrences(LaunchFetch::Now);
+                }
+                // Kept on the page rather than the status line: an empty
+                // list because the collector predates launch history is a
+                // different fact from an empty list because nothing ran.
+                WorkerEvent::LaunchGroups(Err(error)) => {
+                    self.launch_groups.clear();
+                    self.launch_occurrences.clear();
+                    self.launch_occurrence_state.select(None);
+                    self.launch_key = None;
+                    self.launch_wanted = None;
+                    self.launch_occurrence_error = None;
+                    self.launch_error = Some(error);
+                    self.launch_loaded = true;
+                    self.clamp_selection();
+                }
+                WorkerEvent::LaunchOccurrences {
+                    exe_path,
+                    lineage_sig,
+                    result,
+                } => {
+                    // A reply for a group the selection has already left is
+                    // stale by definition: showing it would attach one
+                    // group's occurrences to another's row.
+                    if self.launch_key.as_ref() != Some(&(exe_path.clone(), lineage_sig.clone())) {
+                        continue;
+                    }
+                    match result {
+                        Ok(events) => {
+                            self.launch_occurrence_error = None;
+                            self.launch_occurrences = events;
+                            self.launch_occurrence_state
+                                .select((!self.launch_occurrences.is_empty()).then_some(0));
+                        }
+                        // The drill-down's own failure, shown in the
+                        // drill-down. Reporting it as `launch_error` would
+                        // blame the groups list for a fault it did not have.
+                        Err(error) => {
+                            self.launch_occurrences.clear();
+                            self.launch_occurrence_state.select(None);
+                            self.launch_occurrence_error = Some(error);
+                        }
+                    }
+                }
                 WorkerEvent::Action(Ok(message)) => {
                     self.status = message;
                     self.status_is_error = false;
@@ -1981,9 +2306,9 @@ impl App {
             KeyCode::Tab | KeyCode::Right if self.page != Page::Settings => self.change_page(1),
             KeyCode::BackTab | KeyCode::Left if self.page != Page::Settings => self.change_page(-1),
             KeyCode::Char('?') => self.help_overlay = Some(0),
-            // Digits address the first eight pages only; the KEYS page has
+            // Digits address the first nine pages only; the KEYS page has
             // no digit — Tab wraps to it, and '?' opens the quick overlay.
-            KeyCode::Char(value @ '1'..='8') => {
+            KeyCode::Char(value @ '1'..='9') => {
                 self.select_page(Page::ALL[(value as u8 - b'1') as usize]);
             }
             KeyCode::Esc if self.page == Page::Analyzer && self.analyzer_running => {
@@ -2054,6 +2379,29 @@ impl App {
             }
             KeyCode::Char('x') if matches!(self.page, Page::Processes | Page::Tree) => {
                 self.begin_termination();
+            }
+            KeyCode::Char('c') if self.page == Page::Launches => {
+                self.toggle_launch_console_filter();
+            }
+            KeyCode::Char('o') if self.page == Page::Launches => {
+                self.launch_detail_focused = !self.launch_detail_focused;
+                // Reaching for the occurrence list is a decision: whatever
+                // is still settling is wanted now.
+                self.flush_launch_fetch();
+            }
+            // Read-only jumps: they change which page is looking at the
+            // process, never the process itself.
+            KeyCode::Enter | KeyCode::Char('h') if self.page == Page::Launches => {
+                self.flush_launch_fetch();
+                if !self.jump_to_live_launch(Page::Processes) {
+                    self.report_refused_launch_jump();
+                }
+            }
+            KeyCode::Char('l') if self.page == Page::Launches => {
+                self.flush_launch_fetch();
+                if !self.jump_to_live_launch(Page::Tree) {
+                    self.report_refused_launch_jump();
+                }
             }
             KeyCode::Char('a') if self.page == Page::Alerts => self.acknowledge_selected(),
             KeyCode::Char('z') if self.page == Page::Alerts => self.archive_selected(),
@@ -2500,11 +2848,276 @@ impl App {
             }),
             Page::Analyzer => Some(WorkerCommand::RefreshAnalyzer),
             Page::Settings => Some(WorkerCommand::LoadSettings),
+            Page::Launches => Some(WorkerCommand::RefreshLaunchGroups {
+                console_hosts_only: self.launch_console_only,
+            }),
             _ => None,
         };
         if let Some(command) = command {
             let _ = self.worker.commands.try_send(command);
         }
+    }
+
+    pub fn selected_launch_group(&self) -> Option<&LaunchGroup> {
+        self.launch_state
+            .selected()
+            .and_then(|index| self.launch_groups.get(index))
+    }
+
+    pub fn selected_launch_occurrence(&self) -> Option<&LaunchEvent> {
+        self.launch_occurrence_state
+            .selected()
+            .and_then(|index| self.launch_occurrences.get(index))
+    }
+
+    /// Point the drill-down at whichever group is selected now.
+    ///
+    /// Two guards, for two different costs. The selected group is compared
+    /// against the one already asked for, so a repaint, an `r`, or a
+    /// re-selection of the same row asks for nothing. And a selection the
+    /// user is still moving through is only fetched once it settles
+    /// ([`LAUNCH_SETTLE`]), so holding `j` down a fifty-row list queues one
+    /// seven-day scan rather than fifty. [`LaunchFetch::Now`] is for the
+    /// gestures that are a decision rather than a scroll — a click, a
+    /// focus change, a fresh groups reply.
+    pub(crate) fn sync_launch_occurrences(&mut self, urgency: LaunchFetch) {
+        let wanted = self
+            .selected_launch_group()
+            .map(|group| (group.exe_path.clone(), group.lineage_sig.clone()));
+        if wanted != self.launch_wanted {
+            // Whatever the pane holds describes a row that is no longer
+            // selected, and any pending fetch was for that row too.
+            self.launch_wanted = wanted;
+            self.launch_key = None;
+            self.launch_fetch_due = None;
+            self.launch_occurrences.clear();
+            self.launch_occurrence_state.select(None);
+            self.launch_occurrence_error = None;
+        }
+        if self.launch_wanted.is_none() || self.launch_key == self.launch_wanted {
+            return;
+        }
+        match urgency {
+            LaunchFetch::Now => self.request_launch_occurrences(),
+            // `get_or_insert`, not an assignment: the deadline is cleared
+            // by a real selection change above, so repeated syncs on an
+            // unchanged row (holding `j` against the end of the list)
+            // cannot push it forever into the future.
+            LaunchFetch::Settle => {
+                self.launch_fetch_due
+                    .get_or_insert_with(|| Instant::now() + LAUNCH_SETTLE);
+            }
+        }
+    }
+
+    /// Send the settled selection's occurrence request, if there is one.
+    ///
+    /// `launch_key` advances only when the command is genuinely on the
+    /// channel. A full queue means nothing was asked, and a key claiming
+    /// otherwise would wedge the drill-down permanently: every later sync
+    /// would read "already asked" and never retry. Instead the deadline is
+    /// re-armed, so a busy worker costs a quarter-second, not the pane.
+    fn request_launch_occurrences(&mut self) {
+        self.launch_fetch_due = None;
+        let Some((exe_path, lineage_sig)) = self.launch_wanted.clone() else {
+            return;
+        };
+        let sent = self
+            .worker
+            .commands
+            .try_send(WorkerCommand::RefreshLaunchOccurrences {
+                exe_path: exe_path.clone(),
+                lineage_sig: lineage_sig.clone(),
+            })
+            .is_ok();
+        if sent {
+            self.launch_key = Some((exe_path, lineage_sig));
+        } else {
+            self.launch_key = None;
+            self.launch_fetch_due = Some(Instant::now() + LAUNCH_SETTLE);
+        }
+    }
+
+    /// Fire a settled occurrence fetch that has come due. Returns whether
+    /// anything happened, so the main loop can mark the frame dirty.
+    pub fn poll_launch_fetch(&mut self, now: Instant) -> bool {
+        if self.launch_fetch_due.is_none_or(|due| now < due) {
+            return false;
+        }
+        self.request_launch_occurrences();
+        true
+    }
+
+    /// When the main loop must next wake to service a settled fetch, so a
+    /// quiet event-driven session does not sit on a pending drill-down.
+    pub fn launch_fetch_deadline(&self) -> Option<Instant> {
+        self.launch_fetch_due
+    }
+
+    /// Let go of a settling fetch at once. Deliberately narrower than
+    /// [`Self::sync_launch_occurrences`]: it only releases a deadline that
+    /// is already armed and never touches the selection or the loaded
+    /// rows, so the gestures that call it (focusing the list, a jump)
+    /// cannot blank the pane they are about to read.
+    pub(crate) fn flush_launch_fetch(&mut self) {
+        if self.launch_fetch_due.is_some() {
+            self.request_launch_occurrences();
+        }
+    }
+
+    /// `c`: narrow the groups list to launches that were console hosts —
+    /// stated as a filter, because a console window is a fact about how a
+    /// program ran, not a verdict about it.
+    pub(crate) fn toggle_launch_console_filter(&mut self) {
+        self.launch_console_only = !self.launch_console_only;
+        self.launch_groups.clear();
+        self.launch_state.select(Some(0));
+        // The filter changes which groups exist, so whatever the drill-down
+        // holds is about to be answered for by a fresh selection.
+        self.launch_occurrences.clear();
+        self.launch_occurrence_state.select(None);
+        self.launch_key = None;
+        self.launch_wanted = None;
+        self.launch_fetch_due = None;
+        self.launch_detail_focused = false;
+        // Both failures belong to the list that is being thrown away. Left
+        // standing, the old one would be read as a verdict on the new
+        // request that has not even been answered yet.
+        self.launch_error = None;
+        self.launch_occurrence_error = None;
+        self.launch_loaded = false;
+        self.refresh_page();
+    }
+
+    /// Whether the selected occurrence's process is still running.
+    ///
+    /// Identity is pid **and** start time, both derived from the same
+    /// process-creation FILETIME on either side. Pid alone would be a lie
+    /// the moment Windows reuses one, which on a busy machine is the common
+    /// case for the short-lived launches this page is full of.
+    ///
+    /// `None` means there is nothing to judge — no occurrence selected, or
+    /// no snapshot to check it against. The caller must say nothing at all
+    /// rather than default to "exited".
+    pub(crate) fn launch_liveness(&self) -> Option<LaunchLiveness> {
+        let occurrence = self.selected_launch_occurrence()?;
+        let snapshot = self.snapshot.as_ref()?;
+        let mut pid_in_use = false;
+        for process in &snapshot.processes {
+            if process.pid != occurrence.pid {
+                continue;
+            }
+            if process.started_at_ms == occurrence.start_time_ms {
+                return Some(LaunchLiveness::Live);
+            }
+            pid_in_use = true;
+        }
+        Some(if pid_in_use {
+            LaunchLiveness::PidInUse
+        } else {
+            LaunchLiveness::Exited
+        })
+    }
+
+    /// The pid to jump to: only a confirmed identity earns one. A pid that
+    /// is merely in use is not this launch, so far as anything here can
+    /// tell, and jumping to it would put the operator in front of a process
+    /// PC Pulse cannot say is the one they asked about.
+    pub(crate) fn live_launch_pid(&self) -> Option<u32> {
+        (self.launch_liveness()? == LaunchLiveness::Live)
+            .then(|| self.selected_launch_occurrence().map(|event| event.pid))
+            .flatten()
+    }
+
+    /// Say why a jump went nowhere — in the same terms the detail pane is
+    /// using at that moment.
+    ///
+    /// A single "has exited" line for every refusal was a contradiction the
+    /// operator could see: the pane would be saying "identity cannot be
+    /// confirmed" about a process that is demonstrably running, or showing
+    /// nothing at all because the drill-down had not loaded, while the
+    /// status line pronounced the launch dead. Each refusal now reports its
+    /// own reason, and the one case with nothing to report — no snapshot to
+    /// judge against — leaves the status line alone rather than inventing a
+    /// verdict.
+    fn report_refused_launch_jump(&mut self) {
+        let reason = if self.selected_launch_occurrence().is_none() {
+            Some(LAUNCH_LOADING_STATUS)
+        } else {
+            match self.launch_liveness() {
+                Some(LaunchLiveness::Exited) => Some(LAUNCH_EXITED_STATUS),
+                Some(LaunchLiveness::PidInUse) => Some(LAUNCH_UNCONFIRMED_STATUS),
+                // `Live` never refuses a jump, and `None` here means there
+                // is no snapshot to check against.
+                Some(LaunchLiveness::Live) | None => None,
+            }
+        };
+        if let Some(reason) = reason {
+            self.status = reason.into();
+            self.status_is_error = false;
+        }
+    }
+
+    /// `Enter`/`h` (HUNT) and `l` (LINEAGE): follow a launch that is still
+    /// alive onto the page that can act on it. A launch that has exited
+    /// stays here — there is nothing live to select, and the recorded
+    /// lineage the detail pane already shows is the honest answer.
+    pub(crate) fn jump_to_live_launch(&mut self, page: Page) -> bool {
+        let Some(pid) = self.live_launch_pid() else {
+            return false;
+        };
+        self.select_page(page);
+        match page {
+            Page::Processes => {
+                // A live pid is in the current snapshot by definition, but
+                // the filter in force may still hide its row; clearing it
+                // is what makes the jump land where it says it does — and
+                // saying so is the point, because the operator's HUNT
+                // filter silently vanishing is otherwise a small mystery.
+                if !self
+                    .visible_processes()
+                    .iter()
+                    .any(|process| process.pid == pid)
+                {
+                    self.process_filter.clear();
+                    self.agents_only = false;
+                    self.status = LAUNCH_JUMP_FILTER_CLEARED.into();
+                    self.status_is_error = false;
+                }
+                if let Some(index) = self
+                    .visible_processes()
+                    .iter()
+                    .position(|process| process.pid == pid)
+                {
+                    self.process_state.select(Some(index));
+                }
+            }
+            Page::Tree => {
+                // Select in the tree in hand for instant feedback, but keep
+                // the pid pending regardless: `select_page` just asked for a
+                // fresh tree, and that reply re-flattens `self.tree` under
+                // whatever index is selected. Landing now and clearing the
+                // pending pid would leave the *stale* tree's index pointing
+                // at an unrelated row of the new one.
+                self.select_tree_pid(pid);
+                self.pending_tree_pid = Some(pid);
+            }
+            _ => {}
+        }
+        true
+    }
+
+    /// Selects `pid` in the LINEAGE table, reporting whether it was there.
+    fn select_tree_pid(&mut self, pid: u32) -> bool {
+        let Some(index) = self
+            .visible_tree_rows()
+            .iter()
+            .position(|row| row.process.pid == pid)
+        else {
+            return false;
+        };
+        self.tree_state.select(Some(index));
+        true
     }
 
     pub(crate) fn begin_termination(&mut self) {
@@ -2677,6 +3290,17 @@ impl App {
             // asking the person to know the path by heart. The typed editor
             // is still there behind it, for a dialog that cannot be shown.
             SettingField::ClientBackgroundVideo => self.open_background_picker(),
+            // An action row, not a value to edit: Enter runs the delete
+            // immediately and the worker reports the count on the status
+            // line once the pipe answers, exactly like a rating submission.
+            SettingField::DeleteCommandLines => {
+                let _ = self
+                    .worker
+                    .commands
+                    .try_send(WorkerCommand::DeleteCommandLines);
+                self.status = "Deleting captured command lines…".into();
+                self.status_is_error = false;
+            }
             // This prefills with what the person would type, not with the
             // display value: a bare number rather than "auto (matches clip)".
             SettingField::ClientBackgroundFps => {
@@ -3082,6 +3706,20 @@ impl App {
                 }
             }
             Page::Settings => move_table(&mut self.setting_state, SettingField::ALL.len(), delta),
+            Page::Launches => {
+                if self.launch_detail_focused {
+                    move_table(
+                        &mut self.launch_occurrence_state,
+                        self.launch_occurrences.len(),
+                        delta,
+                    );
+                } else {
+                    move_table(&mut self.launch_state, self.launch_groups.len(), delta);
+                    // A scroll, not a decision: coalesced by the settle
+                    // window, so a held key costs one fetch, not one a row.
+                    self.sync_launch_occurrences(LaunchFetch::Settle);
+                }
+            }
             _ => {}
         }
     }
@@ -3092,6 +3730,11 @@ impl App {
         clamp_table(&mut self.process_state, process_count);
         clamp_table(&mut self.tree_state, self.tree.len());
         clamp_table(&mut self.alert_state, alert_count);
+        clamp_table(&mut self.launch_state, self.launch_groups.len());
+        clamp_table(
+            &mut self.launch_occurrence_state,
+            self.launch_occurrences.len(),
+        );
         clamp_list(&mut self.chat_session_state, self.chat_sessions.len() + 1);
         let action_count = self.plans.first().map_or(0, |plan| plan.actions.len());
         clamp_list(&mut self.plan_action_state, action_count);
@@ -3927,6 +4570,7 @@ fn write_clipboard_via_clip(text: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pcpulse_service::models::{LineageEntry, WindowState};
 
     #[test]
     #[ignore = "dev harness: prices the App::drain_events snapshot-ingest path; run with --ignored --nocapture"]
@@ -4007,14 +4651,14 @@ mod tests {
     }
 
     #[test]
-    fn key_8_routes_to_gauges_and_keys_sits_last_without_a_digit() {
+    fn digits_route_the_nine_addressable_pages_and_keys_sits_last_without_one() {
         let mut app = App::new_inert();
         app.handle_key(KeyEvent::new(KeyCode::Char('8'), KeyModifiers::NONE));
         assert_eq!(app.page, Page::Hardware);
-        // '9' addresses nothing: the KEYS page has no digit.
+        // '9' is LAUNCHES, the last page with a digit.
         app.handle_key(KeyEvent::new(KeyCode::Char('9'), KeyModifiers::NONE));
-        assert_eq!(app.page, Page::Hardware);
-        // Tab from GAUGES reaches the KEYS appendix, then wraps to Overview.
+        assert_eq!(app.page, Page::Launches);
+        // Tab from LAUNCHES reaches the KEYS appendix, then wraps to Overview.
         app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         assert_eq!(app.page, Page::Help);
         app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
@@ -4022,10 +4666,16 @@ mod tests {
         // Shift-Tab reaches KEYS from Overview.
         app.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE));
         assert_eq!(app.page, Page::Help);
-        assert_eq!(Page::ALL.len(), 9);
+        // ...and one more step back is LAUNCHES: it sits immediately before
+        // the appendix in the cycle.
+        app.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE));
+        assert_eq!(app.page, Page::Launches);
+        assert_eq!(Page::ALL.len(), 10);
         assert_eq!(Page::ALL[7], Page::Hardware);
-        assert_eq!(Page::ALL[8], Page::Help);
+        assert_eq!(Page::ALL[8], Page::Launches);
+        assert_eq!(Page::ALL[9], Page::Help);
         assert_eq!(Page::Help.title(), "Keys");
+        assert_eq!(Page::Launches.title(), "Launches");
         // '?' still opens the quick overlay rather than routing pages.
         app.handle_key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE));
         app.handle_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE));
@@ -5297,7 +5947,7 @@ mod tests {
             assert!(position < SettingField::CLIENT.len(), "{field:?} unpinned");
         }
         assert_eq!(SettingField::CLIENT.len(), 10);
-        assert_eq!(SettingField::ALL.len(), 29);
+        assert_eq!(SettingField::ALL.len(), 32);
         // The quality row sits between the path and the on/off switch, so
         // the three rows that describe *the clip* read top to bottom.
         let row = |field| fields.iter().position(|other| *other == field).unwrap();
@@ -5309,6 +5959,98 @@ mod tests {
             row(SettingField::ClientBackgroundEnabled),
             row(SettingField::ClientBackgroundQuality) + 1
         );
+    }
+
+    #[test]
+    fn the_capture_row_carries_the_disclosure_verbatim() {
+        // Pinned byte-for-byte to the launch-history design spec's exact
+        // wording; reword the row only alongside the spec and this test.
+        assert_eq!(
+            SettingField::CaptureCommandLines.description(),
+            "Command lines can contain credentials, tokens, and personal paths. \
+             Captured lines are redacted, encrypted at rest, kept N hours, and \
+             deletable at any time. Off: PC Pulse identifies the executable and \
+             launcher, but not the exact command or script."
+        );
+    }
+
+    #[test]
+    fn the_retention_hours_row_clamps_out_of_range_edits() {
+        let mut app = App::new_inert();
+        app.settings.command_line_retention_hours = 24;
+
+        app.mode = InputMode::EditSetting {
+            field: SettingField::CommandLineRetentionHours,
+            typed: "0".into(),
+        };
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.settings.command_line_retention_hours, 1);
+        assert!(app.settings_dirty);
+        assert!(matches!(app.mode, InputMode::Normal));
+
+        app.mode = InputMode::EditSetting {
+            field: SettingField::CommandLineRetentionHours,
+            typed: "9999".into(),
+        };
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.settings.command_line_retention_hours, 168);
+
+        app.mode = InputMode::EditSetting {
+            field: SettingField::CommandLineRetentionHours,
+            typed: "50".into(),
+        };
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            app.settings.command_line_retention_hours, 50,
+            "an in-range value passes through unclamped"
+        );
+
+        // Nonsense re-arms the edit with an error instead of committing.
+        app.mode = InputMode::EditSetting {
+            field: SettingField::CommandLineRetentionHours,
+            typed: "forever".into(),
+        };
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.status_is_error);
+        assert!(matches!(app.mode, InputMode::EditSetting { .. }));
+        assert_eq!(app.settings.command_line_retention_hours, 50);
+    }
+
+    #[test]
+    fn the_delete_action_row_sends_the_command_without_opening_an_edit() {
+        let (mut app, commands) = app_with_captive_worker();
+        app.page = Page::Settings;
+        let row = app
+            .visible_setting_fields()
+            .iter()
+            .position(|field| *field == SettingField::DeleteCommandLines)
+            .expect("the delete row is on the TUNE page");
+        app.setting_state.select(Some(row));
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(
+            matches!(app.mode, InputMode::Normal),
+            "the action runs immediately; it never opens a typed edit"
+        );
+        let sent: Vec<WorkerCommand> = commands.try_iter().collect();
+        assert!(
+            matches!(sent.as_slice(), [WorkerCommand::DeleteCommandLines]),
+            "{sent:?}"
+        );
+    }
+
+    #[test]
+    fn the_deleted_count_surfaces_on_the_statusline() {
+        let (mut app, _commands, events) = app_with_live_channels();
+        events
+            .send(WorkerEvent::Action(Ok(
+                "Deleted 3 captured command lines".into()
+            )))
+            .unwrap();
+        app.drain_events();
+        assert_eq!(app.status, "Deleted 3 captured command lines");
+        assert!(!app.status_is_error);
     }
 
     #[test]
@@ -6967,5 +7709,485 @@ mod tests {
         let (elapsed, budget) = app.analyzer_progress().unwrap();
         assert!(elapsed <= 1);
         assert!((30..=1_800).contains(&budget));
+    }
+
+    // ---- Launch history -------------------------------------------------
+
+    pub(crate) fn launch_group(exe_path: &str, lineage_sig: &str, count: usize) -> LaunchGroup {
+        LaunchGroup {
+            exe_name: exe_path.rsplit('\\').next().unwrap_or(exe_path).to_string(),
+            exe_path: exe_path.into(),
+            lineage_sig: lineage_sig.into(),
+            launcher_summary: lineage_sig
+                .split('<')
+                .next()
+                .filter(|value| !value.is_empty())
+                .unwrap_or("unknown")
+                .to_string(),
+            count,
+            first_ms: 1_800_000_000_000,
+            last_ms: 1_800_000_600_000,
+            median_interval_ms: Some(60_000),
+            mean_duration_ms: Some(4_000),
+            max_duration_ms: Some(9_000),
+            windowed: count,
+            never_windowed: 0,
+            unobserved: 0,
+            running: 0,
+            console_host: false,
+        }
+    }
+
+    pub(crate) fn launch_occurrence(pid: u32, start_time_ms: i64) -> LaunchEvent {
+        LaunchEvent {
+            pid,
+            start_time_ms,
+            stop_time_ms: Some(start_time_ms + 4_000),
+            exit_code: Some(0),
+            exe_name: "notepad.exe".into(),
+            exe_path: r"c:\windows\system32\notepad.exe".into(),
+            raw_image_path: None,
+            session_id: 1,
+            parent_pid: 900,
+            lineage: vec![LineageEntry {
+                pid: 900,
+                name: "explorer.exe".into(),
+                path: Some(r"c:\windows\explorer.exe".into()),
+            }],
+            window_state: WindowState::Windowed,
+            console_host: false,
+            command_line: None,
+        }
+    }
+
+    fn snapshot_with_live_process(pid: u32, started_at_ms: i64) -> Snapshot {
+        let mut snapshot = Snapshot::default();
+        snapshot.processes.push(ProcessMetric {
+            timestamp_ms: 1_800_000_600_000,
+            pid,
+            parent_pid: 900,
+            name: "notepad.exe".into(),
+            executable_path: r"C:\Windows\System32\notepad.exe".into(),
+            cpu_percent: 1.0,
+            working_set_bytes: 32 * 1024 * 1024,
+            private_bytes: 0,
+            handle_count: 20,
+            thread_count: 4,
+            read_bytes_per_sec: 0.0,
+            write_bytes_per_sec: 0.0,
+            total_read_bytes: 0,
+            total_write_bytes: 0,
+            started_at_ms,
+            session_id: 1,
+            responsive: true,
+            has_visible_window: true,
+            launch_duration_ms: None,
+            is_agent_candidate: false,
+        });
+        snapshot
+    }
+
+    #[test]
+    fn entering_launches_fetches_groups_and_c_toggles_the_console_filter() {
+        let (mut app, commands, _events) = app_with_live_channels();
+        app.select_page(Page::Launches);
+        assert!(
+            matches!(
+                commands.try_recv(),
+                Ok(WorkerCommand::RefreshLaunchGroups {
+                    console_hosts_only: false
+                })
+            ),
+            "entering the page fetches the unfiltered groups"
+        );
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+        assert!(app.launch_console_only);
+        assert!(
+            matches!(
+                commands.try_recv(),
+                Ok(WorkerCommand::RefreshLaunchGroups {
+                    console_hosts_only: true
+                })
+            ),
+            "the toggle re-fetches with the console-hosts-only flag set"
+        );
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+        assert!(!app.launch_console_only);
+        assert!(matches!(
+            commands.try_recv(),
+            Ok(WorkerCommand::RefreshLaunchGroups {
+                console_hosts_only: false
+            })
+        ));
+    }
+
+    #[test]
+    fn occurrences_are_fetched_only_when_the_selected_group_changes() {
+        let (mut app, commands, _events) = app_with_live_channels();
+        app.page = Page::Launches;
+        app.launch_groups = vec![
+            launch_group(r"c:\windows\system32\notepad.exe", "explorer.exe", 4),
+            launch_group(r"c:\tools\ripgrep.exe", "cmd.exe<explorer.exe", 2),
+        ];
+        app.launch_state.select(Some(0));
+        app.sync_launch_occurrences(LaunchFetch::Now);
+        match commands.try_recv() {
+            Ok(WorkerCommand::RefreshLaunchOccurrences {
+                exe_path,
+                lineage_sig,
+            }) => {
+                // Byte-exact passthrough of the stored (lowercased) values:
+                // the service matches them literally.
+                assert_eq!(exe_path, r"c:\windows\system32\notepad.exe");
+                assert_eq!(lineage_sig, "explorer.exe");
+            }
+            other => panic!("expected an occurrence fetch, got {other:?}"),
+        }
+
+        // Re-syncing without a selection change asks for nothing: the
+        // handler walks the whole 7-day window per request.
+        app.sync_launch_occurrences(LaunchFetch::Now);
+        assert!(commands.try_recv().is_err());
+
+        app.move_selection(1);
+        app.poll_launch_fetch(Instant::now() + LAUNCH_SETTLE);
+        match commands.try_recv() {
+            Ok(WorkerCommand::RefreshLaunchOccurrences {
+                exe_path,
+                lineage_sig,
+            }) => {
+                assert_eq!(exe_path, r"c:\tools\ripgrep.exe");
+                assert_eq!(lineage_sig, "cmd.exe<explorer.exe");
+            }
+            other => panic!("expected the second group's fetch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn scrolling_the_groups_list_coalesces_into_one_occurrence_fetch() {
+        let (mut app, commands, _events) = app_with_live_channels();
+        app.page = Page::Launches;
+        app.launch_groups = (0..12)
+            .map(|index| launch_group(&format!(r"c:\apps\p{index}.exe"), "explorer.exe", 3))
+            .collect();
+        app.launch_state.select(Some(0));
+        app.launch_wanted = Some((r"c:\apps\p0.exe".into(), "explorer.exe".into()));
+        app.launch_key = app.launch_wanted.clone();
+
+        // Eleven rows of `j`, as a held key delivers them.
+        for _ in 0..11 {
+            app.move_selection(1);
+        }
+        assert!(
+            commands.try_recv().is_err(),
+            "a moving selection must not queue a seven-day scan per row"
+        );
+        // Nothing fires until the selection has actually settled.
+        assert!(!app.poll_launch_fetch(Instant::now()));
+        assert!(app.poll_launch_fetch(Instant::now() + LAUNCH_SETTLE));
+        match commands.try_recv() {
+            Ok(WorkerCommand::RefreshLaunchOccurrences { exe_path, .. }) => {
+                assert_eq!(exe_path, r"c:\apps\p11.exe", "only the row landed on");
+            }
+            other => panic!("expected exactly one settled fetch, got {other:?}"),
+        }
+        assert!(commands.try_recv().is_err(), "and only one");
+    }
+
+    #[test]
+    fn a_dropped_occurrence_request_never_wedges_the_drill_down() {
+        let (mut app, commands, _events) = app_with_live_channels();
+        app.page = Page::Launches;
+        app.launch_groups = vec![launch_group(
+            r"c:\windows\system32\notepad.exe",
+            "explorer.exe",
+            4,
+        )];
+        app.launch_state.select(Some(0));
+        // Fill the worker's command queue so the request cannot go out.
+        while app
+            .worker
+            .commands
+            .try_send(WorkerCommand::RefreshRatings)
+            .is_ok()
+        {}
+
+        app.sync_launch_occurrences(LaunchFetch::Now);
+        assert_eq!(
+            app.launch_key, None,
+            "nothing was asked, so nothing may claim an answer is coming"
+        );
+
+        // Drain the queue: the re-armed deadline recovers on its own.
+        while commands.try_recv().is_ok() {}
+        assert!(app.poll_launch_fetch(Instant::now() + LAUNCH_SETTLE));
+        assert!(matches!(
+            commands.try_recv(),
+            Ok(WorkerCommand::RefreshLaunchOccurrences { .. })
+        ));
+        assert_eq!(
+            app.launch_key,
+            Some((
+                r"c:\windows\system32\notepad.exe".into(),
+                "explorer.exe".into()
+            ))
+        );
+    }
+
+    #[test]
+    fn enter_hunts_the_live_process_and_l_shows_its_lineage() {
+        let mut app = App::new_inert();
+        app.snapshot = Some(snapshot_with_live_process(4242, 1_800_000_000_000));
+        app.page = Page::Launches;
+        app.launch_groups = vec![launch_group(
+            r"c:\windows\system32\notepad.exe",
+            "explorer.exe",
+            1,
+        )];
+        app.launch_state.select(Some(0));
+        app.launch_occurrences = vec![launch_occurrence(4242, 1_800_000_000_000)];
+        app.launch_occurrence_state.select(Some(0));
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.page, Page::Processes);
+        assert_eq!(
+            app.selected_process().map(|process| process.pid),
+            Some(4242)
+        );
+
+        app.page = Page::Launches;
+        app.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE));
+        assert_eq!(app.page, Page::Tree);
+    }
+
+    #[test]
+    fn an_l_jump_holds_its_pid_until_the_fresh_tree_arrives() {
+        let (mut app, _commands, events) = app_with_live_channels();
+        app.snapshot = Some(snapshot_with_live_process(4242, 1_800_000_000_000));
+        app.page = Page::Launches;
+        app.launch_groups = vec![launch_group(
+            r"c:\windows\system32\notepad.exe",
+            "explorer.exe",
+            1,
+        )];
+        app.launch_state.select(Some(0));
+        app.launch_occurrences = vec![launch_occurrence(4242, 1_800_000_000_000)];
+        app.launch_occurrence_state.select(Some(0));
+
+        // A stale tree from an earlier visit, with the target at index 0.
+        let stale = vec![ProcessNode {
+            process: snapshot_with_live_process(4242, 1_800_000_000_000).processes[0].clone(),
+            children: Vec::new(),
+        }];
+        flatten_tree(&stale, 0, &mut app.tree);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE));
+        assert_eq!(app.page, Page::Tree);
+        assert_eq!(app.tree_state.selected(), Some(0));
+
+        // The refresh the jump asked for lands, and the target has moved to
+        // index 1. Selecting only against the stale tree would leave the
+        // cursor on the wrong process.
+        let fresh = vec![
+            ProcessNode {
+                process: snapshot_with_live_process(900, 1_700_000_000_000).processes[0].clone(),
+                children: Vec::new(),
+            },
+            ProcessNode {
+                process: snapshot_with_live_process(4242, 1_800_000_000_000).processes[0].clone(),
+                children: Vec::new(),
+            },
+        ];
+        events.send(WorkerEvent::Tree(Ok(fresh))).unwrap();
+        app.drain_events();
+        assert_eq!(
+            app.selected_tree_process().map(|process| process.pid),
+            Some(4242),
+            "the pid, not a stale index, is what the jump promised"
+        );
+    }
+
+    #[test]
+    fn a_dead_occurrence_never_leaves_the_launches_page() {
+        let mut app = App::new_inert();
+        // Same pid, different start time: pid reuse must not be mistaken
+        // for the recorded launch still being alive.
+        app.snapshot = Some(snapshot_with_live_process(4242, 1_799_000_000_000));
+        app.page = Page::Launches;
+        app.launch_groups = vec![launch_group(
+            r"c:\windows\system32\notepad.exe",
+            "explorer.exe",
+            1,
+        )];
+        app.launch_state.select(Some(0));
+        app.launch_occurrences = vec![launch_occurrence(4242, 1_800_000_000_000)];
+        app.launch_occurrence_state.select(Some(0));
+
+        assert_eq!(app.live_launch_pid(), None);
+        for key in [KeyCode::Enter, KeyCode::Char('h'), KeyCode::Char('l')] {
+            app.status = "sentinel".into();
+            app.handle_key(KeyEvent::new(key, KeyModifiers::NONE));
+            assert_eq!(app.page, Page::Launches);
+            // A live process holds the pid, so "has exited" would flatly
+            // contradict the pane, which says the identity is unconfirmed.
+            assert_eq!(app.status, LAUNCH_UNCONFIRMED_STATUS, "{key:?}");
+        }
+    }
+
+    #[test]
+    fn a_jump_before_the_drill_down_loads_never_declares_the_launch_dead() {
+        let mut app = App::new_inert();
+        app.snapshot = Some(snapshot_with_live_process(4242, 1_800_000_000_000));
+        app.page = Page::Launches;
+        app.launch_groups = vec![launch_group(
+            r"c:\windows\system32\notepad.exe",
+            "explorer.exe",
+            1,
+        )];
+        app.launch_state.select(Some(0));
+        // The settle window has not elapsed, or the reply is still in
+        // flight: there is no record to pronounce on.
+        assert!(app.launch_occurrences.is_empty());
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.page, Page::Launches);
+        assert_eq!(app.status, LAUNCH_LOADING_STATUS);
+
+        // ...and with no snapshot to judge against, the jump says nothing
+        // at all rather than picking a verdict.
+        app.launch_occurrences = vec![launch_occurrence(4242, 1_800_000_000_000)];
+        app.launch_occurrence_state.select(Some(0));
+        app.snapshot = None;
+        app.status = "sentinel".into();
+        app.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE));
+        assert_eq!(app.page, Page::Launches);
+        assert_eq!(app.status, "sentinel");
+    }
+
+    #[test]
+    fn an_exited_launch_still_reports_that_it_exited() {
+        let mut app = App::new_inert();
+        // Nothing in the snapshot wears the pid at all.
+        app.snapshot = Some(snapshot_with_live_process(111, 1_800_000_000_000));
+        app.page = Page::Launches;
+        app.launch_groups = vec![launch_group(
+            r"c:\windows\system32\notepad.exe",
+            "explorer.exe",
+            1,
+        )];
+        app.launch_state.select(Some(0));
+        app.launch_occurrences = vec![launch_occurrence(65_001, 1_800_000_000_000)];
+        app.launch_occurrence_state.select(Some(0));
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.page, Page::Launches);
+        assert_eq!(app.status, LAUNCH_EXITED_STATUS);
+    }
+
+    #[test]
+    fn a_hunt_jump_says_so_when_it_clears_the_operators_filter() {
+        let mut app = App::new_inert();
+        app.snapshot = Some(snapshot_with_live_process(4242, 1_800_000_000_000));
+        app.page = Page::Launches;
+        app.launch_groups = vec![launch_group(
+            r"c:\windows\system32\notepad.exe",
+            "explorer.exe",
+            1,
+        )];
+        app.launch_state.select(Some(0));
+        app.launch_occurrences = vec![launch_occurrence(4242, 1_800_000_000_000)];
+        app.launch_occurrence_state.select(Some(0));
+        // A filter that hides the very row the jump promises to land on.
+        app.process_filter = "chrome".into();
+        app.status = "sentinel".into();
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.page, Page::Processes);
+        assert_eq!(app.selected_process().map(|p| p.pid), Some(4242));
+        assert!(app.process_filter.is_empty());
+        assert_eq!(app.status, LAUNCH_JUMP_FILTER_CLEARED);
+        assert!(!app.status_is_error);
+    }
+
+    #[test]
+    fn a_hunt_jump_that_hid_nothing_leaves_the_status_line_alone() {
+        let mut app = App::new_inert();
+        app.snapshot = Some(snapshot_with_live_process(4242, 1_800_000_000_000));
+        app.page = Page::Launches;
+        app.launch_groups = vec![launch_group(
+            r"c:\windows\system32\notepad.exe",
+            "explorer.exe",
+            1,
+        )];
+        app.launch_state.select(Some(0));
+        app.launch_occurrences = vec![launch_occurrence(4242, 1_800_000_000_000)];
+        app.launch_occurrence_state.select(Some(0));
+        // A filter is set, but the target row matches it: nothing was
+        // taken away, so there is nothing to announce.
+        app.process_filter = "notepad".into();
+        app.status = "sentinel".into();
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.page, Page::Processes);
+        assert_eq!(app.selected_process().map(|p| p.pid), Some(4242));
+        assert_eq!(app.process_filter, "notepad");
+        assert_eq!(app.status, "sentinel");
+    }
+
+    #[test]
+    fn a_stale_occurrence_reply_for_another_group_is_dropped() {
+        let (mut app, _commands, events) = app_with_live_channels();
+        app.page = Page::Launches;
+        app.launch_groups = vec![launch_group(
+            r"c:\windows\system32\notepad.exe",
+            "explorer.exe",
+            1,
+        )];
+        app.launch_state.select(Some(0));
+        app.sync_launch_occurrences(LaunchFetch::Now);
+
+        events
+            .send(WorkerEvent::LaunchOccurrences {
+                exe_path: r"c:\tools\ripgrep.exe".into(),
+                lineage_sig: "cmd.exe".into(),
+                result: Ok(vec![launch_occurrence(7, 1_800_000_000_000)]),
+            })
+            .unwrap();
+        app.drain_events();
+        assert!(
+            app.launch_occurrences.is_empty(),
+            "a reply keyed on a group that is no longer selected must be dropped"
+        );
+
+        events
+            .send(WorkerEvent::LaunchOccurrences {
+                exe_path: r"c:\windows\system32\notepad.exe".into(),
+                lineage_sig: "explorer.exe".into(),
+                result: Ok(vec![launch_occurrence(4242, 1_800_000_000_000)]),
+            })
+            .unwrap();
+        app.drain_events();
+        assert_eq!(app.launch_occurrences.len(), 1);
+        assert_eq!(app.launch_occurrence_state.selected(), Some(0));
+    }
+
+    #[test]
+    fn the_launches_page_never_arms_a_termination() {
+        let mut app = App::new_inert();
+        app.snapshot = Some(snapshot_with_live_process(4242, 1_800_000_000_000));
+        app.page = Page::Launches;
+        app.launch_groups = vec![launch_group(
+            r"c:\windows\system32\notepad.exe",
+            "explorer.exe",
+            1,
+        )];
+        app.launch_state.select(Some(0));
+        app.launch_occurrences = vec![launch_occurrence(4242, 1_800_000_000_000)];
+        app.launch_occurrence_state.select(Some(0));
+        app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert!(matches!(app.mode, InputMode::Normal));
+        assert_eq!(app.page, Page::Launches);
     }
 }

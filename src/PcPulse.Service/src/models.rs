@@ -474,6 +474,13 @@ pub struct Snapshot {
     /// the ones worth asking for. `None` alongside [`Self::demand`].
     #[serde(default)]
     pub heavy_minutes_trailing_hour: Option<u16>,
+    /// Launch-history capture health, republished every sample. Additive:
+    /// snapshots from services that predate launch history have no such
+    /// field and deserialize to the all-zero default, which reads as "no
+    /// launches seen" -- the same thing a service that has just started
+    /// reports.
+    #[serde(default)]
+    pub launch_capture: LaunchCaptureStatus,
 }
 
 impl Default for Snapshot {
@@ -490,6 +497,7 @@ impl Default for Snapshot {
             learning_minutes_left: None,
             demand: None,
             heavy_minutes_trailing_hour: None,
+            launch_capture: LaunchCaptureStatus::default(),
         }
     }
 }
@@ -993,6 +1001,33 @@ pub enum PipeRequest {
     GetRatings {
         limit: usize,
     },
+    /// Launch-history groups, bucketed by `(exe_path, lineage_sig)`, over
+    /// launches with `start_time_ms >= from_ms` (default: 7 days back).
+    /// `limit` is transport-safe-clamped to 500.
+    GetLaunchGroups {
+        #[serde(default)]
+        from_ms: Option<i64>,
+        #[serde(default)]
+        console_hosts_only: Option<bool>,
+        #[serde(default)]
+        limit: Option<usize>,
+    },
+    /// Individual launch occurrences for one group's exact key, newest
+    /// first, `command_line` decrypted per-request (never cached) when a
+    /// captured command line exists for that occurrence. `limit` is
+    /// transport-safe-clamped to 1000.
+    GetLaunchOccurrences {
+        exe_path: String,
+        lineage_sig: String,
+        #[serde(default)]
+        from_ms: Option<i64>,
+        #[serde(default)]
+        limit: Option<usize>,
+    },
+    /// Delete every captured command-line blob -- the user-facing "forget
+    /// captured command lines" control. Never touches `launch_events`
+    /// rows, which never carry command lines in the first place.
+    DeleteCommandLines,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1009,9 +1044,173 @@ pub enum PipeResponse {
     Error { code: String, message: String },
 }
 
+/// One ancestor in a launch's parent chain, resolved at capture time (see
+/// `LaunchTracker`). `name` is `"unknown"` when the ancestor pid could not be
+/// resolved via the live process table or the tracker's recent-launch ring;
+/// the walk stops at the first unresolvable ancestor rather than guessing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LineageEntry {
+    pub pid: u32,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+}
+
+/// Whether a launch was ever observed to own a visible top-level window,
+/// honestly distinguishing "never sampled" from "sampled but never visible"
+/// rather than defaulting either to a guess.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum WindowState {
+    Windowed,
+    NeverWindowed,
+    Unobserved,
+    /// Still running when flushed past the 60s threshold; a snapshot, not a
+    /// final state -- the row is finalized (and window state re-resolved)
+    /// once the matching stop event lands.
+    Running,
+}
+
+/// One recorded process launch, built by `LaunchTracker` from ETW start/stop
+/// events. Never fabricated: a launch only exists here because a start event
+/// was actually observed.
+///
+/// `Debug` is hand-written rather than derived so `command_line` can never
+/// be printed. The line is post-redaction by the time it lands here, but
+/// redaction strips secrets, not identity: what survives is still the user's
+/// own paths, document names and arguments. A derived `Debug` is exactly how
+/// that ends up in a log line or a panic message -- the same reasoning as
+/// `CapturedCmdline` and `MofProcessStart` in `etw.rs`.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LaunchEvent {
+    pub pid: u32,
+    pub start_time_ms: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop_time_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<u32>,
+    pub exe_name: String,
+    pub exe_path: String,
+    /// The original, unmapped kernel image path, kept only when
+    /// `normalize_image_path` could not translate the `\Device\...` prefix
+    /// to a drive letter -- present exactly when the mapping failed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw_image_path: Option<String>,
+    pub session_id: u32,
+    pub parent_pid: u32,
+    /// Ancestor chain, nearest first, depth <= 5.
+    pub lineage: Vec<LineageEntry>,
+    pub window_state: WindowState,
+    pub console_host: bool,
+    /// Set only by the Task 7 command-line join; absent otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command_line: Option<String>,
+}
+
+impl std::fmt::Debug for LaunchEvent {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("LaunchEvent")
+            .field("pid", &self.pid)
+            .field("start_time_ms", &self.start_time_ms)
+            .field("stop_time_ms", &self.stop_time_ms)
+            .field("exit_code", &self.exit_code)
+            .field("exe_name", &self.exe_name)
+            .field("exe_path", &self.exe_path)
+            .field("raw_image_path", &self.raw_image_path)
+            .field("session_id", &self.session_id)
+            .field("parent_pid", &self.parent_pid)
+            .field("lineage", &self.lineage)
+            // Presence is diagnostic (did the join attach a line?); the
+            // content is not, and never prints. See the type's doc comment.
+            .field(
+                "command_line",
+                &self.command_line.as_ref().map(|_| "‹elided›"),
+            )
+            .field("window_state", &self.window_state)
+            .field("console_host", &self.console_host)
+            .finish()
+    }
+}
+
+/// Capture-health counters for the launch-history pipeline. The `etw_*`
+/// fields are tracker-owned zeros here; the runtime (Task 7) merges in the
+/// live `EtwHealth` counters before serving this to clients.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LaunchCaptureStatus {
+    pub starts_seen: u64,
+    pub stops_seen: u64,
+    pub persisted: u64,
+    pub dropped_channel: u64,
+    pub etw_events_lost: u64,
+    pub events_lost_query_failures: u64,
+    pub malformed_events: u64,
+    pub orphan_stops: u64,
+    /// Pending (never-stopped) rows dropped after 24h with no matching stop
+    /// event; their last-emitted `Running` snapshot (if any) remains in
+    /// storage as the honest last-known state.
+    pub stale_pending_evicted: u64,
+    pub cmdline_session_active: bool,
+    pub cmdlines_captured: u64,
+    pub cmdlines_redacted_fields: u64,
+    /// Captured command lines dropped before any launch row claimed them --
+    /// aged out of the join window or evicted by its cap. Mostly ordinary
+    /// (the MOF session sees every process on the machine, while only
+    /// tracked launches ever claim a line), but a figure climbing alongside
+    /// a flat `cmdlinesCaptured` means the join itself is failing.
+    #[serde(default)]
+    pub cmdlines_unmatched_evicted: u64,
+    /// Joined command lines that could not be stored (DPAPI encryption or
+    /// the insert failed). The line is gone by then -- the join consumed it
+    /// -- so this is real, unrecoverable loss, counted rather than left to a
+    /// single log line.
+    #[serde(default)]
+    pub cmdlines_persist_failures: u64,
+    /// Captured command lines that failed to decrypt when a client asked
+    /// for them via `getLaunchOccurrences` (e.g. a machine-key change after
+    /// a reinstall). Unlike the other counters here, this one is driven by
+    /// read traffic rather than the sampling loop -- it accumulates across
+    /// every `getLaunchOccurrences` request the service has served, folded
+    /// in here once per tick from a shared counter.
+    #[serde(default)]
+    pub cmdlines_decrypt_failures: u64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshot_carries_launch_capture_as_an_additive_camel_case_field() {
+        let snapshot = Snapshot {
+            launch_capture: LaunchCaptureStatus {
+                starts_seen: 12,
+                cmdline_session_active: true,
+                cmdlines_unmatched_evicted: 3,
+                cmdlines_persist_failures: 1,
+                cmdlines_decrypt_failures: 2,
+                ..LaunchCaptureStatus::default()
+            },
+            ..Snapshot::default()
+        };
+        let json = serde_json::to_string(&snapshot).unwrap();
+        assert!(json.contains("\"launchCapture\""), "{json}");
+        assert!(json.contains("\"cmdlineSessionActive\":true"), "{json}");
+        // Clients render these two as loss; the wire names are the contract.
+        assert!(json.contains("\"cmdlinesUnmatchedEvicted\":3"), "{json}");
+        assert!(json.contains("\"cmdlinesPersistFailures\":1"), "{json}");
+        assert!(json.contains("\"cmdlinesDecryptFailures\":2"), "{json}");
+
+        // A snapshot from a service that predates launch history has no such
+        // field and must still deserialize.
+        let mut older: serde_json::Value = serde_json::from_str(&json).unwrap();
+        older.as_object_mut().unwrap().remove("launchCapture");
+        let decoded: Snapshot = serde_json::from_value(older).unwrap();
+        assert_eq!(decoded.launch_capture, LaunchCaptureStatus::default());
+    }
 
     #[test]
     fn snapshot_round_trips_with_hardware_metrics() {

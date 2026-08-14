@@ -28,10 +28,26 @@ pub struct Settings {
     #[serde(default = "default_collector_cpu_percent")]
     pub collector_cpu_percent: f64,
     pub agent_process_patterns: Vec<String>,
+    /// Opt-in capture of process command lines for launch history. Default
+    /// **false**, and a settings file written before 1.20 has no such field,
+    /// so it migrates to false: opting in is always an explicit act. While
+    /// this is off no command-line data enters the process in any form --
+    /// the MOF session that carries it is not even started.
+    #[serde(default)]
+    pub capture_command_lines: bool,
+    /// How long captured (redacted, DPAPI-encrypted) command lines are kept,
+    /// on their own clock independent of the 7-day launch-event window.
+    /// Serde-defaulted so pre-1.20 settings files load unchanged.
+    #[serde(default = "default_command_line_retention_hours")]
+    pub command_line_retention_hours: u32,
 }
 
 fn default_collector_cpu_percent() -> f64 {
     0.2
+}
+
+fn default_command_line_retention_hours() -> u32 {
+    24
 }
 
 impl Default for Settings {
@@ -55,6 +71,8 @@ impl Default for Settings {
             abandoned_agent_minutes: 30,
             notifications_enabled: true,
             collector_cpu_percent: default_collector_cpu_percent(),
+            capture_command_lines: false,
+            command_line_retention_hours: default_command_line_retention_hours(),
             agent_process_patterns: vec![
                 "codex".into(),
                 "claude".into(),
@@ -84,6 +102,9 @@ impl Settings {
         }
         if !(0.05..=10.0).contains(&self.collector_cpu_percent) {
             bail!("collectorCpuPercent must be between 0.05 and 10");
+        }
+        if !(1..=168).contains(&self.command_line_retention_hours) {
+            bail!("commandLineRetentionHours must be between 1 and 168");
         }
         if self.agent_process_patterns.len() > 32
             || self.agent_process_patterns.iter().any(|x| x.len() > 64)
@@ -133,6 +154,49 @@ mod tests {
             ..Settings::default()
         };
         assert!(settings.validate().is_err());
+    }
+
+    #[test]
+    fn pre_1_20_settings_file_migrates_to_capture_off() {
+        // A settings file written before launch history has neither field.
+        // Opting in must never happen by migration: absent means off, and
+        // the retention clock falls back to its 24h default.
+        let json = r#"{
+            "sampleIntervalMs": 2000,
+            "retentionDays": 14,
+            "sustainedSamples": 5,
+            "baselineSigma": 3.0,
+            "cpuPercent": 80.0,
+            "memoryGrowthMb": 256.0,
+            "handleGrowth": 500,
+            "threadGrowth": 50,
+            "diskLatencyMs": 30.0,
+            "ioMbPerSec": 100.0,
+            "kernelPoolGrowthMb": 128.0,
+            "dpcRate": 1000.0,
+            "interruptRate": 20000.0,
+            "unresponsiveSeconds": 10,
+            "slowLaunchMs": 8000,
+            "abandonedAgentMinutes": 30,
+            "notificationsEnabled": true,
+            "agentProcessPatterns": ["codex"]
+        }"#;
+        let settings: Settings = serde_json::from_str(json).unwrap();
+        assert!(!settings.capture_command_lines);
+        assert_eq!(settings.command_line_retention_hours, 24);
+        settings.validate().unwrap();
+    }
+
+    #[test]
+    fn command_line_retention_hours_range_is_enforced() {
+        let with = |hours: u32| Settings {
+            command_line_retention_hours: hours,
+            ..Settings::default()
+        };
+        assert!(with(0).validate().is_err());
+        assert!(with(169).validate().is_err());
+        assert!(with(1).validate().is_ok());
+        assert!(with(168).validate().is_ok());
     }
 
     #[test]
