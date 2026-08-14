@@ -70,6 +70,16 @@ const LAUNCH_GROUP_LIMIT: usize = 500;
 /// archive — 200 rows is more than a pane can show and a fraction of the
 /// work the ceiling would cost.
 const LAUNCH_OCCURRENCE_LIMIT: usize = 200;
+/// How long the LAUNCHES selection must hold still before its occurrences
+/// are fetched. Every `j`/`k` and every wheel notch moves the selection by
+/// a row, and each fetch costs the service a seven-day scan plus up to
+/// [`LAUNCH_OCCURRENCE_LIMIT`] DPAPI decrypts on its one serial worker —
+/// scrolling a list must not queue one of those per row it passes over.
+/// A deadline rather than a loop-iteration count: the main loop's cadence
+/// swings between 16 ms and 250 ms depending on what else is animating,
+/// so counting turns of it would mean a settle time that changes with the
+/// theme.
+pub(crate) const LAUNCH_SETTLE: Duration = Duration::from_millis(250);
 /// The status line a running background conversion owns, and the prefix the
 /// worker's per-percent updates extend. Shared so that "is a conversion
 /// already speaking?" is a check against the real string rather than a
@@ -88,6 +98,10 @@ pub const RATING_RECORDED_STATUS: &str = "rating recorded — thanks";
 /// The detail pane makes the same point in its own words; this is the
 /// keystroke's own acknowledgement that it was heard and had no target.
 pub const LAUNCH_EXITED_STATUS: &str = "that launch has exited — showing its recorded lineage";
+/// Said out loud when a HUNT jump drops the operator's own process filter
+/// to reach the row it promised: a filter that disappears without a word
+/// reads as a bug.
+pub const LAUNCH_JUMP_FILTER_CLEARED: &str = "Process filter cleared for the jump";
 /// The nudge is shown at most once a day (spec UX).
 pub const RATING_NUDGE_INTERVAL_MS: i64 = 24 * 3_600_000;
 /// …and only after the trailing hour held at least this many heavy minutes.
@@ -150,6 +164,34 @@ impl Page {
             Self::Launches => "Launches",
         }
     }
+}
+
+/// Whether a LAUNCHES occurrence fetch goes out at once or waits for the
+/// selection to settle. See [`App::sync_launch_occurrences`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LaunchFetch {
+    /// A decision: a click, a focus change, a fresh groups reply.
+    Now,
+    /// A scroll: `j`/`k`, the wheel. Coalesced.
+    Settle,
+}
+
+/// Whether the process a recorded launch describes is still running.
+/// Deliberately three-valued: `PidInUse` is the case where a live process
+/// wears the occurrence's pid but its start time does not match, which is
+/// pid reuse *or* a process whose creation time the sampler could not read
+/// (`GetProcessTimes` denied — `metrics/win32.rs` then falls back to an
+/// ETW or sample timestamp). Those two are indistinguishable from here, and
+/// calling either of them "exited" would be a claim about a process that
+/// may well be alive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LaunchLiveness {
+    /// pid *and* start time match a process in the current snapshot.
+    Live,
+    /// A live process holds the pid, but the identity cannot be confirmed.
+    PidInUse,
+    /// Nothing in the current snapshot holds the pid.
+    Exited,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1300,10 +1342,26 @@ pub struct App {
     /// The selected group's occurrences, newest first, or empty while a
     /// fetch is in flight.
     pub launch_occurrences: Vec<LaunchEvent>,
-    /// Which group `launch_occurrences` was asked for, byte-exact as the
-    /// service served it. Also the guard that drops a reply arriving after
-    /// the selection has moved on.
+    /// Which group's occurrences were actually *requested*, byte-exact as
+    /// the service served the key. Also the guard that drops a reply
+    /// arriving after the selection has moved on. Only ever set once a
+    /// request is genuinely on the channel: a dropped send must not leave
+    /// this claiming an answer is coming, or the drill-down wedges.
     pub(crate) launch_key: Option<(String, String)>,
+    /// Which group the *selection* points at, which leads `launch_key`
+    /// during the settle window below.
+    pub(crate) launch_wanted: Option<(String, String)>,
+    /// When the settled selection's fetch comes due. `None` = nothing
+    /// pending. See [`LAUNCH_SETTLE`].
+    launch_fetch_due: Option<Instant>,
+    /// False until a `getLaunchGroups` reply of any kind has landed for the
+    /// filter in force, so the page can say "loading" instead of asserting
+    /// that nothing ever launched.
+    pub launch_loaded: bool,
+    /// Why the drill-down is empty, when it is empty for a reason. Kept
+    /// apart from [`Self::launch_error`] so an occurrence failure is never
+    /// reported as the groups list having failed.
+    pub launch_occurrence_error: Option<String>,
     /// The `c` filter: fetch only groups whose launches were console hosts.
     /// A filter, never a verdict — a console host is not a suspect.
     pub launch_console_only: bool,
@@ -1479,6 +1537,10 @@ impl App {
             launch_groups: Vec::new(),
             launch_occurrences: Vec::new(),
             launch_key: None,
+            launch_wanted: None,
+            launch_fetch_due: None,
+            launch_loaded: false,
+            launch_occurrence_error: None,
             launch_console_only: false,
             launch_detail_focused: false,
             launch_error: None,
@@ -1674,6 +1736,7 @@ impl App {
                 WorkerEvent::Ratings(Err(_)) => {}
                 WorkerEvent::LaunchGroups(Ok(groups)) => {
                     self.launch_error = None;
+                    self.launch_loaded = true;
                     self.launch_groups = groups;
                     if self.launch_state.selected().is_none() && !self.launch_groups.is_empty() {
                         self.launch_state.select(Some(0));
@@ -1681,8 +1744,9 @@ impl App {
                     self.clamp_selection();
                     // The selected group may be a different one than before
                     // the refresh (the service re-ranks by recent activity),
-                    // so the drill-down follows it — and only then.
-                    self.sync_launch_occurrences();
+                    // so the drill-down follows it — and only then. A reply
+                    // is a decision, not a scroll: no settle window.
+                    self.sync_launch_occurrences(LaunchFetch::Now);
                 }
                 // Kept on the page rather than the status line: an empty
                 // list because the collector predates launch history is a
@@ -1692,7 +1756,10 @@ impl App {
                     self.launch_occurrences.clear();
                     self.launch_occurrence_state.select(None);
                     self.launch_key = None;
+                    self.launch_wanted = None;
+                    self.launch_occurrence_error = None;
                     self.launch_error = Some(error);
+                    self.launch_loaded = true;
                     self.clamp_selection();
                 }
                 WorkerEvent::LaunchOccurrences {
@@ -1708,14 +1775,18 @@ impl App {
                     }
                     match result {
                         Ok(events) => {
+                            self.launch_occurrence_error = None;
                             self.launch_occurrences = events;
                             self.launch_occurrence_state
                                 .select((!self.launch_occurrences.is_empty()).then_some(0));
                         }
+                        // The drill-down's own failure, shown in the
+                        // drill-down. Reporting it as `launch_error` would
+                        // blame the groups list for a fault it did not have.
                         Err(error) => {
                             self.launch_occurrences.clear();
                             self.launch_occurrence_state.select(None);
-                            self.launch_error = Some(error);
+                            self.launch_occurrence_error = Some(error);
                         }
                     }
                 }
@@ -2216,16 +2287,21 @@ impl App {
             }
             KeyCode::Char('o') if self.page == Page::Launches => {
                 self.launch_detail_focused = !self.launch_detail_focused;
+                // Reaching for the occurrence list is a decision: whatever
+                // is still settling is wanted now.
+                self.flush_launch_fetch();
             }
             // Read-only jumps: they change which page is looking at the
             // process, never the process itself.
             KeyCode::Enter | KeyCode::Char('h') if self.page == Page::Launches => {
+                self.flush_launch_fetch();
                 if !self.jump_to_live_launch(Page::Processes) {
                     self.status = LAUNCH_EXITED_STATUS.into();
                     self.status_is_error = false;
                 }
             }
             KeyCode::Char('l') if self.page == Page::Launches => {
+                self.flush_launch_fetch();
                 if !self.jump_to_live_launch(Page::Tree) {
                     self.status = LAUNCH_EXITED_STATUS.into();
                     self.status_is_error = false;
@@ -2698,29 +2774,98 @@ impl App {
             .and_then(|index| self.launch_occurrences.get(index))
     }
 
-    /// Point the drill-down at whichever group is selected now, fetching its
-    /// occurrences only if that is a different group than the one already
-    /// loaded. The guard is the point: `getLaunchOccurrences` costs the
-    /// service a walk of its whole seven-day window, so it must not fire on
-    /// every keystroke, refresh, or repaint.
-    pub(crate) fn sync_launch_occurrences(&mut self) {
-        let key = self
+    /// Point the drill-down at whichever group is selected now.
+    ///
+    /// Two guards, for two different costs. The selected group is compared
+    /// against the one already asked for, so a repaint, an `r`, or a
+    /// re-selection of the same row asks for nothing. And a selection the
+    /// user is still moving through is only fetched once it settles
+    /// ([`LAUNCH_SETTLE`]), so holding `j` down a fifty-row list queues one
+    /// seven-day scan rather than fifty. [`LaunchFetch::Now`] is for the
+    /// gestures that are a decision rather than a scroll — a click, a
+    /// focus change, a fresh groups reply.
+    pub(crate) fn sync_launch_occurrences(&mut self, urgency: LaunchFetch) {
+        let wanted = self
             .selected_launch_group()
             .map(|group| (group.exe_path.clone(), group.lineage_sig.clone()));
-        if key == self.launch_key {
+        if wanted != self.launch_wanted {
+            // Whatever the pane holds describes a row that is no longer
+            // selected, and any pending fetch was for that row too.
+            self.launch_wanted = wanted;
+            self.launch_key = None;
+            self.launch_fetch_due = None;
+            self.launch_occurrences.clear();
+            self.launch_occurrence_state.select(None);
+            self.launch_occurrence_error = None;
+        }
+        if self.launch_wanted.is_none() || self.launch_key == self.launch_wanted {
             return;
         }
-        self.launch_occurrences.clear();
-        self.launch_occurrence_state.select(None);
-        self.launch_key = key.clone();
-        if let Some((exe_path, lineage_sig)) = key {
-            let _ = self
-                .worker
-                .commands
-                .try_send(WorkerCommand::RefreshLaunchOccurrences {
-                    exe_path,
-                    lineage_sig,
-                });
+        match urgency {
+            LaunchFetch::Now => self.request_launch_occurrences(),
+            // `get_or_insert`, not an assignment: the deadline is cleared
+            // by a real selection change above, so repeated syncs on an
+            // unchanged row (holding `j` against the end of the list)
+            // cannot push it forever into the future.
+            LaunchFetch::Settle => {
+                self.launch_fetch_due
+                    .get_or_insert_with(|| Instant::now() + LAUNCH_SETTLE);
+            }
+        }
+    }
+
+    /// Send the settled selection's occurrence request, if there is one.
+    ///
+    /// `launch_key` advances only when the command is genuinely on the
+    /// channel. A full queue means nothing was asked, and a key claiming
+    /// otherwise would wedge the drill-down permanently: every later sync
+    /// would read "already asked" and never retry. Instead the deadline is
+    /// re-armed, so a busy worker costs a quarter-second, not the pane.
+    fn request_launch_occurrences(&mut self) {
+        self.launch_fetch_due = None;
+        let Some((exe_path, lineage_sig)) = self.launch_wanted.clone() else {
+            return;
+        };
+        let sent = self
+            .worker
+            .commands
+            .try_send(WorkerCommand::RefreshLaunchOccurrences {
+                exe_path: exe_path.clone(),
+                lineage_sig: lineage_sig.clone(),
+            })
+            .is_ok();
+        if sent {
+            self.launch_key = Some((exe_path, lineage_sig));
+        } else {
+            self.launch_key = None;
+            self.launch_fetch_due = Some(Instant::now() + LAUNCH_SETTLE);
+        }
+    }
+
+    /// Fire a settled occurrence fetch that has come due. Returns whether
+    /// anything happened, so the main loop can mark the frame dirty.
+    pub fn poll_launch_fetch(&mut self, now: Instant) -> bool {
+        if self.launch_fetch_due.is_none_or(|due| now < due) {
+            return false;
+        }
+        self.request_launch_occurrences();
+        true
+    }
+
+    /// When the main loop must next wake to service a settled fetch, so a
+    /// quiet event-driven session does not sit on a pending drill-down.
+    pub fn launch_fetch_deadline(&self) -> Option<Instant> {
+        self.launch_fetch_due
+    }
+
+    /// Let go of a settling fetch at once. Deliberately narrower than
+    /// [`Self::sync_launch_occurrences`]: it only releases a deadline that
+    /// is already armed and never touches the selection or the loaded
+    /// rows, so the gestures that call it (focusing the list, a jump)
+    /// cannot blank the pane they are about to read.
+    pub(crate) fn flush_launch_fetch(&mut self) {
+        if self.launch_fetch_due.is_some() {
+            self.request_launch_occurrences();
         }
     }
 
@@ -2736,25 +2881,56 @@ impl App {
         self.launch_occurrences.clear();
         self.launch_occurrence_state.select(None);
         self.launch_key = None;
+        self.launch_wanted = None;
+        self.launch_fetch_due = None;
         self.launch_detail_focused = false;
+        // Both failures belong to the list that is being thrown away. Left
+        // standing, the old one would be read as a verdict on the new
+        // request that has not even been answered yet.
+        self.launch_error = None;
+        self.launch_occurrence_error = None;
+        self.launch_loaded = false;
         self.refresh_page();
     }
 
-    /// The pid of the selected occurrence *if that exact launch is still
-    /// running* — matched on pid **and** start time, both of which come from
-    /// the same process-creation FILETIME on either side. Pid alone would be
-    /// a lie the moment Windows reuses one, which on a busy machine is the
-    /// common case for the short-lived launches this page is full of.
-    pub(crate) fn live_launch_pid(&self) -> Option<u32> {
+    /// Whether the selected occurrence's process is still running.
+    ///
+    /// Identity is pid **and** start time, both derived from the same
+    /// process-creation FILETIME on either side. Pid alone would be a lie
+    /// the moment Windows reuses one, which on a busy machine is the common
+    /// case for the short-lived launches this page is full of.
+    ///
+    /// `None` means there is nothing to judge — no occurrence selected, or
+    /// no snapshot to check it against. The caller must say nothing at all
+    /// rather than default to "exited".
+    pub(crate) fn launch_liveness(&self) -> Option<LaunchLiveness> {
         let occurrence = self.selected_launch_occurrence()?;
         let snapshot = self.snapshot.as_ref()?;
-        snapshot
-            .processes
-            .iter()
-            .find(|process| {
-                process.pid == occurrence.pid && process.started_at_ms == occurrence.start_time_ms
-            })
-            .map(|process| process.pid)
+        let mut pid_in_use = false;
+        for process in &snapshot.processes {
+            if process.pid != occurrence.pid {
+                continue;
+            }
+            if process.started_at_ms == occurrence.start_time_ms {
+                return Some(LaunchLiveness::Live);
+            }
+            pid_in_use = true;
+        }
+        Some(if pid_in_use {
+            LaunchLiveness::PidInUse
+        } else {
+            LaunchLiveness::Exited
+        })
+    }
+
+    /// The pid to jump to: only a confirmed identity earns one. A pid that
+    /// is merely in use is not this launch, so far as anything here can
+    /// tell, and jumping to it would put the operator in front of a process
+    /// PC Pulse cannot say is the one they asked about.
+    pub(crate) fn live_launch_pid(&self) -> Option<u32> {
+        (self.launch_liveness()? == LaunchLiveness::Live)
+            .then(|| self.selected_launch_occurrence().map(|event| event.pid))
+            .flatten()
     }
 
     /// `Enter`/`h` (HUNT) and `l` (LINEAGE): follow a launch that is still
@@ -2770,7 +2946,9 @@ impl App {
             Page::Processes => {
                 // A live pid is in the current snapshot by definition, but
                 // the filter in force may still hide its row; clearing it
-                // is what makes the jump land where it says it does.
+                // is what makes the jump land where it says it does — and
+                // saying so is the point, because the operator's HUNT
+                // filter silently vanishing is otherwise a small mystery.
                 if !self
                     .visible_processes()
                     .iter()
@@ -2778,6 +2956,8 @@ impl App {
                 {
                     self.process_filter.clear();
                     self.agents_only = false;
+                    self.status = LAUNCH_JUMP_FILTER_CLEARED.into();
+                    self.status_is_error = false;
                 }
                 if let Some(index) = self
                     .visible_processes()
@@ -2788,11 +2968,14 @@ impl App {
                 }
             }
             Page::Tree => {
-                // `select_page` just asked for a fresh tree; if the one in
-                // hand already holds the pid this lands immediately, and
-                // otherwise the reply carries it.
-                let landed = self.select_tree_pid(pid);
-                self.pending_tree_pid = (!landed).then_some(pid);
+                // Select in the tree in hand for instant feedback, but keep
+                // the pid pending regardless: `select_page` just asked for a
+                // fresh tree, and that reply re-flattens `self.tree` under
+                // whatever index is selected. Landing now and clearing the
+                // pending pid would leave the *stale* tree's index pointing
+                // at an unrelated row of the new one.
+                self.select_tree_pid(pid);
+                self.pending_tree_pid = Some(pid);
             }
             _ => {}
         }
@@ -3396,7 +3579,9 @@ impl App {
                     );
                 } else {
                     move_table(&mut self.launch_state, self.launch_groups.len(), delta);
-                    self.sync_launch_occurrences();
+                    // A scroll, not a decision: coalesced by the settle
+                    // window, so a held key costs one fetch, not one a row.
+                    self.sync_launch_occurrences(LaunchFetch::Settle);
                 }
             }
             _ => {}
@@ -7419,7 +7604,7 @@ mod tests {
             launch_group(r"c:\tools\ripgrep.exe", "cmd.exe<explorer.exe", 2),
         ];
         app.launch_state.select(Some(0));
-        app.sync_launch_occurrences();
+        app.sync_launch_occurrences(LaunchFetch::Now);
         match commands.try_recv() {
             Ok(WorkerCommand::RefreshLaunchOccurrences {
                 exe_path,
@@ -7435,10 +7620,11 @@ mod tests {
 
         // Re-syncing without a selection change asks for nothing: the
         // handler walks the whole 7-day window per request.
-        app.sync_launch_occurrences();
+        app.sync_launch_occurrences(LaunchFetch::Now);
         assert!(commands.try_recv().is_err());
 
         app.move_selection(1);
+        app.poll_launch_fetch(Instant::now() + LAUNCH_SETTLE);
         match commands.try_recv() {
             Ok(WorkerCommand::RefreshLaunchOccurrences {
                 exe_path,
@@ -7449,6 +7635,77 @@ mod tests {
             }
             other => panic!("expected the second group's fetch, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn scrolling_the_groups_list_coalesces_into_one_occurrence_fetch() {
+        let (mut app, commands, _events) = app_with_live_channels();
+        app.page = Page::Launches;
+        app.launch_groups = (0..12)
+            .map(|index| launch_group(&format!(r"c:\apps\p{index}.exe"), "explorer.exe", 3))
+            .collect();
+        app.launch_state.select(Some(0));
+        app.launch_wanted = Some((r"c:\apps\p0.exe".into(), "explorer.exe".into()));
+        app.launch_key = app.launch_wanted.clone();
+
+        // Eleven rows of `j`, as a held key delivers them.
+        for _ in 0..11 {
+            app.move_selection(1);
+        }
+        assert!(
+            commands.try_recv().is_err(),
+            "a moving selection must not queue a seven-day scan per row"
+        );
+        // Nothing fires until the selection has actually settled.
+        assert!(!app.poll_launch_fetch(Instant::now()));
+        assert!(app.poll_launch_fetch(Instant::now() + LAUNCH_SETTLE));
+        match commands.try_recv() {
+            Ok(WorkerCommand::RefreshLaunchOccurrences { exe_path, .. }) => {
+                assert_eq!(exe_path, r"c:\apps\p11.exe", "only the row landed on");
+            }
+            other => panic!("expected exactly one settled fetch, got {other:?}"),
+        }
+        assert!(commands.try_recv().is_err(), "and only one");
+    }
+
+    #[test]
+    fn a_dropped_occurrence_request_never_wedges_the_drill_down() {
+        let (mut app, commands, _events) = app_with_live_channels();
+        app.page = Page::Launches;
+        app.launch_groups = vec![launch_group(
+            r"c:\windows\system32\notepad.exe",
+            "explorer.exe",
+            4,
+        )];
+        app.launch_state.select(Some(0));
+        // Fill the worker's command queue so the request cannot go out.
+        while app
+            .worker
+            .commands
+            .try_send(WorkerCommand::RefreshRatings)
+            .is_ok()
+        {}
+
+        app.sync_launch_occurrences(LaunchFetch::Now);
+        assert_eq!(
+            app.launch_key, None,
+            "nothing was asked, so nothing may claim an answer is coming"
+        );
+
+        // Drain the queue: the re-armed deadline recovers on its own.
+        while commands.try_recv().is_ok() {}
+        assert!(app.poll_launch_fetch(Instant::now() + LAUNCH_SETTLE));
+        assert!(matches!(
+            commands.try_recv(),
+            Ok(WorkerCommand::RefreshLaunchOccurrences { .. })
+        ));
+        assert_eq!(
+            app.launch_key,
+            Some((
+                r"c:\windows\system32\notepad.exe".into(),
+                "explorer.exe".into()
+            ))
+        );
     }
 
     #[test]
@@ -7475,6 +7732,53 @@ mod tests {
         app.page = Page::Launches;
         app.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE));
         assert_eq!(app.page, Page::Tree);
+    }
+
+    #[test]
+    fn an_l_jump_holds_its_pid_until_the_fresh_tree_arrives() {
+        let (mut app, _commands, events) = app_with_live_channels();
+        app.snapshot = Some(snapshot_with_live_process(4242, 1_800_000_000_000));
+        app.page = Page::Launches;
+        app.launch_groups = vec![launch_group(
+            r"c:\windows\system32\notepad.exe",
+            "explorer.exe",
+            1,
+        )];
+        app.launch_state.select(Some(0));
+        app.launch_occurrences = vec![launch_occurrence(4242, 1_800_000_000_000)];
+        app.launch_occurrence_state.select(Some(0));
+
+        // A stale tree from an earlier visit, with the target at index 0.
+        let stale = vec![ProcessNode {
+            process: snapshot_with_live_process(4242, 1_800_000_000_000).processes[0].clone(),
+            children: Vec::new(),
+        }];
+        flatten_tree(&stale, 0, &mut app.tree);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE));
+        assert_eq!(app.page, Page::Tree);
+        assert_eq!(app.tree_state.selected(), Some(0));
+
+        // The refresh the jump asked for lands, and the target has moved to
+        // index 1. Selecting only against the stale tree would leave the
+        // cursor on the wrong process.
+        let fresh = vec![
+            ProcessNode {
+                process: snapshot_with_live_process(900, 1_700_000_000_000).processes[0].clone(),
+                children: Vec::new(),
+            },
+            ProcessNode {
+                process: snapshot_with_live_process(4242, 1_800_000_000_000).processes[0].clone(),
+                children: Vec::new(),
+            },
+        ];
+        events.send(WorkerEvent::Tree(Ok(fresh))).unwrap();
+        app.drain_events();
+        assert_eq!(
+            app.selected_tree_process().map(|process| process.pid),
+            Some(4242),
+            "the pid, not a stale index, is what the jump promised"
+        );
     }
 
     #[test]
@@ -7512,7 +7816,7 @@ mod tests {
             1,
         )];
         app.launch_state.select(Some(0));
-        app.sync_launch_occurrences();
+        app.sync_launch_occurrences(LaunchFetch::Now);
 
         events
             .send(WorkerEvent::LaunchOccurrences {

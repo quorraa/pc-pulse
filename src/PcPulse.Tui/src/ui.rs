@@ -1,8 +1,8 @@
 use crate::{
     analyzer::ChatRole,
     app::{
-        AlertSort, AlertView, App, InputMode, Page, ProcessSort, SettingField, SettingSort,
-        SuspectSort, TreeSort, UpdateState,
+        AlertSort, AlertView, App, InputMode, LaunchFetch, LaunchLiveness, Page, ProcessSort,
+        SettingField, SettingSort, SuspectSort, TreeSort, UpdateState,
     },
     format,
     theme::{self, LayoutKind, palette},
@@ -489,7 +489,8 @@ fn mouse_body_click(
             ) {
                 app.launch_detail_focused = false;
                 app.launch_state.select(Some(index));
-                app.sync_launch_occurrences();
+                // A click is a decision, not a scroll: no settle window.
+                app.sync_launch_occurrences(LaunchFetch::Now);
                 return true;
             }
             if let Some(index) = table_row_at(
@@ -1885,8 +1886,8 @@ fn route_short(page: Page) -> &'static str {
     }
 }
 
-/// The printed key label for a page's index/tab entry: its digit for the
-/// first eight pages, or "?" for the KEYS appendix — the one page without
+/// The printed key label for a page's index/tab entry: its digit for every
+/// page that has one, or "?" for the KEYS appendix — the one page without
 /// a digit, reached by Tab wrap-around, a click, or the `?` overlay.
 fn page_key_label(page: Page) -> String {
     if page == Page::Help {
@@ -1964,17 +1965,25 @@ fn masthead_separator(compact: bool) -> &'static str {
     if compact { " " } else { " · " }
 }
 
+/// The columns the printed index needs at a given label width. Derived
+/// from `Page::ALL` for the same reason [`route_strip_width`] is: a
+/// hand-set threshold turns a new page into a silently dropped entry, and
+/// the full-name index now sits within a few columns of the ledger's
+/// narrowest supported width.
+fn masthead_index_width(compact: bool) -> usize {
+    Page::ALL
+        .iter()
+        .map(|page| masthead_label(*page, compact).chars().count())
+        .sum::<usize>()
+        + masthead_separator(compact).chars().count() * (Page::ALL.len() - 1)
+}
+
 /// Where the centered page-index line begins, and whether it uses the
 /// compact labels. Shared by the renderer and the mouse hit-test so the
 /// printed index and its click targets can never drift apart.
 fn masthead_index_origin(area: Rect) -> (u16, bool) {
-    let compact = area.width < 112;
-    let separator = masthead_separator(compact).chars().count();
-    let total = Page::ALL
-        .iter()
-        .map(|page| masthead_label(*page, compact).chars().count())
-        .sum::<usize>()
-        + separator * (Page::ALL.len() - 1);
+    let compact = masthead_index_width(false) > usize::from(area.width);
+    let total = masthead_index_width(compact);
     let x = area.x + (usize::from(area.width).saturating_sub(total) / 2) as u16;
     (x, compact)
 }
@@ -2098,7 +2107,9 @@ fn render_masthead(frame: &mut Frame<'_>, app: &App, area: Rect) {
 /// The printed page index: every page as "N NAME", the active one inverted
 /// like a rubber-stamped entry.
 fn render_masthead_index(frame: &mut Frame<'_>, app: &App, area: Rect) {
-    let compact = area.width < 112;
+    // The one authority on both the label width and where the line starts,
+    // so the printed index and its click map cannot disagree.
+    let (_, compact) = masthead_index_origin(area);
     let mut spans = Vec::new();
     for (index, page) in Page::ALL.iter().copied().enumerate() {
         if index > 0 {
@@ -6472,17 +6483,28 @@ const LAUNCH_CAPTURE_OFF: &str = "Command-line capture is off — PC Pulse can i
 /// answer; "no window" would be a guess dressed as a fact.
 const LAUNCH_WINDOW_UNOBSERVED: &str =
     "window state unobserved — lived less than one sampling interval";
-/// Shown above the recorded lineage when the selected occurrence is not the
-/// process running under that pid now — the ordinary case for the
+/// Shown above the recorded lineage when nothing in the current snapshot
+/// holds the occurrence's pid at all — the ordinary case for the
 /// short-lived launches this page is mostly made of.
 const LAUNCH_PROCESS_EXITED: &str = "process has exited — showing recorded lineage";
+/// Shown instead of [`LAUNCH_PROCESS_EXITED`] when a live process *does*
+/// hold the pid but its start time does not match. That is pid reuse, or a
+/// process whose creation time the sampler could not read (`GetProcessTimes`
+/// denied, leaving `started_at_ms` filled from an ETW or sample clock).
+/// Nothing here can tell those apart, and "has exited" would be a claim
+/// about a process that may be running right now.
+const LAUNCH_IDENTITY_UNCONFIRMED: &str =
+    "live process with this pid exists but identity cannot be confirmed — showing recorded lineage";
+/// The window-glyph key, printed beside the capture strip so the column is
+/// readable without guessing what a hollow square means.
+const LAUNCH_WINDOW_LEGEND: &str = "▣ windowed · ▢ background · ? unobserved";
 
 /// The page's shape: the groups list beside the drill-down, with the
 /// capture-health strip along the bottom. Every consumer derives its rect
 /// from here — the renderer and the click hit-test both — so a click can
 /// never resolve to a row the table it landed on does not have.
 fn launches_regions(body: Rect) -> (Rect, Rect, Rect) {
-    let rows = Layout::vertical([Constraint::Min(6), Constraint::Length(3)]).split(body);
+    let rows = Layout::vertical([Constraint::Min(6), Constraint::Length(4)]).split(body);
     let columns =
         Layout::horizontal([Constraint::Percentage(58), Constraint::Percentage(42)]).split(rows[0]);
     (columns[0], columns[1], rows[1])
@@ -6571,12 +6593,20 @@ fn launch_footer_text(app: &App) -> String {
 /// Pure so the copy can be pinned byte-exactly by tests.
 fn launch_detail_lines(app: &App, now_ms: i64) -> Vec<Line<'static>> {
     let Some(occurrence) = app.selected_launch_occurrence() else {
-        return vec![Line::styled(
-            "No occurrence selected",
-            Style::default().fg(palette().muted),
-        )];
+        // The drill-down's own failure is reported here, not on the groups
+        // list: `getLaunchOccurrences` failing says nothing about whether
+        // `getLaunchGroups` worked.
+        return vec![match &app.launch_occurrence_error {
+            Some(error) => Line::styled(
+                format!("Occurrences unavailable: {error}"),
+                Style::default().fg(palette().warn),
+            ),
+            None => Line::styled(
+                "No occurrence selected",
+                Style::default().fg(palette().muted),
+            ),
+        }];
     };
-    let alive = app.live_launch_pid().is_some();
     let mut lines = vec![
         Line::styled(
             format!(
@@ -6625,14 +6655,23 @@ fn launch_detail_lines(app: &App, now_ms: i64) -> Vec<Line<'static>> {
     }
     lines.push(Line::raw(""));
     // The note explains the lineage that follows it, so it goes first.
-    lines.push(if alive {
-        Line::styled(
+    // `None` — no snapshot to check against — says nothing at all rather
+    // than defaulting to a claim about whether the process is alive.
+    match app.launch_liveness() {
+        Some(LaunchLiveness::Live) => lines.push(Line::styled(
             "still running — Enter/h hunts it, l traces its lineage",
             Style::default().fg(palette().ok),
-        )
-    } else {
-        Line::styled(LAUNCH_PROCESS_EXITED, Style::default().fg(palette().muted))
-    });
+        )),
+        Some(LaunchLiveness::PidInUse) => lines.push(Line::styled(
+            LAUNCH_IDENTITY_UNCONFIRMED,
+            Style::default().fg(palette().warn),
+        )),
+        Some(LaunchLiveness::Exited) => lines.push(Line::styled(
+            LAUNCH_PROCESS_EXITED,
+            Style::default().fg(palette().muted),
+        )),
+        None => {}
+    }
     if occurrence.lineage.is_empty() {
         lines.push(Line::styled(
             format!(
@@ -6674,10 +6713,16 @@ fn render_launches(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     render_launch_groups(frame, app, inset(groups_area), now_ms);
     render_launch_detail(frame, app, detail_area, now_ms);
     frame.render_widget(
-        Paragraph::new(Line::styled(
-            format!(" {}", launch_footer_text(app)),
-            Style::default().fg(palette().muted),
-        ))
+        Paragraph::new(vec![
+            Line::styled(
+                format!(" {}", launch_footer_text(app)),
+                Style::default().fg(palette().muted),
+            ),
+            Line::styled(
+                format!(" {LAUNCH_WINDOW_LEGEND}"),
+                Style::default().fg(palette().faint),
+            ),
+        ])
         .block(accent_panel(" ⎙ LAUNCH CAPTURE ", palette().info)),
         footer_area,
     );
@@ -6687,6 +6732,9 @@ fn render_launch_groups(frame: &mut Frame<'_>, app: &mut App, area: Rect, now_ms
     if app.launch_groups.is_empty() {
         let message = match &app.launch_error {
             Some(error) => format!("Launch history unavailable: {error}"),
+            // Before the first reply — and again after `c` throws the list
+            // away — "nothing launched" is not yet known to be true.
+            None if !app.launch_loaded => "Loading launch history…".into(),
             None if app.launch_console_only => {
                 "No console-host launches recorded in the last 7 days.".into()
             }
@@ -11986,10 +12034,12 @@ mod tests {
             ),
         ];
         app.launch_state.select(Some(0));
+        app.launch_loaded = true;
         app.launch_key = Some((
             r"c:\windows\system32\notepad.exe".into(),
             "explorer.exe".into(),
         ));
+        app.launch_wanted = app.launch_key.clone();
         app.launch_occurrences = vec![LaunchEvent {
             pid: 8801,
             start_time_ms: 1_799_999_400_000,
@@ -12022,8 +12072,119 @@ mod tests {
         assert!(text.contains("explorer.exe"), "the launcher summary");
         assert!(text.contains("ripgrep.exe"), "the second group");
         assert!(text.contains("[console]"), "the console-host tag");
-        // The window glyph legend and the counts both print.
         assert!(text.contains('▣'), "the windowed glyph");
+        assert!(
+            text.contains("▣ windowed · ▢ background · ? unobserved"),
+            "the glyph column is unreadable without its key"
+        );
+    }
+
+    #[test]
+    fn an_unanswered_groups_request_says_loading_not_nothing_ever_launched() {
+        let _guard = theme::test_support::activate(theme::ThemeId::Vitals);
+        let mut app = sample_app();
+        app.page = Page::Launches;
+        // Nothing has come back yet: "no launches" is not yet known.
+        let text = buffer_text(render(&mut app).buffer());
+        assert!(text.contains("Loading launch history…"), "{text}");
+        assert!(!text.contains("No launches recorded"));
+
+        app.launch_loaded = true;
+        let text = buffer_text(render(&mut app).buffer());
+        assert!(text.contains("No launches recorded in the last 7 days."));
+
+        // `c` throws the answered list away, so the claim retires with it.
+        app.launch_groups = vec![launch_group_fixture(
+            "notepad.exe",
+            r"c:\windows\system32\notepad.exe",
+            "explorer.exe",
+            3,
+            false,
+        )];
+        app.toggle_launch_console_filter();
+        let text = buffer_text(render(&mut app).buffer());
+        assert!(text.contains("Loading launch history…"), "{text}");
+    }
+
+    #[test]
+    fn an_occurrence_failure_is_reported_in_the_drill_down_not_on_the_groups_list() {
+        let _guard = theme::test_support::activate(theme::ThemeId::Vitals);
+        let mut app = launches_app();
+        app.launch_occurrences.clear();
+        app.launch_occurrence_state.select(None);
+        app.launch_occurrence_error = Some("pipe closed (ioError)".into());
+        let rendered: Vec<String> = launch_detail_lines(&app, 1_800_000_000_000)
+            .iter()
+            .map(line_text)
+            .collect();
+        assert!(
+            rendered
+                .iter()
+                .any(|line| line.contains("Occurrences unavailable: pipe closed (ioError)")),
+            "{rendered:#?}"
+        );
+        // ...and the groups list, which did not fail, says nothing about it.
+        let text = buffer_text(render(&mut app).buffer());
+        assert!(!text.contains("Launch history unavailable"));
+
+        // The filter toggle retires both, so neither is misattributed to
+        // the request it has not answered yet.
+        app.launch_error = Some("stale (invalidRequest)".into());
+        app.toggle_launch_console_filter();
+        assert_eq!(app.launch_error, None);
+        assert_eq!(app.launch_occurrence_error, None);
+    }
+
+    #[test]
+    fn a_pid_whose_identity_cannot_be_confirmed_is_never_called_exited() {
+        let _guard = theme::test_support::activate(theme::ThemeId::Vitals);
+        let mut app = launches_app();
+        // A live process wears the pid, but its start time does not match:
+        // pid reuse, or a creation time the sampler could not read. Either
+        // way "has exited" would be a claim about a running process.
+        app.launch_occurrences[0].pid = 4242;
+        app.launch_occurrences[0].start_time_ms = 1_700_000_000_000;
+        let rendered: Vec<String> = launch_detail_lines(&app, 1_800_000_000_000)
+            .iter()
+            .map(line_text)
+            .collect();
+        assert!(
+            rendered.iter().any(|line| line
+                == "live process with this pid exists but identity cannot be confirmed — showing recorded lineage"),
+            "{rendered:#?}"
+        );
+        assert!(
+            !rendered
+                .iter()
+                .any(|line| line == "process has exited — showing recorded lineage"),
+            "{rendered:#?}"
+        );
+        // ...and it still earns no jump: unconfirmed is not confirmed.
+        assert_eq!(app.live_launch_pid(), None);
+    }
+
+    #[test]
+    fn with_no_snapshot_the_pane_makes_no_claim_about_liveness() {
+        let _guard = theme::test_support::activate(theme::ThemeId::Vitals);
+        let mut app = launches_app();
+        app.snapshot = None;
+        let rendered: Vec<String> = launch_detail_lines(&app, 1_800_000_000_000)
+            .iter()
+            .map(line_text)
+            .collect();
+        for claim in [
+            "process has exited — showing recorded lineage",
+            "live process with this pid exists but identity cannot be confirmed — showing recorded lineage",
+        ] {
+            assert!(
+                !rendered.iter().any(|line| line == claim),
+                "nothing to check against is not a verdict: {rendered:#?}"
+            );
+        }
+        assert!(
+            rendered.iter().any(|line| line.contains("explorer.exe")),
+            "the recorded lineage still stands on its own: {rendered:#?}"
+        );
     }
 
     #[test]

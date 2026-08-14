@@ -276,6 +276,11 @@ fn run_loop(
             motion.observe(&app);
             dirty = true;
         }
+        // The LAUNCHES drill-down coalesces its fetch until the selection
+        // holds still; this is the clock that lets go of it.
+        if app.poll_launch_fetch(Instant::now()) {
+            dirty = true;
+        }
         // The renderer only reads whichever frame the player says is
         // current; this is the one clock that moves it on. Without this
         // tick the clip would sit on frame 0 forever.
@@ -351,6 +356,11 @@ fn run_loop(
                     .next_deadline()
                     .saturating_duration_since(Instant::now()),
             );
+        }
+        // ...and a settling LAUNCHES fetch is a fourth, on the same terms:
+        // an idle session must not sit on a pending drill-down.
+        if let Some(deadline) = app.launch_fetch_deadline() {
+            poll_timeout = poll_timeout.min(deadline.saturating_duration_since(Instant::now()));
         }
         if event::poll(poll_timeout)? {
             match event::read()? {
