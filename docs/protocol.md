@@ -141,7 +141,7 @@ The tray helper's balloon filter is: an alert pops when `notify == true`, it is 
 
 ## Launch history
 
-`getLaunchGroups`, `getLaunchOccurrences`, and `deleteCommandLines` (service 1.20+) surface the ETW-captured process launch history. A `LaunchEvent` never carries a command line at rest -- the capture pipeline clears it before the row is saved, and any captured line lives only in a separate, DPAPI-encrypted table keyed by `(pid, startTimeMs)`. `getLaunchOccurrences` is the only path that ever populates `commandLine`, decrypting per request and never caching the plaintext.
+`getLaunchGroups`, `getLaunchOccurrences`, and `deleteCommandLines` (service 1.20+) surface the ETW-captured process launch history. A `LaunchEvent` never carries a command line at rest -- the capture pipeline clears it before the row is saved, and any captured line lives only in a separate, DPAPI-encrypted table keyed by `(pid, startTimeMs)`. `getLaunchOccurrences` is the only path that ever populates `commandLine`, decrypting per request and never caching the plaintext. Turning the `captureCommandLines` setting off stops *new* capture only -- lines already captured while it was on are still served by `getLaunchOccurrences` and remain subject to their own retention clock; retention and `deleteCommandLines` are the only two ways a previously-captured line goes away.
 
 ```json
 {"command":"getLaunchGroups","from_ms":0,"console_hosts_only":false,"limit":500}
@@ -173,7 +173,7 @@ All three fields are optional: `from_ms` defaults to 7 days back, `console_hosts
 }
 ```
 
-`lineageSig` is the launch's ancestor names, nearest first, lowercased and joined by `"<"` (e.g. `"cmd.exe<explorer.exe"`; the empty string for a launch with no resolved lineage). `launcherSummary` is the nearest ancestor's own name, or `"unknown"`. Groups are sorted by their occurrence count within the trailing 24 hours of the newest launch in the whole result set (descending), ties broken by `lastMs` (descending) -- a group that was busy weeks ago but is quiet now sorts below one that is active right now, however small its lifetime total. `medianIntervalMs` is `null` when the group has fewer than two occurrences; `meanDurationMs`/`maxDurationMs` are `null` when none of the group's occurrences have finished (still `"running"`).
+`lineageSig` is the launch's ancestor names, nearest first, lowercased and joined by `"<"` (e.g. `"cmd.exe<explorer.exe"`; the empty string for a launch with no resolved lineage). `launcherSummary` is the nearest ancestor's own name, or `"unknown"`. Groups are sorted by their occurrence count within the trailing 24 hours of the newest launch in the whole result set (descending), ties broken by `lastMs` (descending), then by `exePath` and `lineageSig` (both ascending) so the order is fully deterministic even when two groups tie on everything else -- a group that was busy weeks ago but is quiet now sorts below one that is active right now, however small its lifetime total. `medianIntervalMs` is `null` when the group has fewer than two occurrences (rounded half-away-from-zero when it falls between two gaps, e.g. gaps of 1ms and 2ms median to 2ms, not 1ms); `meanDurationMs`/`maxDurationMs` are `null` when none of the group's occurrences have finished (still `"running"`).
 
 `getLaunchOccurrences` fetches one group's individual rows by its exact key:
 
@@ -181,7 +181,7 @@ All three fields are optional: `from_ms` defaults to 7 days back, `console_hosts
 {"command":"getLaunchOccurrences","exe_path":"c:\\windows\\system32\\notepad.exe","lineage_sig":"explorer.exe","from_ms":0,"limit":1000}
 ```
 
-`exe_path` and `lineage_sig` are required (copy them from a `getLaunchGroups` row); `from_ms` defaults to 7 days back and `limit` is clamped to 1000. The response is newest-first `LaunchEvent` rows:
+`exe_path` and `lineage_sig` are required (copy them from a `getLaunchGroups` row); `from_ms` defaults to 7 days back and `limit` is clamped to 1000. Both are matched byte-exactly against the stored (already-lowercased) values -- a hand-typed or differently-cased `exe_path`/`lineage_sig` simply matches nothing and returns an empty `events` array, not an error. The response is newest-first `LaunchEvent` rows:
 
 ```json
 {
@@ -204,7 +204,7 @@ All three fields are optional: `from_ms` defaults to 7 days back, `console_hosts
 }
 ```
 
-`stopTimeMs`, `exitCode`, `rawImagePath`, and `commandLine` are present only when applicable and otherwise omitted rather than sent as `null`. `windowState` is one of `"windowed"`, `"neverWindowed"`, `"unobserved"`, `"running"`. A command line is absent (not the request failing) whenever nothing was captured for that occurrence, capture was off, or decryption fails -- e.g. a machine-key change after a reinstall; that case is logged and counted service-side, never surfaced as a transport error.
+`stopTimeMs`, `exitCode`, `rawImagePath`, and `commandLine` are present only when applicable and otherwise omitted rather than sent as `null`. `windowState` is one of `"windowed"`, `"neverWindowed"`, `"unobserved"`, `"running"`. A command line is absent (not the request failing) whenever nothing was captured for that occurrence, capture was off, or decryption fails -- e.g. a machine-key change after a reinstall. That case is counted (`launchCapture.cmdlinesDecryptFailures`, below) and logged once per request as a single summary line, not once per row -- a client asking for up to 1000 occurrences cannot flood the log by amplifying one bad decrypt across every row it reads. Either way the request itself never fails on a decrypt error.
 
 `deleteCommandLines` takes no fields and deletes every captured command-line blob -- the user-facing "forget captured command lines" control:
 
@@ -226,11 +226,11 @@ It only ever touches the encrypted command-line table; `launch_events` rows are 
   "droppedChannel": 0, "etwEventsLost": 0, "eventsLostQueryFailures": 0, "malformedEvents": 0,
   "orphanStops": 0, "stalePendingEvicted": 0,
   "cmdlineSessionActive": false, "cmdlinesCaptured": 0, "cmdlinesRedactedFields": 0,
-  "cmdlinesUnmatchedEvicted": 0, "cmdlinesPersistFailures": 0
+  "cmdlinesUnmatchedEvicted": 0, "cmdlinesPersistFailures": 0, "cmdlinesDecryptFailures": 0
 }
 ```
 
-`startsSeen`/`stopsSeen`/`persisted` count the ETW start/stop pipeline; `orphanStops` is a stop event with no matching tracked start; `stalePendingEvicted` is a launch dropped after 24h with no stop event ever arriving (its last `"running"` snapshot, if any, remains the honest last-known state). `cmdlineSessionActive` reflects the `captureCommandLines` setting's opt-in MOF session; `cmdlinesCaptured`/`cmdlinesRedactedFields` count what was joined and how much of it was redacted before storage; `cmdlinesUnmatchedEvicted` is captures that aged out or were cap-evicted before any launch row claimed them (ordinary background noise, since the MOF session sees every process on the machine, not just tracked launches); `cmdlinesPersistFailures` is real, unrecoverable loss (DPAPI or the insert itself failed after the join already consumed the capture) and should stay at zero. Snapshots from services older than launch history have no such field and deserialize to the all-zero default, which reads the same as "no launches seen".
+`startsSeen`/`stopsSeen`/`persisted` count the ETW start/stop pipeline; `orphanStops` is a stop event with no matching tracked start; `stalePendingEvicted` is a launch dropped after 24h with no stop event ever arriving (its last `"running"` snapshot, if any, remains the honest last-known state). `cmdlineSessionActive` reflects the `captureCommandLines` setting's opt-in MOF session; `cmdlinesCaptured`/`cmdlinesRedactedFields` count what was joined and how much of it was redacted before storage; `cmdlinesUnmatchedEvicted` is captures that aged out or were cap-evicted before any launch row claimed them (ordinary background noise, since the MOF session sees every process on the machine, not just tracked launches); `cmdlinesPersistFailures` is real, unrecoverable loss (DPAPI or the insert itself failed after the join already consumed the capture) and should stay at zero. `cmdlinesDecryptFailures` is the running total of `getLaunchOccurrences` rows that failed to decrypt (see above) -- unlike the other counters here, it accrues from read traffic rather than from anything the sampling loop itself does, and is simply republished from a shared counter each tick like the rest of this object. Snapshots from services older than launch history (or that predate this specific field) have no such field and deserialize to the all-zero default, which reads the same as "no launches seen".
 
 Launch-event rows are retained for 7 days; captured command lines are retained on their own, separate clock (`commandLineRetentionHours` in settings, default 24h). `protocolVersion` is unchanged (still 1): all three commands and the `launchCapture` field are additive, and a pre-1.20 service answers the commands with the ordinary unknown-command `invalidRequest` error.
 

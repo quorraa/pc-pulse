@@ -1136,6 +1136,14 @@ pub struct LaunchCaptureStatus {
     /// single log line.
     #[serde(default)]
     pub cmdlines_persist_failures: u64,
+    /// Captured command lines that failed to decrypt when a client asked
+    /// for them via `getLaunchOccurrences` (e.g. a machine-key change after
+    /// a reinstall). Unlike the other counters here, this one is driven by
+    /// read traffic rather than the sampling loop -- it accumulates across
+    /// every `getLaunchOccurrences` request the service has served, folded
+    /// in here once per tick from a shared counter.
+    #[serde(default)]
+    pub cmdlines_decrypt_failures: u64,
 }
 
 #[cfg(test)]
@@ -1150,6 +1158,7 @@ mod tests {
                 cmdline_session_active: true,
                 cmdlines_unmatched_evicted: 3,
                 cmdlines_persist_failures: 1,
+                cmdlines_decrypt_failures: 2,
                 ..LaunchCaptureStatus::default()
             },
             ..Snapshot::default()
@@ -1160,6 +1169,7 @@ mod tests {
         // Clients render these two as loss; the wire names are the contract.
         assert!(json.contains("\"cmdlinesUnmatchedEvicted\":3"), "{json}");
         assert!(json.contains("\"cmdlinesPersistFailures\":1"), "{json}");
+        assert!(json.contains("\"cmdlinesDecryptFailures\":2"), "{json}");
 
         // A snapshot from a service that predates launch history has no such
         // field and must still deserialize.

@@ -32,7 +32,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex, RwLock,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread,
     time::{Duration, Instant},
@@ -62,6 +62,23 @@ pub struct AppState {
     /// Activity-gated high-rate telemetry for smooth-mode clients: zero
     /// idle cost, started by the first `live` request, stopped on idle.
     pub live: LiveEngine,
+    /// Bumped by the `deleteCommandLines` handler after it clears the
+    /// persisted table. The sampling loop polls this once per tick and, on
+    /// a change, clears its in-flight `CmdlineJoiner` before that tick's
+    /// join runs -- otherwise a capture the joiner was already holding for
+    /// a launch pending its flush (e.g. inside the 60s "still running"
+    /// window) could still land in storage moments after the user asked to
+    /// forget everything. A plain counter rather than a bool: two deletes
+    /// in quick succession must not collapse into a single observed change
+    /// if the loop's tick happens to land between them in a way a bool
+    /// could miss (it can't, in practice, but the counter makes that true
+    /// by construction rather than by timing luck).
+    pub cmdline_forget_generation: AtomicU64,
+    /// Captured command lines that failed to decrypt when served through
+    /// `getLaunchOccurrences` (e.g. a machine-key change after a
+    /// reinstall). Folded into `LaunchCaptureStatus.cmdlinesDecryptFailures`
+    /// once per sampling-loop tick; see that field's doc comment.
+    pub cmdlines_decrypt_failures: AtomicU64,
 }
 
 impl AppState {
@@ -319,31 +336,55 @@ impl AppState {
                 // is never written back or cached. A decrypt failure (e.g. a
                 // post-reinstall machine-key change) leaves the occurrence's
                 // `command_line` absent rather than failing the whole
-                // request; it is only logged.
+                // request; it is counted (`launchCapture.cmdlinesDecryptFailures`,
+                // folded in from the shared counter below) and logged once
+                // per request, not once per row -- a client asking for up to
+                // 1000 occurrences must not be able to flood the log by
+                // amplifying a single bad decrypt across every row it reads.
+                let mut cmdlines_attempted: u32 = 0;
+                let mut request_decrypt_failures: u32 = 0;
+                let mut first_failure_code: Option<u32> = None;
                 for event in &mut events {
                     if let Some(blob) = self
                         .storage
                         .load_launch_cmdline(event.pid, event.start_time_ms)?
                     {
+                        cmdlines_attempted += 1;
                         match crate::dpapi::unprotect(&blob) {
                             Ok(plaintext) => {
                                 event.command_line =
                                     Some(String::from_utf8_lossy(&plaintext).into_owned());
                             }
                             Err(code) => {
-                                eprintln!(
-                                    "failed to decrypt a captured command line for pid {} (start {}): DPAPI error {code:#x}",
-                                    event.pid, event.start_time_ms
-                                );
+                                request_decrypt_failures += 1;
+                                first_failure_code.get_or_insert(code);
                             }
                         }
                     }
+                }
+                if request_decrypt_failures > 0 {
+                    self.cmdlines_decrypt_failures
+                        .fetch_add(u64::from(request_decrypt_failures), Ordering::Relaxed);
+                    let first_failure_code = first_failure_code.unwrap_or(0);
+                    eprintln!(
+                        "failed to decrypt {request_decrypt_failures} of {cmdlines_attempted} captured command lines (first error 0x{first_failure_code:08x})"
+                    );
                 }
 
                 Ok(json!({ "events": events }))
             }
             PipeRequest::DeleteCommandLines => {
                 let deleted = self.storage.delete_all_launch_cmdlines()?;
+                // Bumped *after* the persisted table is actually gone, and
+                // read by the sampling loop once per tick: a launch pending
+                // its 60s "still running" flush may still have a redacted
+                // line sitting in the loop's in-flight `CmdlineJoiner`,
+                // captured before this request landed. Without this signal
+                // that line would persist moments after the user asked to
+                // forget everything -- see `cmdline_forget_generation`'s
+                // doc comment and `forget_generation_advanced`.
+                self.cmdline_forget_generation
+                    .fetch_add(1, Ordering::SeqCst);
                 Ok(json!({ "deleted": deleted }))
             }
         }
@@ -605,6 +646,8 @@ pub fn run(data_dir: &Path, stop: crossbeam_channel::Receiver<()>) -> Result<()>
         issued_contexts: Mutex::new(VecDeque::new()),
         settings_path,
         live: LiveEngine::windows(),
+        cmdline_forget_generation: AtomicU64::new(0),
+        cmdlines_decrypt_failures: AtomicU64::new(0),
     });
     // What the user's past ratings have made of the notification policy. Read
     // once here so the first evaluation after a restart already honors it.
@@ -819,6 +862,23 @@ fn join_command_lines(
     joined
 }
 
+/// Whether the shared `cmdline_forget_generation` counter has moved since
+/// the last value the sampling loop observed (`seen`, updated in place).
+/// Fires exactly once per bump: a value read twice in a row without an
+/// intervening bump reports no change, so `joiner.clear()` in the loop is
+/// called only on the tick that actually follows a `deleteCommandLines`
+/// request. Factored out as a pure comparison -- no lock, no I/O -- purely
+/// so this edge-detection is unit-testable without spinning up the
+/// sampling loop's real OS collectors.
+fn forget_generation_advanced(seen: &mut u64, current: u64) -> bool {
+    if current == *seen {
+        false
+    } else {
+        *seen = current;
+        true
+    }
+}
+
 fn sampling_loop(
     state: &Arc<AppState>,
     mut baselines: BaselineStore,
@@ -865,6 +925,12 @@ fn sampling_loop(
     // setting is on (it is cleared the moment it goes off).
     let mut launches = LaunchTracker::new();
     let mut joiner = CmdlineJoiner::new();
+    // Seeded from the shared counter's current value (rather than 0) so a
+    // `deleteCommandLines` request that landed before this loop iteration
+    // even started does not trigger a spurious clear on the very first
+    // tick -- harmless either way since the joiner starts empty, but this
+    // keeps the "on change" contract honest.
+    let mut last_forget_generation = state.cmdline_forget_generation.load(Ordering::SeqCst);
     let mut cmdline_session: Option<CmdlineCollector> = None;
     let mut next_cmdline_session_retry = Instant::now();
     // Due immediately: a service that restarts more often than hourly must
@@ -1058,6 +1124,18 @@ fn sampling_loop(
         }
         // Runs every tick even with ETW down, so pending rows still age out.
         let mut flushable = launches.drain_flushable(timestamp_ms);
+        // A `deleteCommandLines` request may have landed since the last
+        // tick: clear whatever the joiner is still holding *before* this
+        // tick's join, so a capture taken for a launch that was still
+        // pending its flush when the user asked to forget cannot slip into
+        // storage after the delete completed. This runs unconditionally,
+        // not gated on `capture_command_lines`, so a delete during a window
+        // where capture just got toggled off still catches whatever the
+        // joiner had left over.
+        let forget_generation = state.cmdline_forget_generation.load(Ordering::SeqCst);
+        if forget_generation_advanced(&mut last_forget_generation, forget_generation) {
+            joiner.clear();
+        }
         // Attaching only happens while the opt-in is active; with it off the
         // joiner is empty anyway, but the guard keeps that a policy rather
         // than an accident.
@@ -1134,6 +1212,10 @@ fn sampling_loop(
                 cmdlines_redacted_fields,
                 cmdlines_unmatched_evicted: joiner.unmatched_evicted(),
                 cmdlines_persist_failures,
+                // Driven by `getLaunchOccurrences` request traffic, not by
+                // anything this loop itself does -- just republished here
+                // each tick like the rest of this struct.
+                cmdlines_decrypt_failures: state.cmdlines_decrypt_failures.load(Ordering::Relaxed),
                 ..launches.status()
             }
         };
@@ -1519,6 +1601,81 @@ mod tests {
     }
 
     #[test]
+    fn clearing_the_joiner_before_join_drops_a_pending_capture() {
+        // Fix round 1 (I3): the sampling loop must clear its in-flight
+        // `CmdlineJoiner` *before* that tick's `join_command_lines` call
+        // whenever `deleteCommandLines` bumped the shared forget-generation
+        // counter since the last tick -- otherwise a capture the joiner was
+        // already holding for a launch still pending its 60s flush could
+        // still land in storage moments after the user asked to forget
+        // everything. This pins the ordering directly: offer a capture,
+        // clear (simulating the epoch-change branch), then join -- the
+        // capture must not attach.
+        let mut joiner = CmdlineJoiner::new();
+        joiner.offer(500, 10_000, "tool.exe --password hunter2");
+        joiner.clear();
+        let mut events = vec![launch_event(500, 10_100)];
+        let joined = join_command_lines(&mut joiner, &mut events);
+
+        assert!(
+            joined.is_empty(),
+            "a capture offered before the clear must not survive it"
+        );
+        assert!(events[0].command_line.is_none());
+    }
+
+    #[test]
+    fn forget_generation_advanced_fires_exactly_once_per_bump() {
+        let mut seen = 0u64;
+        // No bump yet (still 0): no change observed.
+        assert!(!forget_generation_advanced(&mut seen, 0));
+        // Bumped to 1: fires once.
+        assert!(forget_generation_advanced(&mut seen, 1));
+        // Re-reading the same value (no new delete since): does not re-fire.
+        assert!(!forget_generation_advanced(&mut seen, 1));
+        assert!(!forget_generation_advanced(&mut seen, 1));
+        // A second delete bumps it again: fires again.
+        assert!(forget_generation_advanced(&mut seen, 2));
+        assert!(!forget_generation_advanced(&mut seen, 2));
+    }
+
+    #[test]
+    fn delete_command_lines_bumps_the_forget_generation_counter() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = test_state(&directory);
+        assert_eq!(
+            state
+                .cmdline_forget_generation
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+
+        match state.handle(PipeRequest::DeleteCommandLines) {
+            PipeResponse::Ok { .. } => {}
+            PipeResponse::Error { code, message } => {
+                panic!("deleteCommandLines failed: {code} {message}")
+            }
+        }
+        assert_eq!(
+            state
+                .cmdline_forget_generation
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the handler must bump the counter so the sampling loop's \
+             next tick clears its in-flight joiner"
+        );
+
+        state.handle(PipeRequest::DeleteCommandLines);
+        assert_eq!(
+            state
+                .cmdline_forget_generation
+                .load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "a second delete must bump it again, not saturate or reset"
+        );
+    }
+
+    #[test]
     fn builds_parent_child_tree() {
         let tree = build_process_tree(&[process(10, 0), process(11, 10), process(12, 11)]);
         assert_eq!(tree.len(), 1);
@@ -1536,6 +1693,8 @@ mod tests {
             issued_contexts: Mutex::new(VecDeque::new()),
             settings_path: directory.path().join("settings.json"),
             live: LiveEngine::windows(),
+            cmdline_forget_generation: AtomicU64::new(0),
+            cmdlines_decrypt_failures: AtomicU64::new(0),
         }
     }
 
@@ -2336,6 +2495,74 @@ mod tests {
         let events: Vec<LaunchEvent> = serde_json::from_value(data["events"].clone()).unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].command_line, None);
+    }
+
+    #[test]
+    fn get_launch_occurrences_counts_decrypt_failures_without_failing_the_request() {
+        // Fix round 1 (I1+I2): a decrypt failure must (a) not fail the
+        // request, (b) leave only that occurrence's `command_line` absent,
+        // and (c) increment the shared counter the sampling loop folds into
+        // `launchCapture.cmdlinesDecryptFailures` -- once per failed row,
+        // not once per request.
+        let directory = tempfile::tempdir().unwrap();
+        let state = test_state(&directory);
+        let now_ms = Utc::now().timestamp_millis();
+
+        let good = launch_event_with_lineage(1, now_ms - 1_000, r"c:\a.exe", &[]);
+        let bad = launch_event_with_lineage(2, now_ms, r"c:\a.exe", &[]);
+        state
+            .storage
+            .save_launches(&[good.clone(), bad.clone()])
+            .unwrap();
+        let blob = crate::dpapi::protect(b"c:\\a.exe --flag").unwrap();
+        state
+            .storage
+            .save_launch_cmdline(good.pid, good.start_time_ms, now_ms, &blob)
+            .unwrap();
+        // Not a real DPAPI blob at all, so `dpapi::unprotect` genuinely
+        // fails rather than this test faking the failure path.
+        state
+            .storage
+            .save_launch_cmdline(bad.pid, bad.start_time_ms, now_ms, b"not a real dpapi blob")
+            .unwrap();
+
+        assert_eq!(
+            state
+                .cmdlines_decrypt_failures
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+
+        let response = state.handle(PipeRequest::GetLaunchOccurrences {
+            exe_path: r"c:\a.exe".into(),
+            lineage_sig: String::new(),
+            from_ms: None,
+            limit: None,
+        });
+        let data = match response {
+            PipeResponse::Ok { data } => data,
+            PipeResponse::Error { code, message } => {
+                panic!("getLaunchOccurrences failed: {code} {message}")
+            }
+        };
+        let events: Vec<LaunchEvent> = serde_json::from_value(data["events"].clone()).unwrap();
+        assert_eq!(
+            events.len(),
+            2,
+            "a decrypt failure on one row must not fail the whole request"
+        );
+        let good_event = events.iter().find(|event| event.pid == good.pid).unwrap();
+        assert_eq!(good_event.command_line.as_deref(), Some("c:\\a.exe --flag"));
+        let bad_event = events.iter().find(|event| event.pid == bad.pid).unwrap();
+        assert_eq!(bad_event.command_line, None);
+
+        assert_eq!(
+            state
+                .cmdlines_decrypt_failures
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the shared counter must be incremented once per failed row"
+        );
     }
 
     #[test]

@@ -756,14 +756,23 @@ fn median_interval_ms(mut starts: Vec<i64>) -> Option<i64> {
         return None;
     }
     starts.sort_unstable();
-    let mut diffs: Vec<i64> = starts.windows(2).map(|pair| pair[1] - pair[0]).collect();
+    let mut diffs: Vec<i64> = starts
+        .windows(2)
+        .map(|pair| pair[1].saturating_sub(pair[0]))
+        .collect();
     diffs.sort_unstable();
     Some(median_of_sorted(&diffs))
 }
 
 /// Median of an already-sorted, non-empty slice: the middle element for an
-/// odd length, the rounded average of the two middle elements for an even
-/// one.
+/// odd length, the round-half-away-from-zero average of the two middle
+/// elements for an even one (e.g. diffs `[1, 2]` -> `2`, not `1`).
+///
+/// `sorted` here is always a list of `start_time_ms` gaps computed from an
+/// ascending-sorted list of starts, so every element is `>= 0`; the integer
+/// rounding below (`sum / 2 + sum % 2`) relies on that non-negativity and
+/// uses `saturating_add` rather than plain `+` so an extreme (near-`i64::MAX`)
+/// gap cannot overflow into a nonsense negative median.
 fn median_of_sorted(sorted: &[i64]) -> i64 {
     let n = sorted.len();
     if n % 2 == 1 {
@@ -771,7 +780,8 @@ fn median_of_sorted(sorted: &[i64]) -> i64 {
     } else {
         let a = sorted[n / 2 - 1];
         let b = sorted[n / 2];
-        ((a as f64 + b as f64) / 2.0).round() as i64
+        let sum = a.saturating_add(b);
+        sum / 2 + sum % 2
     }
 }
 
@@ -792,12 +802,16 @@ fn build_group(occurrences: &[&LaunchEvent]) -> LaunchGroup {
 
     let durations: Vec<i64> = occurrences
         .iter()
-        .filter_map(|event| event.stop_time_ms.map(|stop| stop - event.start_time_ms))
+        .filter_map(|event| {
+            event
+                .stop_time_ms
+                .map(|stop| stop.saturating_sub(event.start_time_ms))
+        })
         .collect();
     let (mean_duration_ms, max_duration_ms) = if durations.is_empty() {
         (None, None)
     } else {
-        let sum: i64 = durations.iter().sum();
+        let sum: i64 = durations.iter().copied().fold(0, i64::saturating_add);
         let mean = sum / durations.len() as i64;
         let max = durations.iter().copied().fold(i64::MIN, i64::max);
         (Some(mean), Some(max))
@@ -882,7 +896,18 @@ pub fn group_launches(
         scored.retain(|(_, group)| group.console_host);
     }
 
-    scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.last_ms.cmp(&a.1.last_ms)));
+    // Final two tie-breakers make the order fully deterministic even when
+    // two groups share both the 24h count and `last_ms` exactly (e.g. two
+    // executables that both last launched in the same millisecond): without
+    // them, `HashMap`'s iteration order would leak into the response and a
+    // client polling `getLaunchGroups` could see two equally-ranked groups
+    // swap positions between otherwise-identical requests.
+    scored.sort_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then_with(|| b.1.last_ms.cmp(&a.1.last_ms))
+            .then_with(|| a.1.exe_path.cmp(&b.1.exe_path))
+            .then_with(|| a.1.lineage_sig.cmp(&b.1.lineage_sig))
+    });
 
     scored
         .into_iter()
@@ -1495,6 +1520,30 @@ mod tests {
     }
 
     #[test]
+    fn median_interval_over_two_occurrences_is_their_single_gap() {
+        let events = vec![
+            group_test_event(1, 0, r"c:\a.exe", &[]),
+            group_test_event(2, 7_000, r"c:\a.exe", &[]),
+        ];
+        let groups = group_launches(&events, false, 500);
+        assert_eq!(groups[0].median_interval_ms, Some(7_000));
+    }
+
+    #[test]
+    fn median_interval_rounds_half_gaps_away_from_zero() {
+        // Three starts (0, 1, 3) produce gap diffs [1, 2]; their average,
+        // 1.5, must round to 2 -- not down to 1 (banker's/truncating
+        // rounding) and not to -2 (away from zero in the wrong direction).
+        let events = vec![
+            group_test_event(1, 0, r"c:\a.exe", &[]),
+            group_test_event(2, 1, r"c:\a.exe", &[]),
+            group_test_event(3, 3, r"c:\a.exe", &[]),
+        ];
+        let groups = group_launches(&events, false, 500);
+        assert_eq!(groups[0].median_interval_ms, Some(2));
+    }
+
+    #[test]
     fn a_single_occurrence_has_no_median_interval() {
         let events = vec![group_test_event(1, 0, r"c:\a.exe", &[])];
         let groups = group_launches(&events, false, 500);
@@ -1602,6 +1651,26 @@ mod tests {
             "a smaller but currently-active group must outrank a bigger but stale one"
         );
         assert_eq!(groups[1].exe_path, r"c:\old.exe");
+    }
+
+    #[test]
+    fn sort_is_deterministic_when_count_and_last_ms_both_tie() {
+        // Two distinct groups (different exe_path) that launched exactly
+        // once each, at the exact same millisecond: count and last_ms tie
+        // completely, so only the exe_path/lineage_sig tie-breakers decide
+        // the order -- and they must decide it the same way every time,
+        // not however `HashMap` happened to iterate this run.
+        let events = vec![
+            group_test_event(1, 1_000, r"c:\zeta.exe", &[]),
+            group_test_event(2, 1_000, r"c:\alpha.exe", &[]),
+        ];
+        let groups = group_launches(&events, false, 500);
+        assert_eq!(groups.len(), 2);
+        assert_eq!(
+            groups[0].exe_path, r"c:\alpha.exe",
+            "lexicographically-first exe_path must sort first once every other key ties"
+        );
+        assert_eq!(groups[1].exe_path, r"c:\zeta.exe");
     }
 
     #[test]
