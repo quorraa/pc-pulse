@@ -7,6 +7,7 @@ pub mod config;
 pub mod etw;
 pub mod etw_props;
 pub mod eventlog;
+pub mod launches;
 pub mod metrics;
 pub mod models;
 pub mod pipe;
