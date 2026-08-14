@@ -417,6 +417,9 @@ pub enum SettingField {
     AgentAge,
     Notifications,
     AgentPatterns,
+    CaptureCommandLines,
+    CommandLineRetentionHours,
+    DeleteCommandLines,
 }
 
 impl SettingField {
@@ -436,7 +439,7 @@ impl SettingField {
     ];
 
     /// Service-validated detector settings, saved through the pipe with `s`.
-    pub const SERVICE: [Self; 19] = [
+    pub const SERVICE: [Self; 22] = [
         Self::SampleInterval,
         Self::Retention,
         Self::Sustained,
@@ -456,9 +459,12 @@ impl SettingField {
         Self::AgentAge,
         Self::Notifications,
         Self::AgentPatterns,
+        Self::CaptureCommandLines,
+        Self::CommandLineRetentionHours,
+        Self::DeleteCommandLines,
     ];
 
-    pub const ALL: [Self; 29] = [
+    pub const ALL: [Self; 32] = [
         Self::ClientTheme,
         Self::ClientEffects,
         Self::ClientRefresh,
@@ -488,6 +494,9 @@ impl SettingField {
         Self::AgentAge,
         Self::Notifications,
         Self::AgentPatterns,
+        Self::CaptureCommandLines,
+        Self::CommandLineRetentionHours,
+        Self::DeleteCommandLines,
     ];
 
     pub const fn is_client(self) -> bool {
@@ -537,6 +546,9 @@ impl SettingField {
             Self::AgentAge => "Abandoned agent age",
             Self::Notifications => "Native notifications",
             Self::AgentPatterns => "Agent patterns",
+            Self::CaptureCommandLines => "Command-line capture",
+            Self::CommandLineRetentionHours => "Cmdline retention (hours)",
+            Self::DeleteCommandLines => "Delete captured command lines",
         }
     }
 
@@ -563,6 +575,7 @@ impl SettingField {
             Self::Dpc | Self::Interrupt => "/s",
             Self::Unresponsive => "seconds",
             Self::AgentAge => "minutes",
+            Self::CommandLineRetentionHours => "hours",
             _ => "",
         }
     }
@@ -695,6 +708,27 @@ impl SettingField {
                 "Comma-separated name or path fragments that identify AI-agent processes, \
                  used by agent focus and abandoned-agent findings."
             }
+            // Disclosure copy, verbatim from the launch-history design spec.
+            // A pinned test asserts this string byte-for-byte; do not reword
+            // it without updating that test and the spec together.
+            Self::CaptureCommandLines => {
+                "Command lines can contain credentials, tokens, and personal paths. \
+                 Captured lines are redacted, encrypted at rest, kept N hours, and \
+                 deletable at any time. Off: PC Pulse identifies the executable and \
+                 launcher, but not the exact command or script."
+            }
+            Self::CommandLineRetentionHours => {
+                "How long captured, redacted command lines stay encrypted on disk before \
+                 automatic deletion, from 1 to 168 hours -- its own clock, independent of \
+                 the 7-day launch-event history. Out-of-range entries are clamped to the \
+                 nearest valid hour rather than rejected."
+            }
+            Self::DeleteCommandLines => {
+                "Immediately deletes every captured command line from disk, regardless of \
+                 its remaining retention. Enter runs it now; the number deleted appears on \
+                 the status line. Launch history itself (executable, lineage, timestamps) \
+                 is not affected."
+            }
         }
     }
 
@@ -736,6 +770,15 @@ impl SettingField {
             }
             .into(),
             Self::AgentPatterns => settings.agent_process_patterns.join(", "),
+            Self::CaptureCommandLines => if settings.capture_command_lines {
+                "on"
+            } else {
+                "off"
+            }
+            .into(),
+            Self::CommandLineRetentionHours => settings.command_line_retention_hours.to_string(),
+            // Not a stored value -- the row is a button, not a field.
+            Self::DeleteCommandLines => "press enter".into(),
         }
     }
 
@@ -794,6 +837,29 @@ impl SettingField {
                     return Err("use at most 32 patterns of 64 characters each".into());
                 }
                 settings.agent_process_patterns = values;
+            }
+            Self::CaptureCommandLines => {
+                settings.capture_command_lines = match input.trim().to_ascii_lowercase().as_str() {
+                    "on" | "true" | "yes" | "1" => true,
+                    "off" | "false" | "no" | "0" => false,
+                    _ => return Err("enter on or off".into()),
+                }
+            }
+            // A stepper, not a strict range: an out-of-bounds hour count is
+            // clamped to the nearest valid value rather than rejected, the
+            // same forgiving UX as the background-dim row.
+            Self::CommandLineRetentionHours => {
+                let hours: u32 = input
+                    .trim()
+                    .parse()
+                    .map_err(|_| "enter a number from 1 to 168".to_string())?;
+                settings.command_line_retention_hours = hours.clamp(1, 168);
+            }
+            // The row never reaches a typed edit -- `begin_setting_edit`
+            // fires the delete action directly on Enter -- but the match
+            // must stay exhaustive.
+            Self::DeleteCommandLines => {
+                return Err("action row -- press Enter to run it".into());
             }
         }
         Ok(())
@@ -868,6 +934,10 @@ pub enum WorkerCommand {
         exe_path: String,
         lineage_sig: String,
     },
+    /// The TUNE "Delete captured command lines" action row: wipes every
+    /// captured command line immediately, independent of retention. Launch
+    /// events themselves (executable, lineage, timestamps) are untouched.
+    DeleteCommandLines,
     /// One launch-time release check against GitHub; sent only when the
     /// `updateChecks` preference is on and the 20-hour cadence is due.
     CheckUpdate,
@@ -1152,6 +1222,23 @@ fn worker_loop(commands: Receiver<WorkerCommand>, events: Sender<WorkerEvent>) {
                             lineage_sig,
                             result,
                         });
+                    }
+                    Ok(WorkerCommand::DeleteCommandLines) => {
+                        // One pipe round trip, exactly like acknowledge and
+                        // the rating submission: the count the service
+                        // reports is the only honest source for "how many"
+                        // -- the client never estimates it.
+                        let result = client
+                            .delete_command_lines()
+                            .map(|response| {
+                                format!(
+                                    "Deleted {} captured command line{}",
+                                    response.deleted,
+                                    if response.deleted == 1 { "" } else { "s" }
+                                )
+                            })
+                            .map_err(error_text);
+                        let _ = events.send(WorkerEvent::Action(result));
                     }
                     Ok(WorkerCommand::CheckUpdate) => {
                         // Fire-and-forget on its own thread so a slow or
@@ -3203,6 +3290,17 @@ impl App {
             // asking the person to know the path by heart. The typed editor
             // is still there behind it, for a dialog that cannot be shown.
             SettingField::ClientBackgroundVideo => self.open_background_picker(),
+            // An action row, not a value to edit: Enter runs the delete
+            // immediately and the worker reports the count on the status
+            // line once the pipe answers, exactly like a rating submission.
+            SettingField::DeleteCommandLines => {
+                let _ = self
+                    .worker
+                    .commands
+                    .try_send(WorkerCommand::DeleteCommandLines);
+                self.status = "Deleting captured command lines…".into();
+                self.status_is_error = false;
+            }
             // This prefills with what the person would type, not with the
             // display value: a bare number rather than "auto (matches clip)".
             SettingField::ClientBackgroundFps => {
@@ -5849,7 +5947,7 @@ mod tests {
             assert!(position < SettingField::CLIENT.len(), "{field:?} unpinned");
         }
         assert_eq!(SettingField::CLIENT.len(), 10);
-        assert_eq!(SettingField::ALL.len(), 29);
+        assert_eq!(SettingField::ALL.len(), 32);
         // The quality row sits between the path and the on/off switch, so
         // the three rows that describe *the clip* read top to bottom.
         let row = |field| fields.iter().position(|other| *other == field).unwrap();
@@ -5861,6 +5959,98 @@ mod tests {
             row(SettingField::ClientBackgroundEnabled),
             row(SettingField::ClientBackgroundQuality) + 1
         );
+    }
+
+    #[test]
+    fn the_capture_row_carries_the_disclosure_verbatim() {
+        // Pinned byte-for-byte to the launch-history design spec's exact
+        // wording; reword the row only alongside the spec and this test.
+        assert_eq!(
+            SettingField::CaptureCommandLines.description(),
+            "Command lines can contain credentials, tokens, and personal paths. \
+             Captured lines are redacted, encrypted at rest, kept N hours, and \
+             deletable at any time. Off: PC Pulse identifies the executable and \
+             launcher, but not the exact command or script."
+        );
+    }
+
+    #[test]
+    fn the_retention_hours_row_clamps_out_of_range_edits() {
+        let mut app = App::new_inert();
+        app.settings.command_line_retention_hours = 24;
+
+        app.mode = InputMode::EditSetting {
+            field: SettingField::CommandLineRetentionHours,
+            typed: "0".into(),
+        };
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.settings.command_line_retention_hours, 1);
+        assert!(app.settings_dirty);
+        assert!(matches!(app.mode, InputMode::Normal));
+
+        app.mode = InputMode::EditSetting {
+            field: SettingField::CommandLineRetentionHours,
+            typed: "9999".into(),
+        };
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.settings.command_line_retention_hours, 168);
+
+        app.mode = InputMode::EditSetting {
+            field: SettingField::CommandLineRetentionHours,
+            typed: "50".into(),
+        };
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            app.settings.command_line_retention_hours, 50,
+            "an in-range value passes through unclamped"
+        );
+
+        // Nonsense re-arms the edit with an error instead of committing.
+        app.mode = InputMode::EditSetting {
+            field: SettingField::CommandLineRetentionHours,
+            typed: "forever".into(),
+        };
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.status_is_error);
+        assert!(matches!(app.mode, InputMode::EditSetting { .. }));
+        assert_eq!(app.settings.command_line_retention_hours, 50);
+    }
+
+    #[test]
+    fn the_delete_action_row_sends_the_command_without_opening_an_edit() {
+        let (mut app, commands) = app_with_captive_worker();
+        app.page = Page::Settings;
+        let row = app
+            .visible_setting_fields()
+            .iter()
+            .position(|field| *field == SettingField::DeleteCommandLines)
+            .expect("the delete row is on the TUNE page");
+        app.setting_state.select(Some(row));
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(
+            matches!(app.mode, InputMode::Normal),
+            "the action runs immediately; it never opens a typed edit"
+        );
+        let sent: Vec<WorkerCommand> = commands.try_iter().collect();
+        assert!(
+            matches!(sent.as_slice(), [WorkerCommand::DeleteCommandLines]),
+            "{sent:?}"
+        );
+    }
+
+    #[test]
+    fn the_deleted_count_surfaces_on_the_statusline() {
+        let (mut app, _commands, events) = app_with_live_channels();
+        events
+            .send(WorkerEvent::Action(Ok(
+                "Deleted 3 captured command lines".into()
+            )))
+            .unwrap();
+        app.drain_events();
+        assert_eq!(app.status, "Deleted 3 captured command lines");
+        assert!(!app.status_is_error);
     }
 
     #[test]
