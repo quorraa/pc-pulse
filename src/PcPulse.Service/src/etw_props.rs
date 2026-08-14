@@ -8,9 +8,9 @@
 
 use windows::Win32::Foundation::ERROR_INSUFFICIENT_BUFFER;
 use windows::Win32::System::Diagnostics::Etw::{
-    EVENT_RECORD, PROPERTY_DATA_DESCRIPTOR, TDH_INTYPE_FILETIME, TDH_INTYPE_UINT32,
-    TDH_INTYPE_UINT64, TDH_INTYPE_UNICODESTRING, TRACE_EVENT_INFO, TdhGetEventInformation,
-    TdhGetProperty, TdhGetPropertySize,
+    EVENT_PROPERTY_INFO, EVENT_RECORD, PROPERTY_DATA_DESCRIPTOR, TDH_INTYPE_FILETIME,
+    TDH_INTYPE_UINT32, TDH_INTYPE_UINT64, TDH_INTYPE_UNICODESTRING, TRACE_EVENT_INFO,
+    TdhGetEventInformation, TdhGetProperty, TdhGetPropertySize,
 };
 
 const PROCESS_START_EVENT_ID: u16 = 1;
@@ -148,6 +148,39 @@ fn read_u64_le(bytes: &[u8]) -> Option<u64> {
     Some(u64::from_ne_bytes(array))
 }
 
+/// Pure, testable core of the property-array bounds check: given the byte
+/// offset of the property array within the TDH info buffer, the TDH-reported
+/// element count, the element size, and the buffer's actual populated
+/// length, returns the number of whole elements that fit entirely inside
+/// the buffer.
+///
+/// `count` is TDH-supplied and must never be trusted directly — a naive
+/// `offset + count * elem <= buf_len` check would need to guard the
+/// multiply/add against overflow itself. This instead divides the
+/// remaining space by `elem` (division can never overflow) to get the
+/// maximum element count that fits, then takes the smaller of that and
+/// `count`. An out-of-range `offset` clamps to 0 fits rather than
+/// underflowing.
+///
+/// Clamping (rather than returning `Err`) is deliberate here, matching the
+/// rest of this shell: a single unreadable/oversized property already
+/// degrades gracefully (the `continue` cases above), and `decode_event`
+/// still surfaces a `MissingProperty` error if clamping drops a property
+/// the event actually needs. There is no case where reading fewer
+/// properties than TDH claims makes decoding less safe, only potentially
+/// incomplete.
+fn props_that_fit(offset: usize, count: u32, elem: usize, buf_len: usize) -> usize {
+    if offset > buf_len {
+        return 0;
+    }
+    let available = buf_len - offset;
+    if elem == 0 {
+        return count as usize;
+    }
+    let max_that_fit = available / elem;
+    (count as usize).min(max_that_fit)
+}
+
 thread_local! {
     /// Reused across calls on the dedicated `pcpulse-etw` thread to avoid
     /// reallocating the TDH info buffer for every event.
@@ -203,7 +236,19 @@ pub unsafe fn parse_process_event(
     let info = unsafe { &*info_ptr };
     let base = info_ptr.cast::<u8>();
     let info_buffer: &[u8] = unsafe { std::slice::from_raw_parts(base, info_buffer_len) };
-    let property_count = info.TopLevelPropertyCount as usize;
+    // Same invariant as above, applied to the property array itself:
+    // TopLevelPropertyCount is TDH-supplied and must not be trusted to fit
+    // inside the populated buffer. Clamp to the number of whole
+    // EVENT_PROPERTY_INFO entries that actually fit at the array's offset
+    // before ever forming the slice, so a hostile/corrupt count can never
+    // walk `from_raw_parts` past the allocation.
+    let array_offset = info.EventPropertyInfoArray.as_ptr() as usize - base as usize;
+    let property_count = props_that_fit(
+        array_offset,
+        info.TopLevelPropertyCount,
+        std::mem::size_of::<EVENT_PROPERTY_INFO>(),
+        info_buffer_len,
+    );
     let property_array =
         unsafe { std::slice::from_raw_parts(info.EventPropertyInfoArray.as_ptr(), property_count) };
 
@@ -422,5 +467,34 @@ mod tests {
         let mut bag = start_bag();
         bag.iter_mut().find(|(k, _)| k == "SessionID").unwrap().1 = PropValue::U64(1);
         assert!(decode_event(1, &bag).is_ok());
+    }
+    #[test]
+    fn props_that_fit_exact_fit_returns_full_count() {
+        // offset 8, 4 elements of size 8 bytes = 32 bytes, buffer exactly 40.
+        assert_eq!(props_that_fit(8, 4, 8, 40), 4);
+    }
+    #[test]
+    fn props_that_fit_overflowing_count_is_clamped() {
+        // A hostile/corrupt count that would read far past the buffer must
+        // be clamped to what actually fits, not panic or wrap.
+        assert_eq!(props_that_fit(8, u32::MAX, 8, 40), 4);
+    }
+    #[test]
+    fn props_that_fit_offset_past_buffer_is_zero() {
+        assert_eq!(props_that_fit(100, 4, 8, 40), 0);
+    }
+    #[test]
+    fn props_that_fit_offset_at_exact_end_is_zero() {
+        assert_eq!(props_that_fit(40, 4, 8, 40), 0);
+    }
+    #[test]
+    fn props_that_fit_partial_remainder_rounds_down() {
+        // 40 - 8 = 32 bytes remaining, elem size 12 -> only 2 whole elements
+        // fit (24 bytes), the trailing 8 bytes are not a whole element.
+        assert_eq!(props_that_fit(8, 10, 12, 40), 2);
+    }
+    #[test]
+    fn props_that_fit_zero_count_is_zero() {
+        assert_eq!(props_that_fit(0, 0, 8, 40), 0);
     }
 }
