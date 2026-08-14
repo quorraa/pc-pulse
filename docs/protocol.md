@@ -36,6 +36,9 @@ Errors do not disclose stack traces:
 | `terminateProcess` | `pid`, `confirmed` | Termination result |
 | `addRating` | `verdict` | Stores and returns a server-assembled performance rating |
 | `getRatings` | `limit` | Rating history, newest first; transport-safe limit is clamped to 200 (`POLICY_OFFSET_RATINGS`, the same history bound the notification policy is derived from) |
+| `getLaunchGroups` | `from_ms`, `console_hosts_only`, `limit` (all optional) | Recorded launches bucketed by `(exe_path, lineage_sig)` with aggregate stats; transport-safe limit is clamped to 500 |
+| `getLaunchOccurrences` | `exe_path`, `lineage_sig`, `from_ms`, `limit` (the latter two optional) | Individual launch rows for one group's exact key, newest first, with `commandLine` decrypted per request when captured; transport-safe limit is clamped to 1000 |
+| `deleteCommandLines` | — | Deletes every captured command-line blob; never touches launch-history rows |
 
 ## The `live` channel
 
@@ -135,6 +138,101 @@ The tray helper's balloon filter is: an alert pops when `notify == true`, it is 
 `getSnapshot`'s top-level payload gained two additive fields so a client can decide *when to ask* and *what the policy currently says* without deriving either itself: `demand: "light" | "moderate" | "heavy" | null` — the bucket the machine is in right now, the same classification a rating would be filed under — and `heavyMinutesTrailingHour: number | null`, how many distinct minutes of the last hour were heavy. Both are `null` from services that predate ratings, and `null` means *not reported*, never "light"/"zero": a client must not nudge, or display a policy offset, on an unknown bucket. Heaviness is counted in wall-clock minutes rather than in samples, so the figure does not move when `sampleIntervalMs` changes.
 
 **Ratings never modify baselines, detector thresholds, or severities.** They only ever adjust the notification policy's floors, per alert kind and demand bucket, bounded to ±0.15 and decaying with a 30-day half-life — the same guarantee `getAgentContext`'s `ratingOffsets`/`limitations` fields already document. `protocolVersion` is unchanged (still 1): both commands are additive, and a pre-1.19 service answers them with the ordinary unknown-command `invalidRequest` error.
+
+## Launch history
+
+`getLaunchGroups`, `getLaunchOccurrences`, and `deleteCommandLines` (service 1.20+) surface the ETW-captured process launch history. A `LaunchEvent` never carries a command line at rest -- the capture pipeline clears it before the row is saved, and any captured line lives only in a separate, DPAPI-encrypted table keyed by `(pid, startTimeMs)`. `getLaunchOccurrences` is the only path that ever populates `commandLine`, decrypting per request and never caching the plaintext.
+
+```json
+{"command":"getLaunchGroups","from_ms":0,"console_hosts_only":false,"limit":500}
+```
+
+All three fields are optional: `from_ms` defaults to 7 days back, `console_hosts_only` defaults to `false`, and `limit` is clamped to 500 either way. The response groups every matching `LaunchEvent` by `(exePath, lineageSig)` -- never by `sessionId`, so the same launcher chain across sessions is one group:
+
+```json
+{
+  "groups": [
+    {
+      "exeName": "notepad.exe",
+      "exePath": "c:\\windows\\system32\\notepad.exe",
+      "lineageSig": "explorer.exe",
+      "launcherSummary": "explorer.exe",
+      "count": 12,
+      "firstMs": 0,
+      "lastMs": 0,
+      "medianIntervalMs": 0,
+      "meanDurationMs": 0,
+      "maxDurationMs": 0,
+      "windowed": 10,
+      "neverWindowed": 1,
+      "unobserved": 1,
+      "running": 0,
+      "consoleHost": false
+    }
+  ]
+}
+```
+
+`lineageSig` is the launch's ancestor names, nearest first, lowercased and joined by `"<"` (e.g. `"cmd.exe<explorer.exe"`; the empty string for a launch with no resolved lineage). `launcherSummary` is the nearest ancestor's own name, or `"unknown"`. Groups are sorted by their occurrence count within the trailing 24 hours of the newest launch in the whole result set (descending), ties broken by `lastMs` (descending) -- a group that was busy weeks ago but is quiet now sorts below one that is active right now, however small its lifetime total. `medianIntervalMs` is `null` when the group has fewer than two occurrences; `meanDurationMs`/`maxDurationMs` are `null` when none of the group's occurrences have finished (still `"running"`).
+
+`getLaunchOccurrences` fetches one group's individual rows by its exact key:
+
+```json
+{"command":"getLaunchOccurrences","exe_path":"c:\\windows\\system32\\notepad.exe","lineage_sig":"explorer.exe","from_ms":0,"limit":1000}
+```
+
+`exe_path` and `lineage_sig` are required (copy them from a `getLaunchGroups` row); `from_ms` defaults to 7 days back and `limit` is clamped to 1000. The response is newest-first `LaunchEvent` rows:
+
+```json
+{
+  "events": [
+    {
+      "pid": 0,
+      "startTimeMs": 0,
+      "stopTimeMs": 0,
+      "exitCode": 0,
+      "exeName": "notepad.exe",
+      "exePath": "c:\\windows\\system32\\notepad.exe",
+      "sessionId": 1,
+      "parentPid": 0,
+      "lineage": [{"pid": 0, "name": "explorer.exe", "path": "c:\\windows\\explorer.exe"}],
+      "windowState": "windowed",
+      "consoleHost": false,
+      "commandLine": "notepad.exe c:\\notes.txt"
+    }
+  ]
+}
+```
+
+`stopTimeMs`, `exitCode`, `rawImagePath`, and `commandLine` are present only when applicable and otherwise omitted rather than sent as `null`. `windowState` is one of `"windowed"`, `"neverWindowed"`, `"unobserved"`, `"running"`. A command line is absent (not the request failing) whenever nothing was captured for that occurrence, capture was off, or decryption fails -- e.g. a machine-key change after a reinstall; that case is logged and counted service-side, never surfaced as a transport error.
+
+`deleteCommandLines` takes no fields and deletes every captured command-line blob -- the user-facing "forget captured command lines" control:
+
+```json
+{"command":"deleteCommandLines"}
+```
+
+```json
+{"deleted": 0}
+```
+
+It only ever touches the encrypted command-line table; `launch_events` rows are untouched (they never held a command line to begin with).
+
+`getSnapshot`'s top-level payload carries an additive `launchCapture` object, republished every sample, reporting the capture pipeline's own health:
+
+```json
+{
+  "startsSeen": 0, "stopsSeen": 0, "persisted": 0,
+  "droppedChannel": 0, "etwEventsLost": 0, "eventsLostQueryFailures": 0, "malformedEvents": 0,
+  "orphanStops": 0, "stalePendingEvicted": 0,
+  "cmdlineSessionActive": false, "cmdlinesCaptured": 0, "cmdlinesRedactedFields": 0,
+  "cmdlinesUnmatchedEvicted": 0, "cmdlinesPersistFailures": 0
+}
+```
+
+`startsSeen`/`stopsSeen`/`persisted` count the ETW start/stop pipeline; `orphanStops` is a stop event with no matching tracked start; `stalePendingEvicted` is a launch dropped after 24h with no stop event ever arriving (its last `"running"` snapshot, if any, remains the honest last-known state). `cmdlineSessionActive` reflects the `captureCommandLines` setting's opt-in MOF session; `cmdlinesCaptured`/`cmdlinesRedactedFields` count what was joined and how much of it was redacted before storage; `cmdlinesUnmatchedEvicted` is captures that aged out or were cap-evicted before any launch row claimed them (ordinary background noise, since the MOF session sees every process on the machine, not just tracked launches); `cmdlinesPersistFailures` is real, unrecoverable loss (DPAPI or the insert itself failed after the join already consumed the capture) and should stay at zero. Snapshots from services older than launch history have no such field and deserialize to the all-zero default, which reads the same as "no launches seen".
+
+Launch-event rows are retained for 7 days; captured command lines are retained on their own, separate clock (`commandLineRetentionHours` in settings, default 24h). `protocolVersion` is unchanged (still 1): all three commands and the `launchCapture` field are additive, and a pre-1.20 service answers the commands with the ordinary unknown-command `invalidRequest` error.
 
 ## Hardware inventory
 

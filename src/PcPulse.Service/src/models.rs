@@ -1001,6 +1001,33 @@ pub enum PipeRequest {
     GetRatings {
         limit: usize,
     },
+    /// Launch-history groups, bucketed by `(exe_path, lineage_sig)`, over
+    /// launches with `start_time_ms >= from_ms` (default: 7 days back).
+    /// `limit` is transport-safe-clamped to 500.
+    GetLaunchGroups {
+        #[serde(default)]
+        from_ms: Option<i64>,
+        #[serde(default)]
+        console_hosts_only: Option<bool>,
+        #[serde(default)]
+        limit: Option<usize>,
+    },
+    /// Individual launch occurrences for one group's exact key, newest
+    /// first, `command_line` decrypted per-request (never cached) when a
+    /// captured command line exists for that occurrence. `limit` is
+    /// transport-safe-clamped to 1000.
+    GetLaunchOccurrences {
+        exe_path: String,
+        lineage_sig: String,
+        #[serde(default)]
+        from_ms: Option<i64>,
+        #[serde(default)]
+        limit: Option<usize>,
+    },
+    /// Delete every captured command-line blob -- the user-facing "forget
+    /// captured command lines" control. Never touches `launch_events`
+    /// rows, which never carry command lines in the first place.
+    DeleteCommandLines,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

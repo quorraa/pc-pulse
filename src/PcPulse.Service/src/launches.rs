@@ -6,6 +6,7 @@
 
 use std::collections::{HashMap, VecDeque};
 
+use serde::{Deserialize, Serialize};
 use windows::Win32::Storage::FileSystem::QueryDosDeviceW;
 use windows::core::PCWSTR;
 
@@ -687,6 +688,209 @@ fn delta_ms(a: i64, b: i64) -> i64 {
     a.saturating_sub(b).saturating_abs()
 }
 
+// ---------------------------------------------------------------------
+// Launch grouping (Task 8)
+// ---------------------------------------------------------------------
+
+const TRAILING_24H_MS: i64 = 24 * 60 * 60 * 1000;
+
+/// Ancestor-chain signature used as half of a launch group's key: the
+/// lowercase launcher names, nearest first, joined by `<` (e.g.
+/// `"cmd.exe<explorer.exe"`). Lowercasing means two launches through the
+/// same chain of launchers group together even if capture-time casing
+/// differed; an empty lineage signs as the empty string.
+pub fn lineage_sig(lineage: &[LineageEntry]) -> String {
+    lineage
+        .iter()
+        .map(|entry| entry.name.to_lowercase())
+        .collect::<Vec<_>>()
+        .join("<")
+}
+
+/// Human-facing summary of what launched this: the nearest ancestor's own
+/// name, or `"unknown"` when the launch has no resolved lineage at all.
+fn launcher_summary(lineage: &[LineageEntry]) -> String {
+    lineage
+        .first()
+        .map(|entry| entry.name.clone())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// One `(exe_path, lineage_sig)` bucket of recorded launches, with
+/// aggregate stats a client can chart without re-deriving them from raw
+/// rows. Produced by [`group_launches`]; the underlying occurrences
+/// themselves are fetched separately (`getLaunchOccurrences`) by this
+/// group's `(exe_path, lineage_sig)` key.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LaunchGroup {
+    pub exe_name: String,
+    pub exe_path: String,
+    /// `"<"`-joined lowercase lineage names, e.g. `"cmd.exe<explorer.exe"`.
+    pub lineage_sig: String,
+    /// First lineage entry's name, or `"unknown"`.
+    pub launcher_summary: String,
+    pub count: usize,
+    pub first_ms: i64,
+    pub last_ms: i64,
+    /// Median gap between successive `start_time_ms` values in the group,
+    /// ascending. `None` when `count < 2` -- there is no interval to
+    /// measure.
+    pub median_interval_ms: Option<i64>,
+    /// Mean/max duration (`stop_time_ms - start_time_ms`) over completed
+    /// occurrences only. `None` when none of the group's occurrences have
+    /// finished (all still `Running`).
+    pub mean_duration_ms: Option<i64>,
+    pub max_duration_ms: Option<i64>,
+    pub windowed: usize,
+    pub never_windowed: usize,
+    pub unobserved: usize,
+    pub running: usize,
+    pub console_host: bool,
+}
+
+/// Median of the successive gaps between ascending `start_time_ms`
+/// values. `starts.len() < 2` has nothing to measure -- `None`, not zero.
+fn median_interval_ms(mut starts: Vec<i64>) -> Option<i64> {
+    if starts.len() < 2 {
+        return None;
+    }
+    starts.sort_unstable();
+    let mut diffs: Vec<i64> = starts.windows(2).map(|pair| pair[1] - pair[0]).collect();
+    diffs.sort_unstable();
+    Some(median_of_sorted(&diffs))
+}
+
+/// Median of an already-sorted, non-empty slice: the middle element for an
+/// odd length, the rounded average of the two middle elements for an even
+/// one.
+fn median_of_sorted(sorted: &[i64]) -> i64 {
+    let n = sorted.len();
+    if n % 2 == 1 {
+        sorted[n / 2]
+    } else {
+        let a = sorted[n / 2 - 1];
+        let b = sorted[n / 2];
+        ((a as f64 + b as f64) / 2.0).round() as i64
+    }
+}
+
+/// Builds one [`LaunchGroup`] from every occurrence sharing an
+/// `(exe_path, lineage_sig)` key. `occurrences` must be non-empty.
+fn build_group(occurrences: &[&LaunchEvent]) -> LaunchGroup {
+    let representative = occurrences[0];
+    let starts: Vec<i64> = occurrences
+        .iter()
+        .map(|event| event.start_time_ms)
+        .collect();
+    // `occurrences` is always non-empty (callers only ever build a group
+    // from a bucket that has at least one member), so folding from the
+    // identity extremes is equivalent to `.min()`/`.max()` without an
+    // `unwrap`/`expect` this crate denies outside tests.
+    let first_ms = starts.iter().copied().fold(i64::MAX, i64::min);
+    let last_ms = starts.iter().copied().fold(i64::MIN, i64::max);
+
+    let durations: Vec<i64> = occurrences
+        .iter()
+        .filter_map(|event| event.stop_time_ms.map(|stop| stop - event.start_time_ms))
+        .collect();
+    let (mean_duration_ms, max_duration_ms) = if durations.is_empty() {
+        (None, None)
+    } else {
+        let sum: i64 = durations.iter().sum();
+        let mean = sum / durations.len() as i64;
+        let max = durations.iter().copied().fold(i64::MIN, i64::max);
+        (Some(mean), Some(max))
+    };
+
+    let (mut windowed, mut never_windowed, mut unobserved, mut running) =
+        (0usize, 0usize, 0usize, 0usize);
+    for event in occurrences {
+        match event.window_state {
+            WindowState::Windowed => windowed += 1,
+            WindowState::NeverWindowed => never_windowed += 1,
+            WindowState::Unobserved => unobserved += 1,
+            WindowState::Running => running += 1,
+        }
+    }
+
+    LaunchGroup {
+        exe_name: representative.exe_name.clone(),
+        exe_path: representative.exe_path.clone(),
+        lineage_sig: lineage_sig(&representative.lineage),
+        launcher_summary: launcher_summary(&representative.lineage),
+        count: occurrences.len(),
+        first_ms,
+        last_ms,
+        median_interval_ms: median_interval_ms(starts),
+        mean_duration_ms,
+        max_duration_ms,
+        windowed,
+        never_windowed,
+        unobserved,
+        running,
+        console_host: representative.console_host,
+    }
+}
+
+/// Groups launch events by `(exe_path, lineage_sig)` -- never by
+/// `session_id`: the same launcher chain across different sessions is one
+/// group, and its individual occurrences (fetched separately via
+/// `getLaunchOccurrences`) keep their own distinct `session_id`s.
+///
+/// Sorted by each group's occurrence count within the trailing 24h of the
+/// newest `start_time_ms` across all of `events` (desc), ties broken by
+/// the group's own `last_ms` (desc), then truncated to `limit`. This
+/// deliberately favors recent activity over raw lifetime count: a group
+/// that launched heavily weeks ago but is quiet now sorts below a group
+/// that is active right now, however small its total.
+pub fn group_launches(
+    events: &[LaunchEvent],
+    console_hosts_only: bool,
+    limit: usize,
+) -> Vec<LaunchGroup> {
+    let mut buckets: HashMap<(String, String), Vec<&LaunchEvent>> = HashMap::new();
+    for event in events {
+        let sig = lineage_sig(&event.lineage);
+        buckets
+            .entry((event.exe_path.clone(), sig))
+            .or_default()
+            .push(event);
+    }
+
+    let newest = events
+        .iter()
+        .map(|event| event.start_time_ms)
+        .max()
+        .unwrap_or(0);
+    let window_start = newest.saturating_sub(TRAILING_24H_MS);
+
+    let mut scored: Vec<(usize, LaunchGroup)> = buckets
+        .into_values()
+        .map(|occurrences| {
+            let count_24h = occurrences
+                .iter()
+                .filter(|event| {
+                    event.start_time_ms >= window_start && event.start_time_ms <= newest
+                })
+                .count();
+            (count_24h, build_group(&occurrences))
+        })
+        .collect();
+
+    if console_hosts_only {
+        scored.retain(|(_, group)| group.console_host);
+    }
+
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.last_ms.cmp(&a.1.last_ms)));
+
+    scored
+        .into_iter()
+        .take(limit)
+        .map(|(_, group)| group)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1226,5 +1430,198 @@ mod tests {
         // Past the cooldown: rebuilds again.
         tr.on_start(start(3, 4, 61_000, r"\Device\Mup\c.exe"), &no_live);
         assert_eq!(REBUILD_CALLS.load(Ordering::SeqCst), 2);
+    }
+
+    // -- group_launches (Task 8) ---------------------------------------
+
+    fn group_test_event(
+        pid: u32,
+        start_ms: i64,
+        exe_path: &str,
+        lineage_names: &[&str],
+    ) -> LaunchEvent {
+        let exe_name = exe_name_from_path(exe_path);
+        LaunchEvent {
+            pid,
+            start_time_ms: start_ms,
+            stop_time_ms: None,
+            exit_code: None,
+            console_host: is_console_host(&exe_name),
+            exe_name,
+            exe_path: exe_path.to_string(),
+            raw_image_path: None,
+            session_id: 1,
+            parent_pid: 4,
+            lineage: lineage_names
+                .iter()
+                .enumerate()
+                .map(|(index, name)| LineageEntry {
+                    pid: 100 + index as u32,
+                    name: name.to_string(),
+                    path: None,
+                })
+                .collect(),
+            window_state: WindowState::Unobserved,
+            command_line: None,
+        }
+    }
+
+    #[test]
+    fn grouping_key_separates_same_exe_under_different_launchers() {
+        let events = vec![
+            group_test_event(1, 0, r"c:\a.exe", &["explorer.exe"]),
+            group_test_event(2, 1_000, r"c:\a.exe", &["cmd.exe"]),
+        ];
+        let groups = group_launches(&events, false, 500);
+        assert_eq!(
+            groups.len(),
+            2,
+            "same exe under different launchers must not merge"
+        );
+        assert!(groups.iter().any(|g| g.lineage_sig == "explorer.exe"));
+        assert!(groups.iter().any(|g| g.lineage_sig == "cmd.exe"));
+    }
+
+    #[test]
+    fn median_interval_over_three_starts_is_the_average_of_the_two_middle_gaps() {
+        let events = vec![
+            group_test_event(1, 0, r"c:\a.exe", &[]),
+            group_test_event(2, 10_000, r"c:\a.exe", &[]),
+            group_test_event(3, 25_000, r"c:\a.exe", &[]),
+        ];
+        let groups = group_launches(&events, false, 500);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].median_interval_ms, Some(12_500));
+    }
+
+    #[test]
+    fn a_single_occurrence_has_no_median_interval() {
+        let events = vec![group_test_event(1, 0, r"c:\a.exe", &[])];
+        let groups = group_launches(&events, false, 500);
+        assert_eq!(groups[0].count, 1);
+        assert_eq!(groups[0].median_interval_ms, None);
+    }
+
+    #[test]
+    fn duration_stats_ignore_still_running_occurrences() {
+        let mut finished = group_test_event(1, 0, r"c:\a.exe", &[]);
+        finished.stop_time_ms = Some(1_000);
+        let mut running = group_test_event(2, 2_000, r"c:\a.exe", &[]);
+        running.window_state = WindowState::Running;
+        let groups = group_launches(&[finished, running], false, 500);
+        assert_eq!(groups[0].mean_duration_ms, Some(1_000));
+        assert_eq!(groups[0].max_duration_ms, Some(1_000));
+        assert_eq!(
+            groups[0].running, 1,
+            "the running row must still count in the histogram"
+        );
+    }
+
+    #[test]
+    fn duration_stats_are_none_when_nothing_has_completed() {
+        let mut running = group_test_event(1, 0, r"c:\a.exe", &[]);
+        running.window_state = WindowState::Running;
+        let groups = group_launches(&[running], false, 500);
+        assert_eq!(groups[0].mean_duration_ms, None);
+        assert_eq!(groups[0].max_duration_ms, None);
+    }
+
+    #[test]
+    fn window_state_histogram_sums_to_the_group_count() {
+        let mut windowed = group_test_event(1, 0, r"c:\a.exe", &[]);
+        windowed.window_state = WindowState::Windowed;
+        let mut never_windowed = group_test_event(2, 1, r"c:\a.exe", &[]);
+        never_windowed.window_state = WindowState::NeverWindowed;
+        let mut unobserved = group_test_event(3, 2, r"c:\a.exe", &[]);
+        unobserved.window_state = WindowState::Unobserved;
+        let mut running = group_test_event(4, 3, r"c:\a.exe", &[]);
+        running.window_state = WindowState::Running;
+        let groups = group_launches(&[windowed, never_windowed, unobserved, running], false, 500);
+        let group = &groups[0];
+        assert_eq!(group.count, 4);
+        assert_eq!(
+            group.windowed + group.never_windowed + group.unobserved + group.running,
+            group.count
+        );
+        assert_eq!(
+            (
+                group.windowed,
+                group.never_windowed,
+                group.unobserved,
+                group.running
+            ),
+            (1, 1, 1, 1)
+        );
+    }
+
+    #[test]
+    fn console_filter_keeps_only_console_host_groups() {
+        let console = group_test_event(1, 0, r"c:\windows\system32\cmd.exe", &[]);
+        let non_console = group_test_event(2, 0, r"c:\a.exe", &[]);
+        let groups = group_launches(&[console, non_console], true, 500);
+        assert_eq!(groups.len(), 1);
+        assert!(groups[0].console_host);
+        assert_eq!(groups[0].exe_name.to_lowercase(), "cmd.exe");
+    }
+
+    #[test]
+    fn limit_truncates_after_sorting_not_before() {
+        let events: Vec<LaunchEvent> = (0..5)
+            .map(|i| group_test_event(i, i as i64 * 1_000, &format!(r"c:\p{i}.exe"), &[]))
+            .collect();
+        let groups = group_launches(&events, false, 2);
+        assert_eq!(
+            groups.len(),
+            2,
+            "limit must apply after the full set is scored and sorted"
+        );
+    }
+
+    #[test]
+    fn sort_favors_trailing_24h_activity_over_raw_lifetime_count() {
+        let day_ms = 24 * 60 * 60 * 1000;
+        let newest = 100 * day_ms;
+
+        // Old-heavy: ten launches, every one of them more than 24h before
+        // the newest event in the whole set.
+        let old_heavy: Vec<LaunchEvent> = (0..10)
+            .map(|i| group_test_event(i, newest - 2 * day_ms - i as i64, r"c:\old.exe", &[]))
+            .collect();
+        // Recent-active: only three launches, but all inside the trailing
+        // 24h window, including the set's overall newest event.
+        let recent_active: Vec<LaunchEvent> = (0..3)
+            .map(|i| group_test_event(100 + i, newest - i as i64 * 1_000, r"c:\recent.exe", &[]))
+            .collect();
+
+        let mut events = old_heavy;
+        events.extend(recent_active);
+
+        let groups = group_launches(&events, false, 500);
+        assert_eq!(
+            groups[0].exe_path, r"c:\recent.exe",
+            "a smaller but currently-active group must outrank a bigger but stale one"
+        );
+        assert_eq!(groups[1].exe_path, r"c:\old.exe");
+    }
+
+    #[test]
+    fn grouping_does_not_key_on_session_id() {
+        let mut first = group_test_event(1, 0, r"c:\a.exe", &[]);
+        first.session_id = 1;
+        let mut second = group_test_event(2, 1_000, r"c:\a.exe", &[]);
+        second.session_id = 2;
+
+        let groups = group_launches(&[first.clone(), second.clone()], false, 500);
+        assert_eq!(
+            groups.len(),
+            1,
+            "distinct session_ids must not split a group -- only exe_path/lineage_sig do"
+        );
+        assert_eq!(groups[0].count, 2);
+        // The occurrences themselves (fetched separately, by this task's
+        // getLaunchOccurrences handler) are untouched and keep their own
+        // distinct session ids -- grouping never overwrites or collapses
+        // that field.
+        assert_ne!(first.session_id, second.session_id);
     }
 }

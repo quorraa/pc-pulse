@@ -621,6 +621,38 @@ impl Storage {
             .map_err(|_| anyhow::anyhow!("database lock poisoned"))?;
         prune_cmdlines(&connection, cutoff_ms)
     }
+
+    /// Locked wrapper over [`load_launch_events`], for the `getLaunchGroups`
+    /// / `getLaunchOccurrences` pipe handlers.
+    pub fn launch_events(&self, from_ms: i64) -> Result<Vec<LaunchEvent>> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow::anyhow!("database lock poisoned"))?;
+        load_launch_events(&connection, from_ms)
+    }
+
+    /// Locked wrapper over [`load_cmdline`]. The returned blob is still
+    /// DPAPI-encrypted; the caller decrypts it per-request and never caches
+    /// the plaintext.
+    pub fn load_launch_cmdline(&self, pid: u32, start_time_ms: i64) -> Result<Option<Vec<u8>>> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow::anyhow!("database lock poisoned"))?;
+        load_cmdline(&connection, pid, start_time_ms)
+    }
+
+    /// Locked wrapper over [`delete_all_cmdlines`], for the `deleteCommandLines`
+    /// pipe handler -- the user-facing "forget every captured command line"
+    /// control.
+    pub fn delete_all_launch_cmdlines(&self) -> Result<usize> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow::anyhow!("database lock poisoned"))?;
+        delete_all_cmdlines(&connection)
+    }
 }
 
 /// Upsert launch events (payload JSON keyed by `(pid, start_time_ms)`), then

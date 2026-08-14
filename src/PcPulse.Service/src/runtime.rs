@@ -275,9 +275,88 @@ impl AppState {
                     self.storage.ratings(limit.min(POLICY_OFFSET_RATINGS))?,
                 )?)
             }
+            PipeRequest::GetLaunchGroups {
+                from_ms,
+                console_hosts_only,
+                limit,
+            } => {
+                let now_ms = Utc::now().timestamp_millis();
+                let from_ms = from_ms.unwrap_or(now_ms - LAUNCH_HISTORY_DEFAULT_WINDOW_MS);
+                let limit = limit
+                    .unwrap_or(GET_LAUNCH_GROUPS_MAX_LIMIT)
+                    .min(GET_LAUNCH_GROUPS_MAX_LIMIT);
+                let events = self.storage.launch_events(from_ms)?;
+                let groups = crate::launches::group_launches(
+                    &events,
+                    console_hosts_only.unwrap_or(false),
+                    limit,
+                );
+                Ok(json!({ "groups": groups }))
+            }
+            PipeRequest::GetLaunchOccurrences {
+                exe_path,
+                lineage_sig,
+                from_ms,
+                limit,
+            } => {
+                let now_ms = Utc::now().timestamp_millis();
+                let from_ms = from_ms.unwrap_or(now_ms - LAUNCH_HISTORY_DEFAULT_WINDOW_MS);
+                let limit = limit
+                    .unwrap_or(GET_LAUNCH_OCCURRENCES_MAX_LIMIT)
+                    .min(GET_LAUNCH_OCCURRENCES_MAX_LIMIT);
+                // `load_launch_events` already orders by start_time_ms DESC
+                // (newest first), so filtering preserves that order.
+                let mut events = self.storage.launch_events(from_ms)?;
+                events.retain(|event| {
+                    event.exe_path == exe_path
+                        && crate::launches::lineage_sig(&event.lineage) == lineage_sig
+                });
+                events.truncate(limit);
+
+                // Privacy: launch_events payloads never carry command lines
+                // (the runtime clears them before save). A command line is
+                // decrypted here, per request, for this response only -- it
+                // is never written back or cached. A decrypt failure (e.g. a
+                // post-reinstall machine-key change) leaves the occurrence's
+                // `command_line` absent rather than failing the whole
+                // request; it is only logged.
+                for event in &mut events {
+                    if let Some(blob) = self
+                        .storage
+                        .load_launch_cmdline(event.pid, event.start_time_ms)?
+                    {
+                        match crate::dpapi::unprotect(&blob) {
+                            Ok(plaintext) => {
+                                event.command_line =
+                                    Some(String::from_utf8_lossy(&plaintext).into_owned());
+                            }
+                            Err(code) => {
+                                eprintln!(
+                                    "failed to decrypt a captured command line for pid {} (start {}): DPAPI error {code:#x}",
+                                    event.pid, event.start_time_ms
+                                );
+                            }
+                        }
+                    }
+                }
+
+                Ok(json!({ "events": events }))
+            }
+            PipeRequest::DeleteCommandLines => {
+                let deleted = self.storage.delete_all_launch_cmdlines()?;
+                Ok(json!({ "deleted": deleted }))
+            }
         }
     }
 }
+
+/// Default lookback window for `getLaunchGroups`/`getLaunchOccurrences` when
+/// the caller omits `fromMs`.
+const LAUNCH_HISTORY_DEFAULT_WINDOW_MS: i64 = 7 * 24 * 3600 * 1000;
+/// Transport-safe cap on `getLaunchGroups`'s `limit`.
+const GET_LAUNCH_GROUPS_MAX_LIMIT: usize = 500;
+/// Transport-safe cap on `getLaunchOccurrences`'s `limit`.
+const GET_LAUNCH_OCCURRENCES_MAX_LIMIT: usize = 1_000;
 
 #[derive(Debug)]
 struct IssuedContext {
@@ -2006,5 +2085,291 @@ mod tests {
             (0..10).map(|i| full_sample_at(0.0, i * 1_000)).collect();
         let light_calibration = build_calibration(&light_window, &baselines);
         assert_eq!(light_calibration.demand, DemandBucket::Light);
+    }
+
+    // -- Launch history pipe commands (Task 8) -------------------------
+
+    #[test]
+    fn launch_history_commands_use_the_pinned_serde_spelling() {
+        let groups = serde_json::to_string(&PipeRequest::GetLaunchGroups {
+            from_ms: None,
+            console_hosts_only: None,
+            limit: None,
+        })
+        .unwrap();
+        assert!(
+            groups.contains("\"command\":\"getLaunchGroups\""),
+            "wire: {groups}"
+        );
+
+        let occurrences = serde_json::to_string(&PipeRequest::GetLaunchOccurrences {
+            exe_path: r"c:\a.exe".into(),
+            lineage_sig: "explorer.exe".into(),
+            from_ms: None,
+            limit: None,
+        })
+        .unwrap();
+        assert!(
+            occurrences.contains("\"command\":\"getLaunchOccurrences\""),
+            "wire: {occurrences}"
+        );
+        assert!(
+            occurrences.contains("\"exe_path\":\"c:\\\\a.exe\""),
+            "wire: {occurrences}"
+        );
+        assert!(
+            occurrences.contains("\"lineage_sig\":\"explorer.exe\""),
+            "wire: {occurrences}"
+        );
+
+        let delete = serde_json::to_string(&PipeRequest::DeleteCommandLines).unwrap();
+        assert!(
+            delete.contains("\"command\":\"deleteCommandLines\""),
+            "wire: {delete}"
+        );
+
+        // Requests parse with only fromMs/consoleHostsOnly/limit omitted too
+        // -- the request-side optional fields the brief pins.
+        let parsed: PipeRequest = serde_json::from_str(r#"{"command":"getLaunchGroups"}"#).unwrap();
+        assert!(matches!(
+            parsed,
+            PipeRequest::GetLaunchGroups {
+                from_ms: None,
+                console_hosts_only: None,
+                limit: None
+            }
+        ));
+    }
+
+    fn launch_event_with_lineage(
+        pid: u32,
+        start_time_ms: i64,
+        exe_path: &str,
+        lineage_names: &[&str],
+    ) -> LaunchEvent {
+        let mut event = launch_event(pid, start_time_ms);
+        event.exe_path = exe_path.to_string();
+        event.exe_name = exe_path.rsplit(['\\', '/']).next().unwrap().to_string();
+        event.console_host = crate::launches::is_console_host(&event.exe_name);
+        event.lineage = lineage_names
+            .iter()
+            .enumerate()
+            .map(|(index, name)| crate::models::LineageEntry {
+                pid: 900 + index as u32,
+                name: name.to_string(),
+                path: None,
+            })
+            .collect();
+        event.window_state = crate::models::WindowState::NeverWindowed;
+        event.stop_time_ms = Some(start_time_ms + 500);
+        event
+    }
+
+    #[test]
+    fn get_launch_groups_serves_grouped_stored_events() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = test_state(&directory);
+        let now_ms = Utc::now().timestamp_millis();
+
+        let events = vec![
+            launch_event_with_lineage(1, now_ms - 1_000, r"c:\a.exe", &["explorer.exe"]),
+            launch_event_with_lineage(2, now_ms - 500, r"c:\a.exe", &["explorer.exe"]),
+            launch_event_with_lineage(3, now_ms, r"c:\b.exe", &["cmd.exe"]),
+        ];
+        state.storage.save_launches(&events).unwrap();
+
+        let response = state.handle(PipeRequest::GetLaunchGroups {
+            from_ms: None,
+            console_hosts_only: None,
+            limit: None,
+        });
+        let data = match response {
+            PipeResponse::Ok { data } => data,
+            PipeResponse::Error { code, message } => {
+                panic!("getLaunchGroups failed: {code} {message}")
+            }
+        };
+        let groups: Vec<crate::launches::LaunchGroup> =
+            serde_json::from_value(data["groups"].clone()).unwrap();
+        assert_eq!(groups.len(), 2);
+        let a_group = groups.iter().find(|g| g.exe_path == r"c:\a.exe").unwrap();
+        assert_eq!(a_group.count, 2);
+        assert_eq!(a_group.lineage_sig, "explorer.exe");
+    }
+
+    #[test]
+    fn get_launch_groups_console_hosts_only_filters() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = test_state(&directory);
+        let now_ms = Utc::now().timestamp_millis();
+
+        let events = vec![
+            launch_event_with_lineage(1, now_ms, r"c:\windows\system32\cmd.exe", &[]),
+            launch_event_with_lineage(2, now_ms, r"c:\a.exe", &[]),
+        ];
+        state.storage.save_launches(&events).unwrap();
+
+        let response = state.handle(PipeRequest::GetLaunchGroups {
+            from_ms: None,
+            console_hosts_only: Some(true),
+            limit: None,
+        });
+        let data = match response {
+            PipeResponse::Ok { data } => data,
+            PipeResponse::Error { code, message } => {
+                panic!("getLaunchGroups failed: {code} {message}")
+            }
+        };
+        let groups: Vec<crate::launches::LaunchGroup> =
+            serde_json::from_value(data["groups"].clone()).unwrap();
+        assert_eq!(groups.len(), 1);
+        assert!(groups[0].console_host);
+    }
+
+    #[test]
+    fn get_launch_groups_limit_is_clamped_to_the_transport_bound() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = test_state(&directory);
+        let response = state.handle(PipeRequest::GetLaunchGroups {
+            from_ms: None,
+            console_hosts_only: None,
+            limit: Some(1_000_000),
+        });
+        // Nothing is stored, so the clamp itself can only be verified by
+        // reading the code path succeeding without error for an absurd ask
+        // -- the exhaustive over-cap behavior is covered at the
+        // `group_launches` unit level (`limit_truncates_after_sorting_not_before`).
+        match response {
+            PipeResponse::Ok { .. } => {}
+            PipeResponse::Error { code, message } => {
+                panic!("getLaunchGroups failed: {code} {message}")
+            }
+        }
+    }
+
+    #[test]
+    fn get_launch_occurrences_returns_only_the_matching_group_newest_first() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = test_state(&directory);
+        let now_ms = Utc::now().timestamp_millis();
+
+        let events = vec![
+            launch_event_with_lineage(1, now_ms - 2_000, r"c:\a.exe", &["explorer.exe"]),
+            launch_event_with_lineage(2, now_ms - 1_000, r"c:\a.exe", &["explorer.exe"]),
+            // Different lineage under the same exe: must not appear.
+            launch_event_with_lineage(3, now_ms, r"c:\a.exe", &["cmd.exe"]),
+            // Different exe entirely: must not appear.
+            launch_event_with_lineage(4, now_ms, r"c:\b.exe", &["explorer.exe"]),
+        ];
+        state.storage.save_launches(&events).unwrap();
+
+        let response = state.handle(PipeRequest::GetLaunchOccurrences {
+            exe_path: r"c:\a.exe".into(),
+            lineage_sig: "explorer.exe".into(),
+            from_ms: None,
+            limit: None,
+        });
+        let data = match response {
+            PipeResponse::Ok { data } => data,
+            PipeResponse::Error { code, message } => {
+                panic!("getLaunchOccurrences failed: {code} {message}")
+            }
+        };
+        let events: Vec<LaunchEvent> = serde_json::from_value(data["events"].clone()).unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].pid, 2, "newest first");
+        assert_eq!(events[1].pid, 1);
+    }
+
+    #[test]
+    fn get_launch_occurrences_populates_command_line_from_the_encrypted_store() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = test_state(&directory);
+        let now_ms = Utc::now().timestamp_millis();
+
+        let event = launch_event_with_lineage(1, now_ms, r"c:\a.exe", &[]);
+        state.storage.save_launches(&[event.clone()]).unwrap();
+        let blob = crate::dpapi::protect(b"c:\\a.exe --flag").unwrap();
+        state
+            .storage
+            .save_launch_cmdline(event.pid, event.start_time_ms, now_ms, &blob)
+            .unwrap();
+
+        let response = state.handle(PipeRequest::GetLaunchOccurrences {
+            exe_path: r"c:\a.exe".into(),
+            lineage_sig: String::new(),
+            from_ms: None,
+            limit: None,
+        });
+        let data = match response {
+            PipeResponse::Ok { data } => data,
+            PipeResponse::Error { code, message } => {
+                panic!("getLaunchOccurrences failed: {code} {message}")
+            }
+        };
+        let events: Vec<LaunchEvent> = serde_json::from_value(data["events"].clone()).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].command_line.as_deref(), Some("c:\\a.exe --flag"));
+    }
+
+    #[test]
+    fn get_launch_occurrences_without_a_captured_command_line_leaves_it_absent() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = test_state(&directory);
+        let now_ms = Utc::now().timestamp_millis();
+
+        let event = launch_event_with_lineage(1, now_ms, r"c:\a.exe", &[]);
+        state.storage.save_launches(&[event]).unwrap();
+
+        let response = state.handle(PipeRequest::GetLaunchOccurrences {
+            exe_path: r"c:\a.exe".into(),
+            lineage_sig: String::new(),
+            from_ms: None,
+            limit: None,
+        });
+        let data = match response {
+            PipeResponse::Ok { data } => data,
+            PipeResponse::Error { code, message } => {
+                panic!("getLaunchOccurrences failed: {code} {message}")
+            }
+        };
+        let events: Vec<LaunchEvent> = serde_json::from_value(data["events"].clone()).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].command_line, None);
+    }
+
+    #[test]
+    fn delete_command_lines_removes_captured_blobs_but_leaves_launch_events_intact() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = test_state(&directory);
+        let now_ms = Utc::now().timestamp_millis();
+
+        let event = launch_event_with_lineage(1, now_ms, r"c:\a.exe", &[]);
+        state.storage.save_launches(&[event.clone()]).unwrap();
+        let blob = crate::dpapi::protect(b"c:\\a.exe --flag").unwrap();
+        state
+            .storage
+            .save_launch_cmdline(event.pid, event.start_time_ms, now_ms, &blob)
+            .unwrap();
+
+        let response = state.handle(PipeRequest::DeleteCommandLines);
+        let deleted = match response {
+            PipeResponse::Ok { data } => data["deleted"].as_u64().unwrap(),
+            PipeResponse::Error { code, message } => {
+                panic!("deleteCommandLines failed: {code} {message}")
+            }
+        };
+        assert_eq!(deleted, 1);
+        assert_eq!(
+            state
+                .storage
+                .load_launch_cmdline(event.pid, event.start_time_ms)
+                .unwrap(),
+            None
+        );
+        // The launch_events row is untouched: they never carried a command
+        // line in the first place.
+        let events = state.storage.launch_events(0).unwrap();
+        assert_eq!(events.len(), 1);
     }
 }
