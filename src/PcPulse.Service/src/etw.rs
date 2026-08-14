@@ -248,12 +248,12 @@ impl EtwCollector {
     /// Issues one `EVENT_TRACE_CONTROL_QUERY` and returns the session's
     /// `EventsLost`, or the failing status.
     ///
-    /// Uses [`query_property_buffer`] rather than the stop path's buffer:
+    /// Uses [`control_property_buffer`] rather than the start path's buffer:
     /// on QUERY, ETW writes the logger name *and* the log file name back into
     /// the caller's buffer, so it must carry room for both regardless of how
     /// short the session name is.
     fn query_events_lost(&self) -> Result<u32, WIN32_ERROR> {
-        let mut properties = query_property_buffer(&self.session_name);
+        let mut properties = control_property_buffer(&self.session_name);
         let properties_ptr = properties.as_mut_ptr().cast::<EVENT_TRACE_PROPERTIES>();
         let status = unsafe {
             ControlTraceW(
@@ -333,13 +333,15 @@ impl EtwCollector {
 
 impl Drop for EtwCollector {
     fn drop(&mut self) {
-        let mut properties = property_buffer(&self.session_name);
-        unsafe {
-            let _ = ControlTraceW(
-                self.control_handle,
-                PCWSTR(self.session_name.as_ptr()),
-                properties.as_mut_ptr().cast::<EVENT_TRACE_PROPERTIES>(),
-                EVENT_TRACE_CONTROL_STOP,
+        // Correctly sized for a control operation (see
+        // `control_property_buffer`); a stop that fails here is what leaves
+        // the orphan the next start has to reclaim.
+        let status = stop_session(self.control_handle, &self.session_name);
+        if status != ERROR_SUCCESS {
+            eprintln!(
+                "stopping the ETW session returned 0x{:08x}; it may be left running until \
+                 the next start reclaims it",
+                status.0
             );
         }
         if let Some(worker) = self.worker.take() {
@@ -367,18 +369,33 @@ fn classify_start_status(status: WIN32_ERROR) -> StartOutcome {
     }
 }
 
-/// Stops a session by name. Used both for teardown-on-failure and for
-/// reclaiming an orphan; a name-based stop needs no handle, which is exactly
-/// why an orphan from a previous process can be stopped at all.
-fn stop_session_by_name(name: &[u16]) {
-    let mut properties = property_buffer(name);
+/// Stops a session by name, returning the status. Used both for
+/// teardown-on-failure and for reclaiming an orphan; a name-based stop needs
+/// no handle, which is exactly why an orphan left by a *previous process* can
+/// be stopped at all.
+///
+/// The status is returned rather than swallowed because the reclaim path has
+/// to be able to tell "the stale session would not stop" (a privilege
+/// problem, say) from "it stopped and the restart still failed" -- the two
+/// call for completely different operator action, and a discarded status
+/// makes them read identically.
+fn stop_session_by_name(name: &[u16]) -> WIN32_ERROR {
+    stop_session(CONTROLTRACE_HANDLE::default(), name)
+}
+
+/// Stops a session, preferring `handle` when the caller owns one (a zeroed
+/// handle falls back to the name). Owners pass their handle so the stop can
+/// only ever hit the session they started, never a same-named session that
+/// something else has since created.
+fn stop_session(handle: CONTROLTRACE_HANDLE, name: &[u16]) -> WIN32_ERROR {
+    let mut properties = control_property_buffer(name);
     unsafe {
-        let _ = ControlTraceW(
-            CONTROLTRACE_HANDLE::default(),
+        ControlTraceW(
+            handle,
             PCWSTR(name.as_ptr()),
             properties.as_mut_ptr().cast::<EVENT_TRACE_PROPERTIES>(),
             EVENT_TRACE_CONTROL_STOP,
-        );
+        )
     }
 }
 
@@ -416,11 +433,12 @@ fn start_trace_reclaiming_stale(
         StartOutcome::ReclaimStale => {}
     }
 
+    let stop_status = stop_session_by_name(name);
     eprintln!(
-        "reclaiming an orphaned ETW session left by a previous run \
-         (its name was already in use)"
+        "reclaiming an orphaned ETW session left by a previous run (its name was already \
+         in use); stop returned 0x{:08x}",
+        stop_status.0
     );
-    stop_session_by_name(name);
     let mut buffer = properties(name);
     let mut control = CONTROLTRACE_HANDLE::default();
     let status = unsafe {
@@ -431,10 +449,15 @@ fn start_trace_reclaiming_stale(
         )
     };
     if status != ERROR_SUCCESS {
+        // Both statuses, because they say different things: a failed stop
+        // means the orphan is still there (and why), while a successful stop
+        // followed by a failed start means something else took the name or
+        // the session could not be created at all.
         bail!(
-            "StartTraceW failed with status 0x{:08x} after stopping a stale session of the \
-             same name",
-            status.0
+            "StartTraceW failed with status 0x{:08x} after attempting to stop a stale session \
+             of the same name (stop returned 0x{:08x})",
+            status.0,
+            stop_status.0
         );
     }
     Ok(control)
@@ -462,10 +485,11 @@ fn run_trace(
         )
     };
     if enable_status != ERROR_SUCCESS {
-        stop_session_by_name(name);
+        let stop_status = stop_session_by_name(name);
         bail!(
-            "EnableTraceEx2 failed with status 0x{:08x}",
-            enable_status.0
+            "EnableTraceEx2 failed with status 0x{:08x} (teardown stop returned 0x{:08x})",
+            enable_status.0,
+            stop_status.0
         );
     }
 
@@ -486,8 +510,11 @@ fn run_trace(
         unsafe {
             drop(Arc::from_raw(context.cast::<CallbackState>()));
         }
-        stop_session_by_name(name);
-        bail!("OpenTraceW failed");
+        let stop_status = stop_session_by_name(name);
+        bail!(
+            "OpenTraceW failed (teardown stop returned 0x{:08x})",
+            stop_status.0
+        );
     }
     // ProcessTrace owns the callback context until the processing handle is closed.
     // Reconstructing the Arc after ProcessTrace is not safe from this function, so the
@@ -573,18 +600,20 @@ fn property_buffer(name: &[u16]) -> Vec<u64> {
     buffer
 }
 
-/// Buffer for `ControlTraceW` operations that *read* session state back
-/// (`EVENT_TRACE_CONTROL_QUERY`).
+/// Buffer for every `ControlTraceW` operation — `EVENT_TRACE_CONTROL_QUERY`
+/// *and* `EVENT_TRACE_CONTROL_STOP`.
 ///
-/// Unlike the stop path, a query makes ETW write both the logger name and the
-/// log file name into the caller's buffer, so the canonical sizing is the
-/// struct plus two `MAX_SESSION_NAME_CHARS`-style 1024-WCHAR slots with
-/// `LoggerNameOffset` and `LogFileNameOffset` pointing at them. Sizing this
-/// buffer as `struct + session-name bytes` (what [`property_buffer`] does,
-/// correctly, for stop) leaves no room for the names ETW writes back:
-/// `ControlTraceW` would either reject the call with `ERROR_BAD_LENGTH` —
-/// leaving `etw_events_lost` permanently zero — or write past the allocation.
-fn query_property_buffer(name: &[u16]) -> Vec<u64> {
+/// Both control codes make ETW write the session's properties back into the
+/// caller's buffer, including the logger name and the log file name, so the
+/// canonical sizing is the struct plus two `MAX_SESSION_NAME_CHARS`-style
+/// 1024-WCHAR slots with `LoggerNameOffset` and `LogFileNameOffset` pointing
+/// at them. Sizing a control buffer as `struct + session-name bytes` (what
+/// [`property_buffer`] does, correctly, for *starting* a session) leaves no
+/// room for the names ETW writes back: `ControlTraceW` would either reject
+/// the call with `ERROR_BAD_LENGTH` — a query leaving `etw_events_lost`
+/// permanently zero, a stop leaving an orphaned session unreclaimed — or
+/// write past the allocation.
+fn control_property_buffer(name: &[u16]) -> Vec<u64> {
     let property_bytes = size_of::<EVENT_TRACE_PROPERTIES>();
     let name_slot_bytes = QUERY_NAME_SLOT_CHARS * size_of::<u16>();
     let total_bytes = property_bytes + 2 * name_slot_bytes;
@@ -595,7 +624,7 @@ fn query_property_buffer(name: &[u16]) -> Vec<u64> {
     properties.LoggerNameOffset = property_bytes as u32;
     properties.LogFileNameOffset = (property_bytes + name_slot_bytes) as u32;
     // Copy the session name into its slot, truncating rather than overflowing
-    // if it somehow exceeds the slot (it cannot: the name is "PcPulse-<pid>").
+    // if it somehow exceeds the slot (it cannot: the names are constants).
     let name_bytes = std::mem::size_of_val(name).min(name_slot_bytes);
     unsafe {
         ptr::copy_nonoverlapping(
@@ -754,13 +783,15 @@ impl CmdlineCollector {
 
 impl Drop for CmdlineCollector {
     fn drop(&mut self) {
-        let mut properties = property_buffer(&self.session_name);
-        unsafe {
-            let _ = ControlTraceW(
-                self.control_handle,
-                PCWSTR(self.session_name.as_ptr()),
-                properties.as_mut_ptr().cast::<EVENT_TRACE_PROPERTIES>(),
-                EVENT_TRACE_CONTROL_STOP,
+        // A failed stop here costs one of the machine's eight system-logger
+        // slots until the next start reclaims the name, so it is said out
+        // loud rather than discarded.
+        let status = stop_session(self.control_handle, &self.session_name);
+        if status != ERROR_SUCCESS {
+            eprintln!(
+                "stopping the command-line ETW session returned 0x{:08x}; it may be left \
+                 holding a system-logger slot until the next start reclaims it",
+                status.0
             );
         }
         if let Some(worker) = self.worker.take() {
@@ -803,8 +834,11 @@ fn run_cmdline_trace(
         unsafe {
             drop(Arc::from_raw(context.cast::<CmdlineCallbackState>()));
         }
-        stop_session_by_name(name);
-        bail!("OpenTraceW failed for the command-line session");
+        let stop_status = stop_session_by_name(name);
+        bail!(
+            "OpenTraceW failed for the command-line session (teardown stop returned 0x{:08x})",
+            stop_status.0
+        );
     }
     Ok((control, processing, context.cast::<CmdlineCallbackState>()))
 }
@@ -879,10 +913,24 @@ fn system_property_buffer(name: &[u16]) -> Vec<u64> {
 }
 
 /// What this module needs out of a classic `Process_TypeGroup1` payload.
-#[derive(Debug, PartialEq)]
+///
+/// Like [`CapturedCmdline`], `Debug` elides the command line: it is still raw
+/// and unredacted at this point, and a derived `Debug` is exactly how such a
+/// line ends up in a log or a panic message.
+#[derive(PartialEq)]
 struct MofProcessStart {
     pid: u32,
     command_line: String,
+}
+
+impl std::fmt::Debug for MofProcessStart {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("MofProcessStart")
+            .field("pid", &self.pid)
+            .field("command_line", &"‹elided›")
+            .finish()
+    }
 }
 
 /// Parses a classic MOF `Process_TypeGroup1` start payload.
@@ -1033,9 +1081,12 @@ mod tests {
     }
 
     #[test]
-    fn query_buffer_reserves_room_for_both_names_etw_writes_back() {
+    fn control_buffer_reserves_room_for_both_names_etw_writes_back() {
+        // Both control codes this buffer serves -- QUERY and STOP -- make ETW
+        // write the names back, so an under-sized buffer breaks the
+        // events-lost query *and* the stale-session stop.
         let name: Vec<u16> = "PcPulse-1234".encode_utf16().chain(Some(0)).collect();
-        let mut buffer = query_property_buffer(&name);
+        let mut buffer = control_property_buffer(&name);
         let struct_bytes = size_of::<EVENT_TRACE_PROPERTIES>();
         let slot_bytes = QUERY_NAME_SLOT_CHARS * size_of::<u16>();
         let properties = unsafe { &*buffer.as_mut_ptr().cast::<EVENT_TRACE_PROPERTIES>() };

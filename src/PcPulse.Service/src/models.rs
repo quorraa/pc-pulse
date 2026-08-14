@@ -1121,6 +1121,8 @@ mod tests {
             launch_capture: LaunchCaptureStatus {
                 starts_seen: 12,
                 cmdline_session_active: true,
+                cmdlines_unmatched_evicted: 3,
+                cmdlines_persist_failures: 1,
                 ..LaunchCaptureStatus::default()
             },
             ..Snapshot::default()
@@ -1128,6 +1130,9 @@ mod tests {
         let json = serde_json::to_string(&snapshot).unwrap();
         assert!(json.contains("\"launchCapture\""), "{json}");
         assert!(json.contains("\"cmdlineSessionActive\":true"), "{json}");
+        // Clients render these two as loss; the wire names are the contract.
+        assert!(json.contains("\"cmdlinesUnmatchedEvicted\":3"), "{json}");
+        assert!(json.contains("\"cmdlinesPersistFailures\":1"), "{json}");
 
         // A snapshot from a service that predates launch history has no such
         // field and must still deserialize.
