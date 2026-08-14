@@ -98,6 +98,17 @@ pub const RATING_RECORDED_STATUS: &str = "rating recorded — thanks";
 /// The detail pane makes the same point in its own words; this is the
 /// keystroke's own acknowledgement that it was heard and had no target.
 pub const LAUNCH_EXITED_STATUS: &str = "that launch has exited — showing its recorded lineage";
+/// The same refusal when a live process *does* hold the pid but its start
+/// time does not match. Worded to agree with the detail pane's pinned
+/// sentence: the two are describing one fact, and a status line claiming
+/// "exited" over a pane saying "cannot be confirmed" is the console
+/// contradicting itself.
+pub const LAUNCH_UNCONFIRMED_STATUS: &str =
+    "that pid is in use — this launch's identity cannot be confirmed";
+/// ...and when there is no occurrence to judge yet, because the drill-down
+/// is still settling or in flight. Saying "exited" here would be a verdict
+/// on a record that has not been read.
+pub const LAUNCH_LOADING_STATUS: &str = "still loading launch details";
 /// Said out loud when a HUNT jump drops the operator's own process filter
 /// to reach the row it promised: a filter that disappears without a word
 /// reads as a bug.
@@ -2296,15 +2307,13 @@ impl App {
             KeyCode::Enter | KeyCode::Char('h') if self.page == Page::Launches => {
                 self.flush_launch_fetch();
                 if !self.jump_to_live_launch(Page::Processes) {
-                    self.status = LAUNCH_EXITED_STATUS.into();
-                    self.status_is_error = false;
+                    self.report_refused_launch_jump();
                 }
             }
             KeyCode::Char('l') if self.page == Page::Launches => {
                 self.flush_launch_fetch();
                 if !self.jump_to_live_launch(Page::Tree) {
-                    self.status = LAUNCH_EXITED_STATUS.into();
-                    self.status_is_error = false;
+                    self.report_refused_launch_jump();
                 }
             }
             KeyCode::Char('a') if self.page == Page::Alerts => self.acknowledge_selected(),
@@ -2931,6 +2940,35 @@ impl App {
         (self.launch_liveness()? == LaunchLiveness::Live)
             .then(|| self.selected_launch_occurrence().map(|event| event.pid))
             .flatten()
+    }
+
+    /// Say why a jump went nowhere — in the same terms the detail pane is
+    /// using at that moment.
+    ///
+    /// A single "has exited" line for every refusal was a contradiction the
+    /// operator could see: the pane would be saying "identity cannot be
+    /// confirmed" about a process that is demonstrably running, or showing
+    /// nothing at all because the drill-down had not loaded, while the
+    /// status line pronounced the launch dead. Each refusal now reports its
+    /// own reason, and the one case with nothing to report — no snapshot to
+    /// judge against — leaves the status line alone rather than inventing a
+    /// verdict.
+    fn report_refused_launch_jump(&mut self) {
+        let reason = if self.selected_launch_occurrence().is_none() {
+            Some(LAUNCH_LOADING_STATUS)
+        } else {
+            match self.launch_liveness() {
+                Some(LaunchLiveness::Exited) => Some(LAUNCH_EXITED_STATUS),
+                Some(LaunchLiveness::PidInUse) => Some(LAUNCH_UNCONFIRMED_STATUS),
+                // `Live` never refuses a jump, and `None` here means there
+                // is no snapshot to check against.
+                Some(LaunchLiveness::Live) | None => None,
+            }
+        };
+        if let Some(reason) = reason {
+            self.status = reason.into();
+            self.status_is_error = false;
+        }
     }
 
     /// `Enter`/`h` (HUNT) and `l` (LINEAGE): follow a launch that is still
@@ -7798,12 +7836,114 @@ mod tests {
         app.launch_occurrence_state.select(Some(0));
 
         assert_eq!(app.live_launch_pid(), None);
+        for key in [KeyCode::Enter, KeyCode::Char('h'), KeyCode::Char('l')] {
+            app.status = "sentinel".into();
+            app.handle_key(KeyEvent::new(key, KeyModifiers::NONE));
+            assert_eq!(app.page, Page::Launches);
+            // A live process holds the pid, so "has exited" would flatly
+            // contradict the pane, which says the identity is unconfirmed.
+            assert_eq!(app.status, LAUNCH_UNCONFIRMED_STATUS, "{key:?}");
+        }
+    }
+
+    #[test]
+    fn a_jump_before_the_drill_down_loads_never_declares_the_launch_dead() {
+        let mut app = App::new_inert();
+        app.snapshot = Some(snapshot_with_live_process(4242, 1_800_000_000_000));
+        app.page = Page::Launches;
+        app.launch_groups = vec![launch_group(
+            r"c:\windows\system32\notepad.exe",
+            "explorer.exe",
+            1,
+        )];
+        app.launch_state.select(Some(0));
+        // The settle window has not elapsed, or the reply is still in
+        // flight: there is no record to pronounce on.
+        assert!(app.launch_occurrences.is_empty());
+
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(app.page, Page::Launches);
-        app.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE));
-        assert_eq!(app.page, Page::Launches);
+        assert_eq!(app.status, LAUNCH_LOADING_STATUS);
+
+        // ...and with no snapshot to judge against, the jump says nothing
+        // at all rather than picking a verdict.
+        app.launch_occurrences = vec![launch_occurrence(4242, 1_800_000_000_000)];
+        app.launch_occurrence_state.select(Some(0));
+        app.snapshot = None;
+        app.status = "sentinel".into();
         app.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE));
         assert_eq!(app.page, Page::Launches);
+        assert_eq!(app.status, "sentinel");
+    }
+
+    #[test]
+    fn an_exited_launch_still_reports_that_it_exited() {
+        let mut app = App::new_inert();
+        // Nothing in the snapshot wears the pid at all.
+        app.snapshot = Some(snapshot_with_live_process(111, 1_800_000_000_000));
+        app.page = Page::Launches;
+        app.launch_groups = vec![launch_group(
+            r"c:\windows\system32\notepad.exe",
+            "explorer.exe",
+            1,
+        )];
+        app.launch_state.select(Some(0));
+        app.launch_occurrences = vec![launch_occurrence(65_001, 1_800_000_000_000)];
+        app.launch_occurrence_state.select(Some(0));
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.page, Page::Launches);
+        assert_eq!(app.status, LAUNCH_EXITED_STATUS);
+    }
+
+    #[test]
+    fn a_hunt_jump_says_so_when_it_clears_the_operators_filter() {
+        let mut app = App::new_inert();
+        app.snapshot = Some(snapshot_with_live_process(4242, 1_800_000_000_000));
+        app.page = Page::Launches;
+        app.launch_groups = vec![launch_group(
+            r"c:\windows\system32\notepad.exe",
+            "explorer.exe",
+            1,
+        )];
+        app.launch_state.select(Some(0));
+        app.launch_occurrences = vec![launch_occurrence(4242, 1_800_000_000_000)];
+        app.launch_occurrence_state.select(Some(0));
+        // A filter that hides the very row the jump promises to land on.
+        app.process_filter = "chrome".into();
+        app.status = "sentinel".into();
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.page, Page::Processes);
+        assert_eq!(app.selected_process().map(|p| p.pid), Some(4242));
+        assert!(app.process_filter.is_empty());
+        assert_eq!(app.status, LAUNCH_JUMP_FILTER_CLEARED);
+        assert!(!app.status_is_error);
+    }
+
+    #[test]
+    fn a_hunt_jump_that_hid_nothing_leaves_the_status_line_alone() {
+        let mut app = App::new_inert();
+        app.snapshot = Some(snapshot_with_live_process(4242, 1_800_000_000_000));
+        app.page = Page::Launches;
+        app.launch_groups = vec![launch_group(
+            r"c:\windows\system32\notepad.exe",
+            "explorer.exe",
+            1,
+        )];
+        app.launch_state.select(Some(0));
+        app.launch_occurrences = vec![launch_occurrence(4242, 1_800_000_000_000)];
+        app.launch_occurrence_state.select(Some(0));
+        // A filter is set, but the target row matches it: nothing was
+        // taken away, so there is nothing to announce.
+        app.process_filter = "notepad".into();
+        app.status = "sentinel".into();
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.page, Page::Processes);
+        assert_eq!(app.selected_process().map(|p| p.pid), Some(4242));
+        assert_eq!(app.process_filter, "notepad");
+        assert_eq!(app.status, "sentinel");
     }
 
     #[test]
