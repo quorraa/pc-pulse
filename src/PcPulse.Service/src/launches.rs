@@ -32,7 +32,7 @@ pub fn normalize_image_path(raw: &str, device_map: &[(String, String)]) -> (Stri
 
     let best = device_map
         .iter()
-        .filter(|(device, _)| lower.starts_with(device.as_str()))
+        .filter(|(device, _)| device_prefix_matches(&lower, device))
         .max_by_key(|(device, _)| device.len());
 
     match best {
@@ -42,6 +42,17 @@ pub fn normalize_image_path(raw: &str, device_map: &[(String, String)]) -> (Stri
         }
         None => (lower, false),
     }
+}
+
+/// Whether `lower` (already lowercased) begins with `device` at a
+/// path-component boundary: the prefix must be followed by a path separator
+/// (`\` or `/`) or nothing at all. A plain `starts_with` would let
+/// `\device\harddiskvolume1` wrongly match `\device\harddiskvolume10\...`
+/// since one device path can be a numeric prefix of another.
+fn device_prefix_matches(lower: &str, device: &str) -> bool {
+    lower
+        .strip_prefix(device)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with(['\\', '/']))
 }
 
 /// Builds a live `\Device\HarddiskVolumeN` -> drive-letter map by calling
@@ -99,6 +110,37 @@ mod tests {
             normalize_image_path(r"\Device\HarddiskVolume4\Windows\System32\CMD.EXE", &map);
         assert_eq!(p, r"c:\windows\system32\cmd.exe");
         assert!(mapped);
+    }
+
+    #[test]
+    fn numeric_prefix_volume_is_not_falsely_matched() {
+        let map = vec![(r"\device\harddiskvolume1".to_string(), "c:".to_string())];
+        let (p, mapped) = normalize_image_path(r"\Device\HarddiskVolume10\x.exe", &map);
+        assert_eq!(p, r"\device\harddiskvolume10\x.exe");
+        assert!(!mapped);
+    }
+
+    #[test]
+    fn exact_equality_prefix_still_maps() {
+        let map = vec![(r"\device\harddiskvolume1".to_string(), "c:".to_string())];
+        let (p, mapped) = normalize_image_path(r"\Device\HarddiskVolume1", &map);
+        assert_eq!(p, "c:");
+        assert!(mapped);
+    }
+
+    #[test]
+    fn volume_and_its_numeric_extension_each_map_to_own_drive() {
+        let map = vec![
+            (r"\device\harddiskvolume1".to_string(), "c:".to_string()),
+            (r"\device\harddiskvolume10".to_string(), "d:".to_string()),
+        ];
+        let (p1, mapped1) = normalize_image_path(r"\Device\HarddiskVolume1\a.exe", &map);
+        assert_eq!(p1, r"c:\a.exe");
+        assert!(mapped1);
+
+        let (p10, mapped10) = normalize_image_path(r"\Device\HarddiskVolume10\b.exe", &map);
+        assert_eq!(p10, r"d:\b.exe");
+        assert!(mapped10);
     }
 
     #[test]
