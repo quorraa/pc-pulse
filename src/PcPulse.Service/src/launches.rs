@@ -447,7 +447,22 @@ impl LaunchTracker {
             })
     }
 
-    pub fn on_stop(&mut self, p: ProcessStopProps, now_ms: i64) {
+    /// Closes the pending launch matching `p.pid`, stamping it with the stop
+    /// *event's* own time (`p.stop_time_ms`).
+    ///
+    /// Deliberately takes no wall clock: it used to be handed the sampling
+    /// tick's `Utc::now()`, which stamped every exit with when we happened
+    /// to drain the ETW queue rather than when the process died. The kernel
+    /// session flushes on a 1s timer and the loop drains on its own
+    /// interval, so a 300ms popup was recorded as living for seconds --
+    /// durations measured our delivery latency, not the process. Sourcing
+    /// the stamp from the event alone makes that regression unrepresentable
+    /// rather than merely fixed at the one call site.
+    ///
+    /// Note this is only the *recorded* clock domain: `drain_flushable` and
+    /// the staleness eviction still run on wall-clock time, since those are
+    /// decisions about our own bookkeeping, not about the process.
+    pub fn on_stop(&mut self, p: ProcessStopProps) {
         self.stops_seen += 1;
 
         let matched = self.pid_index.get(&p.pid).copied().and_then(|start_ms| {
@@ -461,7 +476,7 @@ impl LaunchTracker {
             return;
         };
 
-        launch.stop_time_ms = Some(now_ms);
+        launch.stop_time_ms = Some(p.stop_time_ms);
         launch.exit_code = Some(p.exit_code);
         launch.window_state = if launch.visible {
             WindowState::Windowed
@@ -1002,6 +1017,16 @@ mod tests {
             image_name: img.to_string(),
         }
     }
+    /// `at_ms` is the stop *event's* own timestamp -- what the ETW record
+    /// header carried -- which is exactly what lands on the row. The tracker
+    /// has no other clock for it, by design.
+    fn stop(pid: u32, exit_code: u32, at_ms: i64) -> ProcessStopProps {
+        ProcessStopProps {
+            pid,
+            exit_code,
+            stop_time_ms: at_ms,
+        }
+    }
     fn no_live(_: u32) -> Option<LiveProcessInfo> {
         None
     }
@@ -1013,37 +1038,48 @@ mod tests {
             start(500, 4, 1_000, r"\Device\HarddiskVolume4\x\popup.exe"),
             &no_live,
         );
-        tr.on_stop(
-            ProcessStopProps {
-                pid: 500,
-                exit_code: 1,
-            },
-            1_300,
-        );
+        tr.on_stop(stop(500, 1, 1_300));
         let ev = &tr.drain_flushable(2_000)[0];
         assert_eq!(ev.stop_time_ms, Some(1_300));
         assert_eq!(ev.exit_code, Some(1));
         assert_eq!(ev.window_state, WindowState::Unobserved);
     }
+
+    #[test]
+    fn sub_second_lifetime_survives_seconds_of_delivery_latency() {
+        // The marquee case: a 300ms popup whose stop event only reaches us
+        // seconds after the fact (kernel FlushTimer + the sampling
+        // interval). The delivery is late in every way the tracker could
+        // possibly notice -- `on_stop` is called long after the exit and the
+        // drain happens later still -- yet the recorded lifetime must be the
+        // process's 300ms, not the multi-second round trip. Before the stop
+        // stamp moved to the event's own header timestamp this recorded
+        // ~4_700ms of pure delivery latency.
+        let mut tr = LaunchTracker::new_for_test(Vec::new());
+        tr.on_start(
+            start(500, 4, 1_000, r"\Device\HarddiskVolume4\x\popup.exe"),
+            &no_live,
+        );
+        // Event time 1_300 (300ms after start); everything downstream of it
+        // is seconds later.
+        tr.on_stop(stop(500, 0, 1_300));
+        let ev = &tr.drain_flushable(6_000)[0];
+        let duration_ms = ev.stop_time_ms.unwrap() - ev.start_time_ms;
+        assert_eq!(duration_ms, 300);
+        assert!(
+            duration_ms < 1_000,
+            "sub-second lifetime reported as {duration_ms}ms -- that is delivery latency, \
+             not a process lifetime"
+        );
+    }
+
     #[test]
     fn pid_reuse_produces_distinct_rows_with_correct_stop_matching() {
         let mut tr = LaunchTracker::new_for_test(Vec::new());
         tr.on_start(start(500, 4, 1_000, r"c:\a.exe"), &no_live);
-        tr.on_stop(
-            ProcessStopProps {
-                pid: 500,
-                exit_code: 0,
-            },
-            2_000,
-        );
+        tr.on_stop(stop(500, 0, 2_000));
         tr.on_start(start(500, 4, 3_000, r"c:\b.exe"), &no_live);
-        tr.on_stop(
-            ProcessStopProps {
-                pid: 500,
-                exit_code: 7,
-            },
-            4_000,
-        );
+        tr.on_stop(stop(500, 7, 4_000));
         let evs = tr.drain_flushable(5_000);
         assert_eq!(evs.len(), 2);
         assert!(
@@ -1070,13 +1106,7 @@ mod tests {
     #[test]
     fn orphan_stop_counts_and_creates_no_row() {
         let mut tr = LaunchTracker::new_for_test(Vec::new());
-        tr.on_stop(
-            ProcessStopProps {
-                pid: 999,
-                exit_code: 0,
-            },
-            1_000,
-        );
+        tr.on_stop(stop(999, 0, 1_000));
         assert!(tr.drain_flushable(2_000).is_empty());
         assert_eq!(tr.status().orphan_stops, 1);
     }
@@ -1087,20 +1117,8 @@ mod tests {
         tr.on_start(start(2, 4, 0, r"c:\bg.exe"), &no_live);
         tr.observe_window(1, true);
         tr.observe_window(2, false);
-        tr.on_stop(
-            ProcessStopProps {
-                pid: 1,
-                exit_code: 0,
-            },
-            5_000,
-        );
-        tr.on_stop(
-            ProcessStopProps {
-                pid: 2,
-                exit_code: 0,
-            },
-            5_000,
-        );
+        tr.on_stop(stop(1, 0, 5_000));
+        tr.on_stop(stop(2, 0, 5_000));
         let evs = tr.drain_flushable(6_000);
         assert_eq!(
             evs.iter().find(|e| e.pid == 1).unwrap().window_state,
@@ -1118,13 +1136,7 @@ mod tests {
         let first = tr.drain_flushable(61_000);
         assert_eq!(first.len(), 1);
         assert_eq!(first[0].window_state, WindowState::Running);
-        tr.on_stop(
-            ProcessStopProps {
-                pid: 1,
-                exit_code: 0,
-            },
-            90_000,
-        );
+        tr.on_stop(stop(1, 0, 90_000));
         let second = tr.drain_flushable(91_000);
         assert_eq!(second[0].stop_time_ms, Some(90_000)); // same (pid,start) key → upsert finalizes
     }
@@ -1133,13 +1145,7 @@ mod tests {
         let mut tr = LaunchTracker::new_for_test(Vec::new());
         for i in 0..50 {
             tr.on_start(start(1000 + i, 4, i as i64 * 10, r"c:\spam.exe"), &no_live);
-            tr.on_stop(
-                ProcessStopProps {
-                    pid: 1000 + i,
-                    exit_code: 0,
-                },
-                i as i64 * 10 + 5,
-            );
+            tr.on_stop(stop(1000 + i, 0, i as i64 * 10 + 5));
         }
         assert_eq!(tr.drain_flushable(10_000).len(), 50);
         assert_eq!(tr.status().starts_seen, 50);
@@ -1199,13 +1205,7 @@ mod tests {
         tr.on_start(start(1, 4, 0, r"c:\long.exe"), &no_live);
         let d1 = tr.drain_flushable(61_000);
         assert_eq!(d1[0].window_state, WindowState::Running);
-        tr.on_stop(
-            ProcessStopProps {
-                pid: 1,
-                exit_code: 0,
-            },
-            70_000,
-        );
+        tr.on_stop(stop(1, 0, 70_000));
         let d2 = tr.drain_flushable(71_000);
         assert_eq!(d2.len(), 1);
         assert_eq!(d2[0].stop_time_ms, Some(70_000));
@@ -1221,13 +1221,7 @@ mod tests {
         assert!(evs.is_empty());
         assert_eq!(tr.status().stale_pending_evicted, 1);
 
-        tr.on_stop(
-            ProcessStopProps {
-                pid: 1,
-                exit_code: 0,
-            },
-            STALE_PENDING_THRESHOLD_MS + 2,
-        );
+        tr.on_stop(stop(1, 0, STALE_PENDING_THRESHOLD_MS + 2));
         assert_eq!(tr.status().orphan_stops, 1);
         assert!(
             tr.drain_flushable(STALE_PENDING_THRESHOLD_MS + 3)
@@ -1243,13 +1237,7 @@ mod tests {
         // Duplicate start for the exact same (pid, start) key: must not
         // reset the accumulated `visible` state back to false.
         tr.on_start(start(1, 4, 0, r"c:\a.exe"), &no_live);
-        tr.on_stop(
-            ProcessStopProps {
-                pid: 1,
-                exit_code: 0,
-            },
-            5_000,
-        );
+        tr.on_stop(stop(1, 0, 5_000));
         let evs = tr.drain_flushable(6_000);
         assert_eq!(evs.len(), 1);
         assert_eq!(evs[0].window_state, WindowState::Windowed);
@@ -1259,13 +1247,7 @@ mod tests {
     fn duplicate_start_after_stop_does_not_resurrect_the_row() {
         let mut tr = LaunchTracker::new_for_test(Vec::new());
         tr.on_start(start(1, 4, 0, r"c:\a.exe"), &no_live);
-        tr.on_stop(
-            ProcessStopProps {
-                pid: 1,
-                exit_code: 0,
-            },
-            1_000,
-        );
+        tr.on_stop(stop(1, 0, 1_000));
         // Duplicate start after the row already finalized: must not revert
         // it back to a pending/no-stop phantom.
         tr.on_start(start(1, 4, 0, r"c:\a.exe"), &no_live);
@@ -1322,6 +1304,32 @@ mod tests {
         let mut again = launch_event(500, 11_500);
         assert!(joiner.attach(&mut again).is_none());
         assert_eq!(joiner.len(), 0);
+    }
+
+    #[test]
+    fn launch_event_debug_never_prints_the_command_line() {
+        // Redaction strips secrets, not identity: what survives is still the
+        // user's own paths and document names. A derived `Debug` -- which is
+        // what this guards against being reintroduced -- would put that
+        // straight into any log line or panic message that formats a
+        // `LaunchEvent`.
+        let mut ev = launch_event(500, 11_500);
+        ev.command_line = Some(r"c:\x.exe --open c:\users\someone\taxes-2025.pdf".into());
+        let rendered = format!("{ev:?}");
+        assert!(
+            !rendered.contains("taxes-2025"),
+            "command line leaked into Debug: {rendered}"
+        );
+        assert!(
+            !rendered.contains("someone"),
+            "command line leaked into Debug: {rendered}"
+        );
+        // Presence stays visible -- "was a line attached?" is legitimate
+        // diagnostic signal, and eliding it would hide join failures.
+        assert!(rendered.contains("‹elided›"), "{rendered}");
+        let mut absent = launch_event(500, 11_500);
+        absent.command_line = None;
+        assert!(format!("{absent:?}").contains("command_line: None"));
     }
 
     #[test]

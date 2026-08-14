@@ -1075,7 +1075,14 @@ pub enum WindowState {
 /// One recorded process launch, built by `LaunchTracker` from ETW start/stop
 /// events. Never fabricated: a launch only exists here because a start event
 /// was actually observed.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `Debug` is hand-written rather than derived so `command_line` can never
+/// be printed. The line is post-redaction by the time it lands here, but
+/// redaction strips secrets, not identity: what survives is still the user's
+/// own paths, document names and arguments. A derived `Debug` is exactly how
+/// that ends up in a log line or a panic message -- the same reasoning as
+/// `CapturedCmdline` and `MofProcessStart` in `etw.rs`.
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LaunchEvent {
     pub pid: u32,
@@ -1100,6 +1107,32 @@ pub struct LaunchEvent {
     /// Set only by the Task 7 command-line join; absent otherwise.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub command_line: Option<String>,
+}
+
+impl std::fmt::Debug for LaunchEvent {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("LaunchEvent")
+            .field("pid", &self.pid)
+            .field("start_time_ms", &self.start_time_ms)
+            .field("stop_time_ms", &self.stop_time_ms)
+            .field("exit_code", &self.exit_code)
+            .field("exe_name", &self.exe_name)
+            .field("exe_path", &self.exe_path)
+            .field("raw_image_path", &self.raw_image_path)
+            .field("session_id", &self.session_id)
+            .field("parent_pid", &self.parent_pid)
+            .field("lineage", &self.lineage)
+            // Presence is diagnostic (did the join attach a line?); the
+            // content is not, and never prints. See the type's doc comment.
+            .field(
+                "command_line",
+                &self.command_line.as_ref().map(|_| "‹elided›"),
+            )
+            .field("window_state", &self.window_state)
+            .field("console_host", &self.console_host)
+            .finish()
+    }
 }
 
 /// Capture-health counters for the launch-history pipeline. The `etw_*`

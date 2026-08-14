@@ -62,13 +62,16 @@ pub struct AppState {
     /// Activity-gated high-rate telemetry for smooth-mode clients: zero
     /// idle cost, started by the first `live` request, stopped on idle.
     pub live: LiveEngine,
-    /// Bumped by the `deleteCommandLines` handler after it clears the
-    /// persisted table. The sampling loop polls this once per tick and, on
-    /// a change, clears its in-flight `CmdlineJoiner` before that tick's
-    /// join runs -- otherwise a capture the joiner was already holding for
-    /// a launch pending its flush (e.g. inside the 60s "still running"
-    /// window) could still land in storage moments after the user asked to
-    /// forget everything. A plain counter rather than a bool: two deletes
+    /// Bumped by the `deleteCommandLines` handler immediately *before* it
+    /// clears the persisted table. The sampling loop reads this twice per
+    /// tick -- once before that tick's join and again immediately before the
+    /// persist loop -- and on a change clears its in-flight `CmdlineJoiner`
+    /// and abandons the batch, so lines joined during the deleting tick
+    /// cannot be inserted after the wipe has already returned. Without this
+    /// signal, a capture the joiner was already holding for a launch pending
+    /// its flush (e.g. inside the 60s "still running" window) could still
+    /// land in storage moments after the user asked to forget everything.
+    /// A plain counter rather than a bool: two deletes
     /// in quick succession must not collapse into a single observed change
     /// if the loop's tick happens to land between them in a way a bool
     /// could miss (it can't, in practice, but the counter makes that true
@@ -374,17 +377,27 @@ impl AppState {
                 Ok(json!({ "events": events }))
             }
             PipeRequest::DeleteCommandLines => {
-                let deleted = self.storage.delete_all_launch_cmdlines()?;
-                // Bumped *after* the persisted table is actually gone, and
-                // read by the sampling loop once per tick: a launch pending
-                // its 60s "still running" flush may still have a redacted
-                // line sitting in the loop's in-flight `CmdlineJoiner`,
-                // captured before this request landed. Without this signal
-                // that line would persist moments after the user asked to
-                // forget everything -- see `cmdline_forget_generation`'s
-                // doc comment and `forget_generation_advanced`.
+                // Bumped *before* the table delete, deliberately. The signal
+                // tells the sampling loop's in-flight `CmdlineJoiner` to drop
+                // whatever it is holding: a launch pending its 60s "still
+                // running" flush may have a redacted line captured before
+                // this request landed, which would otherwise persist moments
+                // after the user asked to forget everything. Bumping first
+                // means the delete can only ever run against rows the loop
+                // had already committed, never against rows it is about to
+                // write -- the loop re-reads this counter immediately before
+                // its persist loop and abandons the batch if it moved. Were
+                // the order reversed, lines joined during this same tick
+                // could be inserted after the wipe had already returned.
+                // A side effect of ordering it this way, and the right one:
+                // if the delete below fails, the counter has already moved,
+                // so the loop still drops its in-flight captures. A wipe
+                // that could not finish is no reason to keep writing new
+                // lines. See `cmdline_forget_generation`'s doc comment and
+                // `forget_generation_advanced`.
                 self.cmdline_forget_generation
                     .fetch_add(1, Ordering::SeqCst);
+                let deleted = self.storage.delete_all_launch_cmdlines()?;
                 Ok(json!({ "deleted": deleted }))
             }
         }
@@ -1112,7 +1125,13 @@ fn sampling_loop(
             for event in collector.take_process_events() {
                 match event {
                     ParsedProcessEvent::Start(props) => launches.on_start(props, &live_lookup),
-                    ParsedProcessEvent::Stop(props) => launches.on_stop(props, timestamp_ms),
+                    // Note the missing `timestamp_ms`: a stop is stamped with
+                    // the *event's* own time, which the props now carry. The
+                    // kernel session flushes on a 1s timer and this loop
+                    // drains on its own interval, so this tick's wall clock
+                    // can trail the real exit by seconds -- for a 300ms popup
+                    // that difference is the whole measurement.
+                    ParsedProcessEvent::Stop(props) => launches.on_stop(props),
                 }
             }
         }
@@ -1124,14 +1143,16 @@ fn sampling_loop(
         }
         // Runs every tick even with ETW down, so pending rows still age out.
         let mut flushable = launches.drain_flushable(timestamp_ms);
-        // A `deleteCommandLines` request may have landed since the last
-        // tick: clear whatever the joiner is still holding *before* this
-        // tick's join, so a capture taken for a launch that was still
-        // pending its flush when the user asked to forget cannot slip into
-        // storage after the delete completed. This runs unconditionally,
-        // not gated on `capture_command_lines`, so a delete during a window
-        // where capture just got toggled off still catches whatever the
-        // joiner had left over.
+        // First of this tick's two forget checks. A `deleteCommandLines`
+        // request may have landed since the last tick: clear whatever the
+        // joiner is still holding *before* this tick's join, so a capture
+        // taken for a launch that was still pending its flush when the user
+        // asked to forget cannot slip into storage after the delete
+        // completed. This runs unconditionally, not gated on
+        // `capture_command_lines`, so a delete during a window where capture
+        // just got toggled off still catches whatever the joiner had left
+        // over. The second check sits just before the persist loop and
+        // covers a delete that lands *during* this tick.
         let forget_generation = state.cmdline_forget_generation.load(Ordering::SeqCst);
         if forget_generation_advanced(&mut last_forget_generation, forget_generation) {
             joiner.clear();
@@ -1139,7 +1160,7 @@ fn sampling_loop(
         // Attaching only happens while the opt-in is active; with it off the
         // joiner is empty anyway, but the guard keeps that a policy rather
         // than an accident.
-        let joined = if settings.capture_command_lines && cmdline_session.is_some() {
+        let mut joined = if settings.capture_command_lines && cmdline_session.is_some() {
             join_command_lines(&mut joiner, &mut flushable)
         } else {
             Vec::new()
@@ -1148,6 +1169,28 @@ fn sampling_loop(
             && let Err(error) = state.storage.save_launches(&flushable)
         {
             eprintln!("failed to persist launch events: {error:#}");
+        }
+        // Second read of the same counter, immediately before the only code
+        // that writes command lines to disk. The check above happens before
+        // the join; a delete landing in between would find the table already
+        // empty and then watch this tick insert the lines it just joined --
+        // a wipe that returned "done" while fresh rows were still arriving.
+        // Re-reading here closes that window: the batch is dropped and the
+        // joiner cleared, so those captures never reach storage at all.
+        //
+        // A residual window remains, between this load and the inserts
+        // below: a delete landing in those few microseconds still races. It
+        // is accepted rather than locked away, because closing it properly
+        // means holding the delete against the whole persist loop (DPAPI
+        // encryption plus a write per line) and the payoff is bounded --
+        // worst case a handful of lines survive a wipe by one tick, and the
+        // *next* tick's first check clears the joiner regardless. What the
+        // re-read removes is the systematic case: an entire tick's join
+        // landing after the delete, every time the two coincide.
+        let forget_generation = state.cmdline_forget_generation.load(Ordering::SeqCst);
+        if forget_generation_advanced(&mut last_forget_generation, forget_generation) {
+            joiner.clear();
+            joined.clear();
         }
         for line in &joined {
             // Redacted already; encrypted here, so the only at-rest copy of
@@ -1622,6 +1665,42 @@ mod tests {
             "a capture offered before the clear must not survive it"
         );
         assert!(events[0].command_line.is_none());
+    }
+
+    #[test]
+    fn a_delete_landing_after_the_join_still_discards_that_tick_s_lines() {
+        // Final fix wave (FW2): the pre-join clear above is not enough on
+        // its own. A `deleteCommandLines` that lands *after* this tick's
+        // join but before its inserts would find the table already empty and
+        // then watch these very lines be written -- a wipe that returned
+        // "done" while fresh rows were still arriving. The loop therefore
+        // re-reads the counter immediately before the persist loop and
+        // abandons the batch. This pins that second check, in the same shape
+        // the loop uses it.
+        let mut joiner = CmdlineJoiner::new();
+        joiner.offer(500, 10_000, "tool.exe --password hunter2");
+        let mut events = vec![launch_event(500, 10_100)];
+        let mut seen = 0u64;
+        // First check: nothing has happened yet, so the join proceeds.
+        assert!(!forget_generation_advanced(&mut seen, 0));
+        let mut joined = join_command_lines(&mut joiner, &mut events);
+        assert_eq!(joined.len(), 1, "the join must have produced a line");
+
+        // The delete lands here, mid-tick, and bumps the counter.
+        let generation = 1;
+        // Second check, immediately before the persist loop.
+        if forget_generation_advanced(&mut seen, generation) {
+            joiner.clear();
+            joined.clear();
+        }
+        assert!(
+            joined.is_empty(),
+            "lines joined during the deleting tick must never reach storage"
+        );
+        // And the joiner is emptied too, so nothing it was still holding
+        // survives into the next tick either.
+        let mut later = vec![launch_event(500, 10_100)];
+        assert!(join_command_lines(&mut joiner, &mut later).is_empty());
     }
 
     #[test]
@@ -2447,7 +2526,10 @@ mod tests {
         let now_ms = Utc::now().timestamp_millis();
 
         let event = launch_event_with_lineage(1, now_ms, r"c:\a.exe", &[]);
-        state.storage.save_launches(&[event.clone()]).unwrap();
+        state
+            .storage
+            .save_launches(std::slice::from_ref(&event))
+            .unwrap();
         let blob = crate::dpapi::protect(b"c:\\a.exe --flag").unwrap();
         state
             .storage
@@ -2572,7 +2654,10 @@ mod tests {
         let now_ms = Utc::now().timestamp_millis();
 
         let event = launch_event_with_lineage(1, now_ms, r"c:\a.exe", &[]);
-        state.storage.save_launches(&[event.clone()]).unwrap();
+        state
+            .storage
+            .save_launches(std::slice::from_ref(&event))
+            .unwrap();
         let blob = crate::dpapi::protect(b"c:\\a.exe --flag").unwrap();
         state
             .storage

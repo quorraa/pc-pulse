@@ -5,6 +5,17 @@
 //! shell (`parse_process_event`) walks `TRACE_EVENT_INFO` via
 //! `TdhGetEventInformation` and reads each top-level property via
 //! `TdhGetProperty`, then hands the resulting bag to `decode_event`.
+//!
+//! One value a stop event needs does not live in the property bag at all:
+//! *when the process actually exited*. The Kernel-Process `ProcessStop`
+//! payload carries no exit-time field, so the event record's
+//! `EventHeader.TimeStamp` stands in for it. Rather than hand `decode_event`
+//! a raw `EVENT_RECORD` (which would make it unsafe and untestable), the
+//! unsafe shell reads that header field, converts it with
+//! [`filetime_to_epoch_ms`], and threads it in as a plain `event_time_ms`
+//! parameter -- the same seam the MOF path uses for `CapturedCmdline.start_ms`.
+//! `decode_event` therefore stays pure: property bag plus event time in,
+//! decoded event out.
 
 use windows::Win32::Foundation::ERROR_INSUFFICIENT_BUFFER;
 use windows::Win32::System::Diagnostics::Etw::{
@@ -33,6 +44,15 @@ pub struct ProcessStartProps {
 pub struct ProcessStopProps {
     pub pid: u32,
     pub exit_code: u32,
+    /// When the process actually exited, in epoch milliseconds, taken from
+    /// the stop event's own `EventHeader.TimeStamp` -- *not* from whenever
+    /// the sampling loop happened to drain the queue. The kernel session
+    /// runs a 1s `FlushTimer` and the loop drains on its own interval, so a
+    /// wall-clock stamp taken at drain time can trail the real exit by
+    /// seconds, which for a short-lived process is most of its reported
+    /// lifetime. Recorded durations must measure the process, not our
+    /// delivery latency.
+    pub stop_time_ms: i64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -98,10 +118,14 @@ fn get_unicode<'a>(
     }
 }
 
-/// Pure, testable core: decode from an already-extracted property bag.
+/// Pure, testable core: decode from an already-extracted property bag plus
+/// the event record's own header timestamp (`event_time_ms`, epoch
+/// milliseconds), which is the only source for a stop event's exit time --
+/// see the module doc comment.
 pub(crate) fn decode_event(
     event_id: u16,
     props: &[(String, PropValue)],
+    event_time_ms: i64,
 ) -> Result<ParsedProcessEvent, ParseError> {
     match event_id {
         PROCESS_START_EVENT_ID => {
@@ -124,6 +148,7 @@ pub(crate) fn decode_event(
             Ok(ParsedProcessEvent::Stop(ProcessStopProps {
                 pid,
                 exit_code,
+                stop_time_ms: event_time_ms,
             }))
         }
         other => Err(ParseError::UnknownEventId(other)),
@@ -200,6 +225,11 @@ pub unsafe fn parse_process_event(
         return Err(ParseError::MissingProperty("EVENT_RECORD"));
     }
     let event_id = unsafe { (*record).EventHeader.EventDescriptor.Id };
+    // The session is opened without `PROCESS_TRACE_MODE_RAW_TIMESTAMP`, so
+    // ETW has already converted this header field to FILETIME (100ns ticks
+    // since 1601) by the time the callback sees it -- the same assumption
+    // the MOF command-line path makes for `CapturedCmdline.start_ms`.
+    let event_time_ms = filetime_to_epoch_ms(unsafe { (*record).EventHeader.TimeStamp } as u64);
 
     let info_ptr = TDH_INFO_BUFFER.with(|cell| -> Result<*const TRACE_EVENT_INFO, ParseError> {
         let mut buffer = cell.borrow_mut();
@@ -325,7 +355,7 @@ pub unsafe fn parse_process_event(
         props.push((name, value));
     }
 
-    decode_event(event_id, &props)
+    decode_event(event_id, &props, event_time_ms)
 }
 
 /// Scans `buffer` for a NUL-terminated UTF-16LE string starting at byte
@@ -363,6 +393,10 @@ fn read_wide_string_at(buffer: &[u8], offset: u32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// Stand-in for an event record's header timestamp in the decode tests;
+    /// distinct from every property value in the bags below so a test can
+    /// tell "came from the header" apart from "came from the payload".
+    const EVENT_TIME_MS: i64 = 1_786_600_005_000;
     fn start_bag() -> Vec<(String, PropValue)> {
         vec![
             ("ProcessID".into(), PropValue::U32(4242)),
@@ -377,7 +411,8 @@ mod tests {
     }
     #[test]
     fn decodes_process_start() {
-        let ParsedProcessEvent::Start(s) = decode_event(1, &start_bag()).unwrap() else {
+        let ParsedProcessEvent::Start(s) = decode_event(1, &start_bag(), EVENT_TIME_MS).unwrap()
+        else {
             panic!("expected Start")
         };
         assert_eq!(s.pid, 4242);
@@ -392,18 +427,21 @@ mod tests {
             ("ProcessID".into(), PropValue::U32(4242)),
             ("ExitCode".into(), PropValue::U32(0)),
         ];
-        let ParsedProcessEvent::Stop(s) = decode_event(2, &bag).unwrap() else {
+        let ParsedProcessEvent::Stop(s) = decode_event(2, &bag, EVENT_TIME_MS).unwrap() else {
             panic!("expected Stop")
         };
         assert_eq!(s.pid, 4242);
         assert_eq!(s.exit_code, 0);
+        // The exit time comes from the record header, not the property bag:
+        // the ProcessStop payload has no timestamp field at all.
+        assert_eq!(s.stop_time_ms, EVENT_TIME_MS);
     }
     #[test]
     fn missing_property_is_error_not_panic() {
         let mut bag = start_bag();
         bag.retain(|(k, _)| k != "ParentProcessID");
         assert_eq!(
-            decode_event(1, &bag).unwrap_err(),
+            decode_event(1, &bag, EVENT_TIME_MS).unwrap_err(),
             ParseError::MissingProperty("ParentProcessID")
         );
     }
@@ -412,14 +450,14 @@ mod tests {
         let mut bag = start_bag();
         bag.iter_mut().find(|(k, _)| k == "ProcessID").unwrap().1 = PropValue::Unicode("42".into());
         assert_eq!(
-            decode_event(1, &bag).unwrap_err(),
+            decode_event(1, &bag, EVENT_TIME_MS).unwrap_err(),
             ParseError::BadType("ProcessID")
         );
     }
     #[test]
     fn unknown_event_id_is_error() {
         assert_eq!(
-            decode_event(15, &start_bag()).unwrap_err(),
+            decode_event(15, &start_bag(), EVENT_TIME_MS).unwrap_err(),
             ParseError::UnknownEventId(15)
         );
     }
@@ -466,7 +504,7 @@ mod tests {
         // Some manifest versions emit UInt64 for SessionID; accept lossless widening.
         let mut bag = start_bag();
         bag.iter_mut().find(|(k, _)| k == "SessionID").unwrap().1 = PropValue::U64(1);
-        assert!(decode_event(1, &bag).is_ok());
+        assert!(decode_event(1, &bag, EVENT_TIME_MS).is_ok());
     }
     #[test]
     fn props_that_fit_exact_fit_returns_full_count() {

@@ -1175,7 +1175,7 @@ mod tests {
     fn launch_events_round_trip() {
         let connection = open_test_connection();
         let event = sample_launch(100, 1_000);
-        save_launch_events(&connection, &[event.clone()]).unwrap();
+        save_launch_events(&connection, std::slice::from_ref(&event)).unwrap();
 
         let loaded = load_launch_events(&connection, 0).unwrap();
         assert_eq!(loaded.len(), 1);

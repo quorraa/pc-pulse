@@ -898,9 +898,14 @@ unsafe extern "system" fn cmdline_record_callback(record: *mut EVENT_RECORD) {
 /// [`property_buffer`], plus `EVENT_TRACE_SYSTEM_LOGGER_MODE` and the kernel
 /// `EnableFlags` that select which kernel providers the session carries.
 ///
-/// The name is this service's own (`PcPulse-Cmdline-<pid>`), not
+/// The name is this service's own (`PcPulse-Cmdline`), not
 /// `NT Kernel Logger`: since Windows 8 a process may run its own
 /// system-logger session, of which the machine supports eight in total.
+/// Fixed rather than per-pid on purpose -- a stable name is what lets a
+/// restart reclaim the session a killed instance left behind, instead of
+/// leaking a slot out of that pool of eight per crash (see
+/// `start_trace_reclaiming_stale` and the `looks process-specific`
+/// assertion in the tests).
 /// `Wnode.Guid` is deliberately left zeroed -- setting it to
 /// `SystemTraceControlGuid` is what asks for the single, global NT Kernel
 /// Logger instead.
@@ -1036,6 +1041,10 @@ mod tests {
     use super::*;
     use crate::etw_props::ProcessStopProps;
 
+    /// Arbitrary but explicit event time for the queue fixtures below; these
+    /// tests care about ordering and drop accounting, not about clocks.
+    const STOP_EVENT_MS: i64 = 1_786_600_000_000;
+
     #[test]
     fn channel_full_increments_dropped_and_keeps_collector_alive() {
         let (queue, sink) = EtwProcessQueue::new_for_test(4);
@@ -1043,6 +1052,7 @@ mod tests {
             sink.offer(ParsedProcessEvent::Stop(ProcessStopProps {
                 pid,
                 exit_code: 0,
+                stop_time_ms: STOP_EVENT_MS,
             }));
         }
         assert_eq!(queue.health().dropped_channel.load(Ordering::Relaxed), 6);
@@ -1057,6 +1067,7 @@ mod tests {
             sink.offer(ParsedProcessEvent::Stop(ProcessStopProps {
                 pid,
                 exit_code: pid,
+                stop_time_ms: STOP_EVENT_MS + i64::from(pid),
             }));
         }
         let drained = queue.take_process_events();
@@ -1066,15 +1077,18 @@ mod tests {
             vec![
                 ParsedProcessEvent::Stop(ProcessStopProps {
                     pid: 7,
-                    exit_code: 7
+                    exit_code: 7,
+                    stop_time_ms: STOP_EVENT_MS + 7,
                 }),
                 ParsedProcessEvent::Stop(ProcessStopProps {
                     pid: 8,
-                    exit_code: 8
+                    exit_code: 8,
+                    stop_time_ms: STOP_EVENT_MS + 8,
                 }),
                 ParsedProcessEvent::Stop(ProcessStopProps {
                     pid: 9,
-                    exit_code: 9
+                    exit_code: 9,
+                    stop_time_ms: STOP_EVENT_MS + 9,
                 }),
             ]
         );
