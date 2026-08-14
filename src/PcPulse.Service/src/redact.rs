@@ -588,10 +588,14 @@ fn redact_url_query(input: &str, count: &mut u32) -> String {
 ///   closing quote, whichever comes first when inside quotes). There is no
 ///   argument-boundary early-out, so a spaced value like
 ///   `Password=my -secret;` is redacted whole.
-/// - **No qualifying `;` exists** → the value terminates at the first
-///   whitespace (still bounded by the closing quote when inside quotes), so
-///   a bare `password=hunter2 --verbose --port 80` or
-///   `myapp.exe password=hunter2 input.csv` keeps its trailing arguments.
+/// - **No qualifying `;` exists, inside quotes** → the value is the whole
+///   quoted remainder, up to the closing `"`. The quoted element already
+///   bounds it, so there is no unrelated text to protect and no reason to
+///   stop at whitespace (`"User Id=john smith"` redacts whole).
+/// - **No qualifying `;` exists, outside quotes** → the value terminates at
+///   the first whitespace, so a bare `password=hunter2 --verbose --port 80`
+///   or `myapp.exe password=hunter2 input.csv` keeps its trailing
+///   arguments.
 ///
 /// Two earlier designs failed here: a *whole-input* "does a `;` appear
 /// later" lookahead over-triggered `;`-only mode on stray downstream
@@ -672,8 +676,20 @@ fn connection_string_value_end(chars: &[char], val_start: usize, in_quotes: &[bo
         k += 1;
     }
 
-    // No qualifying ';' — this is not connection-string syntax, so the
-    // value is a single whitespace-delimited token.
+    // No qualifying ';'. Inside quotes there is nothing left to protect:
+    // `region_end` already bounds the value at the closing quote, so the
+    // whole quoted remainder is the value. Falling through to the
+    // whitespace scan here would leak the tail *inside* the quotes
+    // (`"User Id=john smith"` → `‹redacted› smith"`). The whitespace-mode
+    // justification — don't eat unrelated command-line arguments — only
+    // applies outside quotes, where no such bound exists.
+    if inside {
+        return region_end;
+    }
+
+    // Outside quotes: not connection-string syntax, so the value is a
+    // single whitespace-delimited token and the rest of the command line
+    // survives.
     let mut e = val_start;
     while e < region_end && !chars[e].is_whitespace() {
         e += 1;
@@ -1222,5 +1238,50 @@ mod tests {
         );
         assert!(r.contains("&page=2"), "{r}");
         assert!(r.contains("&q=50%25"), "{r}");
+    }
+
+    // -- Security review, fix round 5 -----------------------------------
+    //
+    // Round 4 regression: inside quotes, when the ';' lookahead found
+    // nothing before the closing quote, the code fell through to the
+    // whitespace scan and leaked the value's tail *inside* the quotes.
+    // `region_end` already bounds a quoted value, so whitespace mode has no
+    // job to do there — inside quotes the value is now the whole quoted
+    // remainder.
+
+    // Genuine connection string, ';' present but only *before* the value:
+    // the lookahead (which starts at the value) finds none, so this hit the
+    // regression too.
+    #[test]
+    fn r5_quoted_conn_string_without_trailing_semicolon_is_fully_redacted() {
+        let (r, n) = redact_command_line(r#"app "Server=x;User Id=john smith""#);
+        assert_eq!(r, "app \"Server=x;User Id=\u{2039}redacted\u{203a}\"");
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn r5_quoted_user_id_with_no_semicolon_at_all_is_fully_redacted() {
+        let (r, n) = redact_command_line(r#"app "User Id=john smith""#);
+        assert_eq!(r, "app \"User Id=\u{2039}redacted\u{203a}\"");
+        assert_eq!(n, 1);
+    }
+
+    // The quoted element still bounds the value: arguments after the
+    // closing quote survive untouched.
+    #[test]
+    fn r5_quoted_uid_value_stops_at_closing_quote_leaving_later_flags() {
+        let (r, n) = redact_command_line(r#"app "Uid=john smith" --port 80"#);
+        assert_eq!(r, "app \"Uid=\u{2039}redacted\u{203a}\" --port 80");
+        assert_eq!(n, 1);
+    }
+
+    // Unbalanced opening quote: parity says "inside" to end of string, so
+    // the value runs to end of string — no tail leak.
+    #[test]
+    fn r5_unbalanced_quote_does_not_leak_the_value_tail() {
+        let (r, n) = redact_command_line("app \"Uid=john smith");
+        assert!(!r.contains("john"), "{r}");
+        assert!(!r.contains("smith"), "{r}");
+        assert_eq!(n, 1);
     }
 }
