@@ -1070,7 +1070,7 @@ pub struct LaunchEvent {
 /// Capture-health counters for the launch-history pipeline. The `etw_*`
 /// fields are tracker-owned zeros here; the runtime (Task 7) merges in the
 /// live `EtwHealth` counters before serving this to clients.
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LaunchCaptureStatus {
     pub starts_seen: u64,
@@ -1081,6 +1081,10 @@ pub struct LaunchCaptureStatus {
     pub events_lost_query_failures: u64,
     pub malformed_events: u64,
     pub orphan_stops: u64,
+    /// Pending (never-stopped) rows dropped after 24h with no matching stop
+    /// event; their last-emitted `Running` snapshot (if any) remains in
+    /// storage as the honest last-known state.
+    pub stale_pending_evicted: u64,
     pub cmdline_session_active: bool,
     pub cmdlines_captured: u64,
     pub cmdlines_redacted_fields: u64,

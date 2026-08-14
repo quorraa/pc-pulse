@@ -21,6 +21,20 @@ const LINEAGE_MAX_DEPTH: usize = 5;
 /// A still-pending (no stop event yet) launch this old is flushed as a
 /// `Running` snapshot rather than held back indefinitely.
 const RUNNING_FLUSH_THRESHOLD_MS: i64 = 60_000;
+/// A still-pending (no stop event ever arrived) launch this old is evicted
+/// from `pending` outright rather than held forever: its previously-emitted
+/// `Running` snapshot (if any) remains the honest last-known state in
+/// storage, and a stop event that arrives afterward is counted as an
+/// orphan rather than resurrecting the row.
+const STALE_PENDING_THRESHOLD_MS: i64 = 24 * 60 * 60 * 1000;
+/// Minimum spacing between device-map rebuilds triggered by a mapping
+/// failure, so a storm of unmappable paths (e.g. `\Device\Mup\...` network
+/// shares) can't hammer `QueryDosDeviceW` once per start event.
+const DEVICE_MAP_REBUILD_COOLDOWN_MS: i64 = 60_000;
+
+/// A device-map builder function: `build_device_map` in production, a
+/// counting stand-in in tests that exercise the rebuild-cooldown path.
+type DeviceMapBuilder = fn() -> Vec<(String, String)>;
 
 /// Console host executable names (lowercase, exact match only -- no
 /// substring matching, so e.g. "mycmd.exe" does not match "cmd.exe").
@@ -114,13 +128,26 @@ pub fn is_console_host(exe_name: &str) -> bool {
     CONSOLE_HOSTS.contains(&lower.as_str())
 }
 
+/// Minimal live-process info a caller's process-table lookup returns for a
+/// pid. Carries the pid's own `parent_pid` (unlike a bare name/path pair) so
+/// `LaunchTracker::build_lineage` can keep walking up the chain through
+/// consecutive live-table hits instead of stopping after just one.
+#[derive(Debug, Clone)]
+pub struct LiveProcessInfo {
+    pub name: String,
+    pub path: Option<String>,
+    pub parent_pid: u32,
+}
+
 /// One ancestor launch remembered purely so a later descendant's lineage
 /// walk can resolve it even after it has exited. Distinct from
 /// `LineageEntry` (the public, serialized shape) because it also carries
-/// `parent_pid`, needed to keep walking further up the chain.
+/// `parent_pid`, needed to keep walking further up the chain, and
+/// `start_ms`, needed to pick the reuse-correct entry when a pid recurs.
 struct RecentLaunch {
     pid: u32,
     parent_pid: u32,
+    start_ms: i64,
     name: String,
     path: String,
 }
@@ -150,6 +177,11 @@ struct PendingLaunch {
     /// `drain_flushable` uses `WindowState::Running` for still-pending rows
     /// instead of reading this field.
     window_state: WindowState,
+    /// Whether a `Running` snapshot has already been emitted for this row.
+    /// A still-pending row is only ever emitted once as `Running`; it is
+    /// only re-emitted once a stop event finalizes it (the upsert then
+    /// replaces the earlier `Running` row).
+    emitted_running: bool,
 }
 
 impl PendingLaunch {
@@ -208,14 +240,22 @@ pub struct LaunchTracker {
     /// process table) but that this tracker itself observed starting.
     recent: VecDeque<RecentLaunch>,
     device_map: Vec<(String, String)>,
-    /// Whether `on_start` may call the real `build_device_map` (Win32) when
-    /// normalization fails to map a device path. Disabled by the
-    /// `#[cfg(test)]` constructor so unit tests never touch Win32.
-    rebuild_device_map: bool,
+    /// How `on_start` rebuilds `device_map` on a mapping failure: `None`
+    /// disables rebuilding entirely (the `#[cfg(test)]` default, so unit
+    /// tests never touch Win32); `Some(f)` calls `f()` to rebuild, subject
+    /// to `last_rebuild_ms`'s cooldown.
+    device_map_builder: Option<DeviceMapBuilder>,
+    /// Event-clock (`create_time_ms`) timestamp of the last device-map
+    /// rebuild, so a storm of unmappable paths can't rebuild more than once
+    /// per `DEVICE_MAP_REBUILD_COOLDOWN_MS`. Deliberately driven by the
+    /// event's own timestamp rather than a wall clock, so this stays
+    /// deterministic and testable.
+    last_rebuild_ms: Option<i64>,
     starts_seen: u64,
     stops_seen: u64,
     persisted: u64,
     orphan_stops: u64,
+    stale_pending_evicted: u64,
 }
 
 impl LaunchTracker {
@@ -225,17 +265,18 @@ impl LaunchTracker {
             pid_index: HashMap::new(),
             recent: VecDeque::new(),
             device_map: build_device_map(),
-            rebuild_device_map: true,
+            device_map_builder: Some(build_device_map),
+            last_rebuild_ms: None,
             starts_seen: 0,
             stops_seen: 0,
             persisted: 0,
             orphan_stops: 0,
+            stale_pending_evicted: 0,
         }
     }
 
-    /// Test-only constructor: takes a fixed device map so tests never call
-    /// into Win32 (`QueryDosDeviceW`), including via the mapping-failure
-    /// rebuild path.
+    /// Test-only constructor: takes a fixed device map and never rebuilds
+    /// it, so tests never call into Win32 (`QueryDosDeviceW`).
     #[cfg(test)]
     fn new_for_test(device_map: Vec<(String, String)>) -> Self {
         Self {
@@ -243,26 +284,59 @@ impl LaunchTracker {
             pid_index: HashMap::new(),
             recent: VecDeque::new(),
             device_map,
-            rebuild_device_map: false,
+            device_map_builder: None,
+            last_rebuild_ms: None,
             starts_seen: 0,
             stops_seen: 0,
             persisted: 0,
             orphan_stops: 0,
+            stale_pending_evicted: 0,
         }
     }
 
-    /// live_lookup: pid -> Some((name, Some(path))) from the live process table.
+    /// Test-only constructor for exercising the rebuild-cooldown path
+    /// without touching Win32: `builder` stands in for `build_device_map`.
+    #[cfg(test)]
+    fn new_for_test_with_rebuild(
+        device_map: Vec<(String, String)>,
+        builder: DeviceMapBuilder,
+    ) -> Self {
+        let mut tracker = Self::new_for_test(device_map);
+        tracker.device_map_builder = Some(builder);
+        tracker
+    }
+
+    /// live_lookup: pid -> the live process table's info for that pid, if any.
     pub fn on_start(
         &mut self,
         p: ProcessStartProps,
-        live_lookup: &dyn Fn(u32) -> Option<(String, Option<String>)>,
+        live_lookup: &dyn Fn(u32) -> Option<LiveProcessInfo>,
     ) {
         self.starts_seen += 1;
 
+        let key = (p.pid, p.create_time_ms);
+        if self.pending.contains_key(&key) {
+            // Duplicate start for an already-tracked (pid, start) row (e.g. a
+            // retransmitted ETW event): ignore rather than reset accumulated
+            // window-sample state or resurrect an already-finalized row.
+            return;
+        }
+
         let (mut exe_path, mut mapped) = normalize_image_path(&p.image_name, &self.device_map);
-        if !mapped && self.rebuild_device_map {
-            self.device_map = build_device_map();
-            (exe_path, mapped) = normalize_image_path(&p.image_name, &self.device_map);
+        if !mapped {
+            let should_rebuild = self.device_map_builder.is_some()
+                && match self.last_rebuild_ms {
+                    None => true,
+                    Some(last) => p.create_time_ms - last >= DEVICE_MAP_REBUILD_COOLDOWN_MS,
+                };
+            if should_rebuild {
+                // `device_map_builder` is `Some` per `should_rebuild` above.
+                if let Some(builder) = self.device_map_builder {
+                    self.device_map = builder();
+                    self.last_rebuild_ms = Some(p.create_time_ms);
+                    (exe_path, mapped) = normalize_image_path(&p.image_name, &self.device_map);
+                }
+            }
         }
         let raw_image_path = if mapped {
             None
@@ -271,11 +345,12 @@ impl LaunchTracker {
         };
         let exe_name = exe_name_from_path(&exe_path);
         let console_host = is_console_host(&exe_name);
-        let lineage = self.build_lineage(p.parent_pid, live_lookup);
+        let lineage = self.build_lineage(p.parent_pid, p.create_time_ms, live_lookup);
 
         self.recent.push_back(RecentLaunch {
             pid: p.pid,
             parent_pid: p.parent_pid,
+            start_ms: p.create_time_ms,
             name: exe_name.clone(),
             path: exe_path.clone(),
         });
@@ -284,7 +359,7 @@ impl LaunchTracker {
         }
 
         self.pending.insert(
-            (p.pid, p.create_time_ms),
+            key,
             PendingLaunch {
                 start_time_ms: p.create_time_ms,
                 stop_time_ms: None,
@@ -299,6 +374,7 @@ impl LaunchTracker {
                 sampled: false,
                 visible: false,
                 window_state: WindowState::Unobserved,
+                emitted_running: false,
             },
         );
         // PID reuse: overwrites unconditionally. The prior pending row (if
@@ -311,24 +387,28 @@ impl LaunchTracker {
     /// ancestors, preferring `live_lookup`, then this tracker's own
     /// recently-observed launches, and finally giving up with `"unknown"`
     /// (which also stops the walk -- an unresolvable ancestor's own parent
-    /// is not guessable).
+    /// is not guessable). A `live_lookup` hit carries its own `parent_pid`,
+    /// so the walk keeps going through consecutive live hits instead of
+    /// stopping after the first one.
     fn build_lineage(
         &self,
         start_pid: u32,
-        live_lookup: &dyn Fn(u32) -> Option<(String, Option<String>)>,
+        at_start_ms: i64,
+        live_lookup: &dyn Fn(u32) -> Option<LiveProcessInfo>,
     ) -> Vec<LineageEntry> {
         let mut lineage = Vec::new();
         let mut current_pid = start_pid;
         for _ in 0..LINEAGE_MAX_DEPTH {
-            if let Some((name, path)) = live_lookup(current_pid) {
+            if let Some(info) = live_lookup(current_pid) {
                 lineage.push(LineageEntry {
                     pid: current_pid,
-                    name,
-                    path,
+                    name: info.name,
+                    path: info.path,
                 });
-                break; // live table gives no further parent pid to continue with
+                current_pid = info.parent_pid;
+                continue;
             }
-            if let Some(entry) = self.recent.iter().rev().find(|e| e.pid == current_pid) {
+            if let Some(entry) = self.recent_lookup(current_pid, at_start_ms) {
                 lineage.push(LineageEntry {
                     pid: current_pid,
                     name: entry.name.clone(),
@@ -345,6 +425,25 @@ impl LaunchTracker {
             break;
         }
         lineage
+    }
+
+    /// Finds the recent-ring entry for `pid` that is reuse-proof at capture
+    /// time: the entry with the largest `start_ms` that is still `<=
+    /// at_ms` (i.e. the launch of `pid` that was actually alive when the
+    /// event being resolved happened), falling back to the newest entry for
+    /// that pid if none started early enough (a clock-skew/ordering
+    /// edge case, not the common path).
+    fn recent_lookup(&self, pid: u32, at_ms: i64) -> Option<&RecentLaunch> {
+        self.recent
+            .iter()
+            .filter(|e| e.pid == pid && e.start_ms <= at_ms)
+            .max_by_key(|e| e.start_ms)
+            .or_else(|| {
+                self.recent
+                    .iter()
+                    .filter(|e| e.pid == pid)
+                    .max_by_key(|e| e.start_ms)
+            })
     }
 
     pub fn on_stop(&mut self, p: ProcessStopProps, now_ms: i64) {
@@ -389,24 +488,42 @@ impl LaunchTracker {
         }
     }
 
-    /// Completed launches + still-open ones >= 60s old (emitted once as
-    /// Running; finalized later by upsert).
+    /// Completed launches (drained and removed) + still-open ones >= 60s old
+    /// (emitted exactly once as `Running`, and kept pending -- finalized
+    /// later by upsert when the stop event lands). Pending rows with no
+    /// stop event 24h past their start are evicted outright rather than
+    /// held or re-emitted; see `STALE_PENDING_THRESHOLD_MS`.
     pub fn drain_flushable(&mut self, now_ms: i64) -> Vec<LaunchEvent> {
         let mut out = Vec::new();
         let mut finished_keys = Vec::new();
+        let mut stale_keys = Vec::new();
 
-        for (&(pid, start_ms), launch) in self.pending.iter() {
+        for (&(pid, start_ms), launch) in self.pending.iter_mut() {
             if launch.stop_time_ms.is_some() {
                 out.push(launch.to_event(pid));
                 finished_keys.push((pid, start_ms));
-            } else if now_ms - launch.start_time_ms >= RUNNING_FLUSH_THRESHOLD_MS {
+            } else if now_ms - launch.start_time_ms >= STALE_PENDING_THRESHOLD_MS {
+                stale_keys.push((pid, start_ms));
+            } else if !launch.emitted_running
+                && now_ms - launch.start_time_ms >= RUNNING_FLUSH_THRESHOLD_MS
+            {
                 out.push(launch.to_running_event(pid));
+                launch.emitted_running = true;
             }
         }
 
         for key in finished_keys {
             self.pending.remove(&key);
             self.persisted += 1;
+        }
+        for (pid, start_ms) in stale_keys {
+            self.pending.remove(&(pid, start_ms));
+            // Only clear pid_index if it still points at this exact stale
+            // row; a newer (reused-pid) launch must not be clobbered.
+            if self.pid_index.get(&pid) == Some(&start_ms) {
+                self.pid_index.remove(&pid);
+            }
+            self.stale_pending_evicted += 1;
         }
 
         out
@@ -421,6 +538,7 @@ impl LaunchTracker {
             stops_seen: self.stops_seen,
             persisted: self.persisted,
             orphan_stops: self.orphan_stops,
+            stale_pending_evicted: self.stale_pending_evicted,
             ..LaunchCaptureStatus::default()
         }
     }
@@ -518,7 +636,7 @@ mod tests {
             image_name: img.to_string(),
         }
     }
-    fn no_live(_: u32) -> Option<(String, Option<String>)> {
+    fn no_live(_: u32) -> Option<LiveProcessInfo> {
         None
     }
 
@@ -659,5 +777,170 @@ mod tests {
         }
         assert_eq!(tr.drain_flushable(10_000).len(), 50);
         assert_eq!(tr.status().starts_seen, 50);
+    }
+
+    // -- Fix round 1 --------------------------------------------------
+
+    #[test]
+    fn lineage_walks_through_multiple_live_ancestors() {
+        // live table: pid 100 -> parent 50, pid 50 -> parent 4; pid 4 itself
+        // is unresolvable anywhere. Depth must reach >= 2 through
+        // consecutive live hits, not collapse to 1 after the first.
+        fn live(pid: u32) -> Option<LiveProcessInfo> {
+            match pid {
+                100 => Some(LiveProcessInfo {
+                    name: "explorer.exe".to_string(),
+                    path: Some(r"c:\windows\explorer.exe".to_string()),
+                    parent_pid: 50,
+                }),
+                50 => Some(LiveProcessInfo {
+                    name: "services.exe".to_string(),
+                    path: Some(r"c:\windows\system32\services.exe".to_string()),
+                    parent_pid: 4,
+                }),
+                _ => None,
+            }
+        }
+        let mut tr = LaunchTracker::new_for_test(Vec::new());
+        tr.on_start(start(200, 100, 1_000, r"c:\child.exe"), &live);
+        let evs = tr.drain_flushable(65_000); // past the 60s Running-flush threshold
+        let child = evs.iter().find(|e| e.pid == 200).unwrap();
+        assert_eq!(child.lineage.len(), 3);
+        assert_eq!(child.lineage[0].pid, 100);
+        assert_eq!(child.lineage[0].name, "explorer.exe");
+        assert_eq!(child.lineage[1].pid, 50);
+        assert_eq!(child.lineage[1].name, "services.exe");
+        assert_eq!(child.lineage[2].pid, 4);
+        assert_eq!(child.lineage[2].name, "unknown");
+    }
+
+    #[test]
+    fn running_snapshot_emitted_exactly_once_while_pending() {
+        let mut tr = LaunchTracker::new_for_test(Vec::new());
+        tr.on_start(start(1, 4, 0, r"c:\long.exe"), &no_live);
+        let d1 = tr.drain_flushable(61_000);
+        assert_eq!(d1.len(), 1);
+        assert_eq!(d1[0].window_state, WindowState::Running);
+        let d2 = tr.drain_flushable(62_000);
+        assert!(d2.is_empty(), "must not re-emit Running on every drain");
+        let d3 = tr.drain_flushable(600_000);
+        assert!(d3.is_empty());
+    }
+
+    #[test]
+    fn stop_after_running_emission_re_emits_as_finalized() {
+        let mut tr = LaunchTracker::new_for_test(Vec::new());
+        tr.on_start(start(1, 4, 0, r"c:\long.exe"), &no_live);
+        let d1 = tr.drain_flushable(61_000);
+        assert_eq!(d1[0].window_state, WindowState::Running);
+        tr.on_stop(
+            ProcessStopProps {
+                pid: 1,
+                exit_code: 0,
+            },
+            70_000,
+        );
+        let d2 = tr.drain_flushable(71_000);
+        assert_eq!(d2.len(), 1);
+        assert_eq!(d2[0].stop_time_ms, Some(70_000));
+        assert_eq!(d2[0].exit_code, Some(0));
+    }
+
+    #[test]
+    fn stale_pending_row_evicted_after_24h_and_later_stop_is_orphan() {
+        let mut tr = LaunchTracker::new_for_test(Vec::new());
+        tr.on_start(start(1, 4, 0, r"c:\ghost.exe"), &no_live);
+        // Jump straight past the 24h staleness threshold.
+        let evs = tr.drain_flushable(STALE_PENDING_THRESHOLD_MS + 1);
+        assert!(evs.is_empty());
+        assert_eq!(tr.status().stale_pending_evicted, 1);
+
+        tr.on_stop(
+            ProcessStopProps {
+                pid: 1,
+                exit_code: 0,
+            },
+            STALE_PENDING_THRESHOLD_MS + 2,
+        );
+        assert_eq!(tr.status().orphan_stops, 1);
+        assert!(
+            tr.drain_flushable(STALE_PENDING_THRESHOLD_MS + 3)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn duplicate_start_after_observe_window_keeps_windowed_state() {
+        let mut tr = LaunchTracker::new_for_test(Vec::new());
+        tr.on_start(start(1, 4, 0, r"c:\a.exe"), &no_live);
+        tr.observe_window(1, true);
+        // Duplicate start for the exact same (pid, start) key: must not
+        // reset the accumulated `visible` state back to false.
+        tr.on_start(start(1, 4, 0, r"c:\a.exe"), &no_live);
+        tr.on_stop(
+            ProcessStopProps {
+                pid: 1,
+                exit_code: 0,
+            },
+            5_000,
+        );
+        let evs = tr.drain_flushable(6_000);
+        assert_eq!(evs.len(), 1);
+        assert_eq!(evs[0].window_state, WindowState::Windowed);
+    }
+
+    #[test]
+    fn duplicate_start_after_stop_does_not_resurrect_the_row() {
+        let mut tr = LaunchTracker::new_for_test(Vec::new());
+        tr.on_start(start(1, 4, 0, r"c:\a.exe"), &no_live);
+        tr.on_stop(
+            ProcessStopProps {
+                pid: 1,
+                exit_code: 0,
+            },
+            1_000,
+        );
+        // Duplicate start after the row already finalized: must not revert
+        // it back to a pending/no-stop phantom.
+        tr.on_start(start(1, 4, 0, r"c:\a.exe"), &no_live);
+        let evs = tr.drain_flushable(2_000);
+        assert_eq!(evs.len(), 1);
+        assert_eq!(evs[0].stop_time_ms, Some(1_000));
+    }
+
+    #[test]
+    fn recent_ring_lineage_lookup_is_reuse_proof_at_capture_time() {
+        // pid 100 is reused: an earlier launch starting at t=0, then a
+        // later one starting at t=2_000. A child that started at t=1_000
+        // (between the two) must resolve its parent to the *earlier*
+        // launch, the one actually alive at that time.
+        let mut tr = LaunchTracker::new_for_test(Vec::new());
+        tr.on_start(start(100, 1, 0, r"c:\first.exe"), &no_live);
+        tr.on_start(start(200, 100, 1_000, r"c:\child.exe"), &no_live);
+        tr.on_start(start(100, 1, 2_000, r"c:\second.exe"), &no_live);
+        let evs = tr.drain_flushable(65_000); // past the 60s Running-flush threshold
+        let child = evs.iter().find(|e| e.pid == 200).unwrap();
+        assert_eq!(child.lineage[0].name, "first.exe");
+    }
+
+    #[test]
+    fn device_map_rebuild_respects_cooldown_using_event_clock() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static REBUILD_CALLS: AtomicU64 = AtomicU64::new(0);
+        fn counting_builder() -> Vec<(String, String)> {
+            REBUILD_CALLS.fetch_add(1, Ordering::SeqCst);
+            Vec::new()
+        }
+        REBUILD_CALLS.store(0, Ordering::SeqCst);
+
+        let mut tr = LaunchTracker::new_for_test_with_rebuild(Vec::new(), counting_builder);
+        tr.on_start(start(1, 4, 0, r"\Device\Mup\a.exe"), &no_live);
+        assert_eq!(REBUILD_CALLS.load(Ordering::SeqCst), 1);
+        // Still within the 60s cooldown window: no second rebuild.
+        tr.on_start(start(2, 4, 10_000, r"\Device\Mup\b.exe"), &no_live);
+        assert_eq!(REBUILD_CALLS.load(Ordering::SeqCst), 1);
+        // Past the cooldown: rebuilds again.
+        tr.on_start(start(3, 4, 61_000, r"\Device\Mup\c.exe"), &no_live);
+        assert_eq!(REBUILD_CALLS.load(Ordering::SeqCst), 2);
     }
 }
