@@ -606,18 +606,25 @@ pub fn save_launch_events_with_cap(
     if events.is_empty() {
         return Ok(());
     }
-    for event in events {
-        conn.execute(
+    // `&Connection` (not `&mut Connection`) is the brief's pinned signature,
+    // so `Connection::transaction` (which needs `&mut`) isn't available;
+    // `unchecked_transaction` gets the same atomicity -- one fsync for the
+    // whole batch, and the cap eviction never runs partially -- without it.
+    let transaction = conn.unchecked_transaction()?;
+    {
+        let mut statement = transaction.prepare_cached(
             "INSERT OR REPLACE INTO launch_events(pid, start_time_ms, payload)
              VALUES (?1, ?2, ?3)",
-            params![
+        )?;
+        for event in events {
+            statement.execute(params![
                 event.pid,
                 event.start_time_ms,
                 serde_json::to_string(event)?
-            ],
-        )?;
+            ])?;
+        }
     }
-    conn.execute(
+    transaction.execute(
         "DELETE FROM launch_events WHERE (pid, start_time_ms) IN (
            SELECT pid, start_time_ms FROM launch_events
            ORDER BY start_time_ms ASC
@@ -625,6 +632,7 @@ pub fn save_launch_events_with_cap(
          )",
         [cap as i64],
     )?;
+    transaction.commit()?;
     Ok(())
 }
 
@@ -1151,6 +1159,29 @@ mod tests {
     }
 
     #[test]
+    fn launch_event_exactly_at_the_retention_cutoff_is_kept() {
+        let connection = open_test_connection();
+        let now_ms = 1_000_000_000_000_i64;
+        let cutoff = now_ms - LAUNCH_RETENTION_MS;
+        let at_cutoff = sample_launch(1, cutoff);
+        let one_before_cutoff = sample_launch(2, cutoff - 1);
+        save_launch_events(&connection, &[at_cutoff, one_before_cutoff]).unwrap();
+
+        let removed = prune_launch_events(&connection, now_ms).unwrap();
+        assert_eq!(
+            removed, 1,
+            "only the row strictly older than the cutoff is pruned"
+        );
+
+        let loaded = load_launch_events(&connection, 0).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(
+            loaded[0].pid, 1,
+            "a row exactly at the cutoff is kept (strict < convention)"
+        );
+    }
+
+    #[test]
     fn launch_events_are_capped_evicting_oldest() {
         let connection = open_test_connection();
         let cap = 20usize;
@@ -1165,6 +1196,42 @@ mod tests {
         assert_eq!(oldest_surviving, 10, "the 10 oldest rows were evicted");
         let newest = loaded.iter().map(|e| e.start_time_ms).max().unwrap();
         assert_eq!(newest as usize, cap + 10 - 1, "the newest row is kept");
+    }
+
+    #[test]
+    fn inserting_exactly_the_cap_evicts_nothing() {
+        let connection = open_test_connection();
+        let cap = 20usize;
+        let events: Vec<LaunchEvent> = (0..cap)
+            .map(|i| sample_launch(i as u32, i as i64))
+            .collect();
+        save_launch_events_with_cap(&connection, &events, cap).unwrap();
+
+        let loaded = load_launch_events(&connection, 0).unwrap();
+        assert_eq!(loaded.len(), cap, "count == cap inserts nothing to evict");
+        let oldest_surviving = loaded.iter().map(|e| e.start_time_ms).min().unwrap();
+        assert_eq!(
+            oldest_surviving, 0,
+            "the oldest row survives at exactly the cap"
+        );
+    }
+
+    #[test]
+    fn inserting_one_past_the_cap_evicts_exactly_the_oldest() {
+        let connection = open_test_connection();
+        let cap = 20usize;
+        let events: Vec<LaunchEvent> = (0..cap + 1)
+            .map(|i| sample_launch(i as u32, i as i64))
+            .collect();
+        save_launch_events_with_cap(&connection, &events, cap).unwrap();
+
+        let loaded = load_launch_events(&connection, 0).unwrap();
+        assert_eq!(loaded.len(), cap);
+        let oldest_surviving = loaded.iter().map(|e| e.start_time_ms).min().unwrap();
+        assert_eq!(
+            oldest_surviving, 1,
+            "exactly one row (start_time_ms == 0) was evicted"
+        );
     }
 
     #[test]
