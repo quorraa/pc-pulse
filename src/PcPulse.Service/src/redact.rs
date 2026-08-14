@@ -93,19 +93,23 @@ fn in_quotes_at(in_quotes: &[bool], idx: usize) -> bool {
     in_quotes.get(idx).copied().unwrap_or(false)
 }
 
-/// For each character position `i`, whether a `;` occurs anywhere in
-/// `chars[i..]`. Built once per pass in O(n) (backward scan) so pass 4 can
-/// decide, per match, whether it's looking at a genuine `;`-delimited
-/// connection string (in which case only `;` should terminate a value) or a
-/// bare `key=value` with no connection-string structure at all (in which
-/// case whitespace should terminate it too, so it can't run off the end of
-/// the command line).
-fn compute_has_semicolon_suffix(chars: &[char]) -> Vec<bool> {
-    let mut result = vec![false; chars.len() + 1];
-    for idx in (0..chars.len()).rev() {
-        result[idx] = chars[idx] == ';' || result[idx + 1];
-    }
-    result
+/// Normalizes a key for vocabulary comparison: lowercases and strips `_`
+/// and `-` separators, so header/param naming conventions like `api_key`
+/// normalize the same as the credential vocabulary word `apikey`.
+fn normalize_key(key: &str) -> String {
+    key.chars()
+        .filter(|c| *c != '_' && *c != '-')
+        .collect::<String>()
+        .to_ascii_lowercase()
+}
+
+/// Whether `key`, once normalized, *contains* a credential vocabulary word
+/// — not just equals one — so a conventionally-prefixed header name like
+/// `x-api-key` (normalizes to `xapikey`) still matches the vocabulary word
+/// `apikey`.
+fn is_vocab_key_normalized(key: &str) -> bool {
+    let norm = normalize_key(key);
+    VOCAB.iter().any(|v| norm.contains(&normalize_key(v)))
 }
 
 /// Pass 1: credential vocabulary as `key=value`, `key:value`, `--key value`,
@@ -273,16 +277,24 @@ fn read_value(chars: &[char], start: usize, in_quotes: bool) -> (usize, usize) {
 /// exempt: the path portion (everything before the first `?`, if any) is
 /// split on `/` and each segment is checked independently, so a
 /// secret-looking path/URL segment (e.g. a Slack webhook token) still gets
-/// caught. Two refinements keep this from over-redacting:
-/// - The query portion (from the first `?` onward) is left completely
-///   untouched here — it's pass 3's job, which redacts query *values* by
-///   vocabulary key while preserving the key name (`?token=abc...` must
-///   stay `?token=‹redacted›`, not have its key name eaten too).
+/// caught. Three refinements keep this from over- or under-redacting:
 /// - Within the path portion, a segment's trailing `.extension` (1-5
 ///   alphanumeric characters after the final `.`) is set aside before the
 ///   opaque-run check, and reattached after — so a hashed asset filename
 ///   like `application-a1b2c3d4e5f6.js` redacts to `‹redacted›.js` instead
 ///   of losing its extension.
+/// - The query portion (from the first `?` onward) is split on `&`, and
+///   each `key=value` pair whose key does *not* normalize to a credential
+///   vocabulary word (see `is_vocab_key_normalized`) has its value —
+///   *only* the value, never the key name — opaque-run checked
+///   independently. This is what catches non-vocabulary high-entropy query
+///   parameters (Azure SAS `sig=`, AWS `X-Amz-Signature=`, ...) that
+///   neither pass 1 nor pass 3 would otherwise touch, while `?page=2`
+///   survives untouched.
+/// - A pair whose key *does* normalize to a vocabulary word (`token`,
+///   `api_key`, `x-api-key`, ...) is left completely untouched here — it's
+///   pass 3's job, exclusively, so the two passes never double-redact (and
+///   double-count) the same value.
 fn redact_long_opaque_runs(input: &str, count: &mut u32) -> String {
     let chars: Vec<char> = input.chars().collect();
     let mut out = String::with_capacity(input.len());
@@ -323,10 +335,22 @@ fn redact_long_opaque_runs(input: &str, count: &mut u32) -> String {
                 }
             }
 
-            // Query portion (starting at '?', if present) is left verbatim
-            // for pass 3's key-aware query redaction.
-            for c in query_part {
-                out.push(*c);
+            // Query portion (starting at '?', if present): split on '&' and
+            // redact each pair's value independently (never the key name).
+            if !query_part.is_empty() {
+                out.push(query_part[0]); // '?'
+                let params = &query_part[1..];
+                let mut pstart = 0usize;
+                for idx in 0..=params.len() {
+                    if idx == params.len() || params[idx] == '&' {
+                        let pair = &params[pstart..idx];
+                        out.push_str(&redact_query_pair(pair, count));
+                        if idx < params.len() {
+                            out.push('&');
+                        }
+                        pstart = idx + 1;
+                    }
+                }
             }
         } else {
             out.push_str(&redact_opaque_runs_in_word(word, count));
@@ -336,6 +360,28 @@ fn redact_long_opaque_runs(input: &str, count: &mut u32) -> String {
     }
 
     out
+}
+
+/// Redacts a single `&`-delimited query `key=value` pair (or bare token,
+/// with no `=`). A vocabulary-matched key (per `is_vocab_key_normalized`)
+/// is left entirely untouched — that's pass 3's job exclusively, so the two
+/// passes never double-redact the same value. Otherwise, only the value is
+/// opaque-run checked; the key name always survives.
+fn redact_query_pair(pair: &[char], count: &mut u32) -> String {
+    if let Some(eq_idx) = pair.iter().position(|c| *c == '=') {
+        let key = &pair[..eq_idx];
+        let key_str: String = key.iter().collect();
+        if is_vocab_key_normalized(&key_str) {
+            return pair.iter().collect();
+        }
+        let value = &pair[eq_idx + 1..];
+        let mut out = key_str;
+        out.push('=');
+        out.push_str(&redact_opaque_runs_in_word(value, count));
+        out
+    } else {
+        redact_opaque_runs_in_word(pair, count)
+    }
 }
 
 /// Redacts a single `/`-delimited path segment, preserving a short trailing
@@ -479,7 +525,10 @@ fn redact_url_query(input: &str, count: &mut u32) -> String {
                     .unwrap_or(rest.len());
                 let key = &rest[..key_end];
 
-                if key_end < rest.len() && rest.as_bytes()[key_end] == b'=' && is_vocab_word(key) {
+                if key_end < rest.len()
+                    && rest.as_bytes()[key_end] == b'='
+                    && is_vocab_key_normalized(key)
+                {
                     let val_start = key_end + 1;
                     let val_end = rest[val_start..]
                         .find(|c: char| c == '&' || c.is_whitespace())
@@ -509,20 +558,22 @@ fn redact_url_query(input: &str, count: &mut u32) -> String {
 
 /// Pass 4: connection-string fragments `(Password|Pwd|User Id|Uid)\s*=\s*value`.
 ///
-/// Value termination:
-/// - Inside a quoted connection string (`in_q`), the value always runs to
-///   the next `;` or the closing `"`, since connection strings can
-///   legitimately contain spaces in values, and the value must never run
-///   past the argv element it lives in.
-/// - Outside quotes, if a `;` occurs anywhere later in the input, this is a
-///   genuine `;`-delimited connection string fragment and the value still
-///   runs only to the next `;` — even across embedded spaces (e.g.
-///   `Password=my secret;`), or the tail of the secret leaks.
-/// - Outside quotes, if no `;` occurs anywhere later in the input, there is
-///   no connection-string structure to speak of (this is really pass 1's
-///   bare `key=value` leftover), so the value also stops at the next
-///   whitespace — otherwise it would swallow unrelated trailing
-///   command-line text all the way to end-of-string.
+/// Value termination is decided *locally*, at each character, by the
+/// earliest of:
+/// (a) a `;`;
+/// (b) the closing `"`, when the match sits inside a quoted argv element;
+/// (c) an "argument boundary" — whitespace immediately followed by `-` or
+///     `/` (the start of another CLI flag) — so a value can still contain
+///     embedded spaces (`Password=my secret;`, `User Id=john smith;`)
+///     without pass 4 running off the end of the command line whenever no
+///     `;` happens to follow. An earlier version of this pass decided
+///     whitespace-vs-`;` termination by whether a `;` occurred *anywhere
+///     later in the whole input*, which over-triggered `;`-only mode any
+///     time a stray `;` showed up downstream for any reason (e.g. inside a
+///     later `--exec "a;b"` argument), destroying unrelated trailing
+///     arguments and unbalancing quotes. The boundary check here only ever
+///     looks at the value's own immediate neighborhood.
+/// (d) end of string.
 ///
 /// Already-redacted guard: skip only when the value is *exactly* the
 /// redaction token — not merely prefixed by it — so attacker-supplied text
@@ -534,7 +585,6 @@ fn redact_connection_strings(input: &str, count: &mut u32) -> String {
 
     let chars: Vec<char> = input.chars().collect();
     let in_quotes = compute_in_quotes(&chars);
-    let has_semicolon_after = compute_has_semicolon_suffix(&chars);
     let mut out = String::with_capacity(input.len());
     let mut i = 0usize;
 
@@ -552,22 +602,7 @@ fn redact_connection_strings(input: &str, count: &mut u32) -> String {
                     j = skip_ws(&chars, j);
                     let val_start = j;
                     let in_q = in_quotes_at(&in_quotes, val_start);
-                    let has_semicolon_ahead =
-                        has_semicolon_after.get(val_start).copied().unwrap_or(false);
-                    let mut val_end = val_start;
-                    while val_end < chars.len() {
-                        let c = chars[val_end];
-                        if c == ';' {
-                            break;
-                        }
-                        if in_q && c == '"' {
-                            break;
-                        }
-                        if !in_q && !has_semicolon_ahead && c.is_whitespace() {
-                            break;
-                        }
-                        val_end += 1;
-                    }
+                    let val_end = connection_string_value_end(&chars, val_start, in_q);
                     let value: String = chars[val_start..val_end].iter().collect();
                     if val_end > val_start && value != REDACTED {
                         out.push_str(&chars[i..val_start].iter().collect::<String>());
@@ -584,6 +619,26 @@ fn redact_connection_strings(input: &str, count: &mut u32) -> String {
     }
 
     out
+}
+
+/// Finds where a pass-4 connection-string value ends, per the local
+/// termination rule documented on `redact_connection_strings`.
+fn connection_string_value_end(chars: &[char], val_start: usize, in_quotes: bool) -> usize {
+    let mut val_end = val_start;
+    while val_end < chars.len() {
+        let c = chars[val_end];
+        if c == ';' {
+            break;
+        }
+        if in_quotes && c == '"' {
+            break;
+        }
+        if c.is_whitespace() && matches!(chars.get(val_end + 1), Some('-') | Some('/')) {
+            break;
+        }
+        val_end += 1;
+    }
+    val_end
 }
 
 /// Matches `key` (which may contain a single literal space for "user id")
@@ -803,10 +858,17 @@ mod tests {
     fn c1_unquoted_connection_string_value_with_space_is_fully_redacted() {
         let (r, n) = redact_command_line("app Server=x;Password=my secret;");
         assert_eq!(r, "app Server=x;Password=\u{2039}redacted\u{203a};");
-        // "secret" is itself a vocabulary word, so pass 1 catches "my" on
-        // its own first and pass 4 mops up the rest ("secret") in a second
-        // pass — both counted, but with no leak either way, which is the
-        // property under test.
+        // n == 2 here, not 1 — but not because "secret" happens to be a
+        // vocabulary word (a non-vocabulary tail like "my banana;" produces
+        // the identical n == 2). It's an overlapping-span double-count:
+        // pass 1's value read always stops at the first whitespace no
+        // matter what follows, so it redacts only "my" and leaves the tail
+        // ("secret") as unmatched plain text; pass 4 then re-matches the
+        // "Password=" prefix left behind and mops up the whole remaining
+        // "‹redacted› secret" as a second, overlapping redaction. Both
+        // spans get counted even though they jointly cover one logical
+        // secret — no leak either way, which is the property under test
+        // (asserted directly against the exact final string above).
         assert_eq!(n, 2);
     }
 
@@ -870,6 +932,104 @@ mod tests {
         let (r, n) = redact_command_line("/dist/application-a1b2c3d4e5f6.js");
         assert!(r.contains("\u{2039}redacted\u{203a}.js"), "{r}");
         assert!(!r.contains("application-a1b2c3d4e5f6"), "{r}");
+        assert_eq!(n, 1);
+    }
+
+    // -- Security review, fix round 3 -----------------------------------
+
+    // N1 (critical, new leak from round 2's I2 fix): leaving the entire
+    // query portion untouched by pass 2 let high-entropy values under
+    // *non*-vocabulary keys (Azure SAS `sig=`, AWS `X-Amz-Signature=`, a
+    // plain `api_key=`) through verbatim — pass 3 only redacts
+    // vocabulary-keyed values, and pass 2 was no longer looking at the
+    // query at all. Ruling: pass 2 now splits the query portion on '&' and
+    // opaque-run-checks each pair's *value* only (never the key), for keys
+    // that don't normalize to a vocabulary word; vocabulary-keyed pairs are
+    // left to pass 3 exclusively so the two passes never double-count.
+    #[test]
+    fn n1_azure_sas_signature_value_is_redacted() {
+        let (r, n) = redact_command_line(
+            "az storage blob url --sas-token \"https://acct.blob.core.windows.net/container/blob.txt?sv=2021-01-01&sig=aBcDeF1234567890aBcDeF1234567890\"",
+        );
+        assert!(!r.contains("aBcDeF1234567890aBcDeF1234567890"), "{r}");
+        assert!(r.contains("sig=\u{2039}redacted\u{203a}"), "{r}");
+        assert!(n >= 1);
+    }
+
+    #[test]
+    fn n1_aws_x_amz_signature_value_is_redacted() {
+        let (r, n) = redact_command_line(
+            "curl \"https://s3.amazonaws.com/bucket/key?X-Amz-Signature=abcdef0123abcdef0123abcdef0123\"",
+        );
+        assert!(!r.contains("abcdef0123abcdef0123abcdef0123"), "{r}");
+        assert!(
+            r.contains("X-Amz-Signature=\u{2039}redacted\u{203a}"),
+            "{r}"
+        );
+        assert!(n >= 1);
+    }
+
+    #[test]
+    fn n1_api_key_query_param_is_redacted_via_normalized_vocab_match() {
+        let (r, n) = redact_command_line(
+            "curl \"https://api.example.com/v1?api_key=abc123def456abc123def456\"",
+        );
+        assert!(!r.contains("abc123def456abc123def456"), "{r}");
+        assert!(r.contains("api_key=\u{2039}redacted\u{203a}"), "{r}");
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn n1_query_key_names_and_short_values_survive() {
+        let (r, _n) =
+            redact_command_line("curl https://x.io/a?token=abc123def456abc123def456&page=2");
+        assert!(r.contains("?token=\u{2039}redacted\u{203a}"), "{r}");
+        assert!(r.contains("&page=2"), "{r}");
+    }
+
+    // N2 (important, over-redaction from round 2's C1 fix): pass 4's
+    // "does a ';' occur anywhere later in the whole input" lookahead
+    // over-triggered ';'-only termination whenever a stray ';' showed up
+    // *downstream for any unrelated reason* — e.g. inside a later `--exec
+    // "a;b"` argument — destroying trailing arguments and unbalancing
+    // quotes. Replaced entirely with a local rule: the value runs until the
+    // earliest of ';', a closing '"' (inside quotes), an argument boundary
+    // (whitespace immediately followed by '-' or '/'), or end of string.
+    #[test]
+    fn n2_semicolon_in_a_later_unrelated_argument_does_not_over_redact() {
+        let (r, n) = redact_command_line(r#"app password=hunter2 --verbose --exec "a;b""#);
+        assert!(!r.contains("hunter2"), "{r}");
+        assert!(r.contains("--verbose"), "{r}");
+        assert!(r.contains(r#"--exec "a;b""#), "{r}");
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn n2_connection_string_value_with_space_still_fully_redacted() {
+        let (r, _n) = redact_command_line("app Server=x;Password=my secret;");
+        assert_eq!(r, "app Server=x;Password=\u{2039}redacted\u{203a};");
+    }
+
+    #[test]
+    fn n2_user_id_value_with_space_still_fully_redacted() {
+        let (r, _n) = redact_command_line("app Server=x;User Id=john smith;");
+        assert!(!r.contains("john"), "{r}");
+        assert!(!r.contains("smith"), "{r}");
+    }
+
+    #[test]
+    fn n2_bare_password_still_does_not_swallow_trailing_flags() {
+        let (r, n) = redact_command_line("app password=hunter2 --verbose --port 80");
+        assert!(!r.contains("hunter2"), "{r}");
+        assert!(r.contains("--verbose"), "{r}");
+        assert!(r.contains("--port 80"), "{r}");
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn n2_uid_with_space_then_trailing_flags_both_handled() {
+        let (r, n) = redact_command_line("app Uid=john smith --port 80;");
+        assert_eq!(r, "app Uid=\u{2039}redacted\u{203a} --port 80;");
         assert_eq!(n, 1);
     }
 }
