@@ -132,7 +132,7 @@ pub(crate) fn decode_event(
 
 /// Converts a raw FILETIME value (100ns ticks since 1601-01-01) to
 /// milliseconds since the Unix epoch.
-fn filetime_to_epoch_ms(filetime: u64) -> i64 {
+pub(crate) fn filetime_to_epoch_ms(filetime: u64) -> i64 {
     (filetime as i64 - FILETIME_EPOCH_DIFF_TICKS) / TICKS_PER_MS
 }
 

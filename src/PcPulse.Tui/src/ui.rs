@@ -9653,6 +9653,7 @@ mod tests {
             // incidents pane shows no offset line.
             demand: None,
             heavy_minutes_trailing_hour: None,
+            launch_capture: Default::default(),
         });
         app
     }

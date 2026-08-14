@@ -474,6 +474,13 @@ pub struct Snapshot {
     /// the ones worth asking for. `None` alongside [`Self::demand`].
     #[serde(default)]
     pub heavy_minutes_trailing_hour: Option<u16>,
+    /// Launch-history capture health, republished every sample. Additive:
+    /// snapshots from services that predate launch history have no such
+    /// field and deserialize to the all-zero default, which reads as "no
+    /// launches seen" -- the same thing a service that has just started
+    /// reports.
+    #[serde(default)]
+    pub launch_capture: LaunchCaptureStatus,
 }
 
 impl Default for Snapshot {
@@ -490,6 +497,7 @@ impl Default for Snapshot {
             learning_minutes_left: None,
             demand: None,
             heavy_minutes_trailing_hour: None,
+            launch_capture: LaunchCaptureStatus::default(),
         }
     }
 }
@@ -1093,6 +1101,28 @@ pub struct LaunchCaptureStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshot_carries_launch_capture_as_an_additive_camel_case_field() {
+        let snapshot = Snapshot {
+            launch_capture: LaunchCaptureStatus {
+                starts_seen: 12,
+                cmdline_session_active: true,
+                ..LaunchCaptureStatus::default()
+            },
+            ..Snapshot::default()
+        };
+        let json = serde_json::to_string(&snapshot).unwrap();
+        assert!(json.contains("\"launchCapture\""), "{json}");
+        assert!(json.contains("\"cmdlineSessionActive\":true"), "{json}");
+
+        // A snapshot from a service that predates launch history has no such
+        // field and must still deserialize.
+        let mut older: serde_json::Value = serde_json::from_str(&json).unwrap();
+        older.as_object_mut().unwrap().remove("launchCapture");
+        let decoded: Snapshot = serde_json::from_value(older).unwrap();
+        assert_eq!(decoded.launch_capture, LaunchCaptureStatus::default());
+    }
 
     #[test]
     fn snapshot_round_trips_with_hardware_metrics() {

@@ -585,6 +585,42 @@ impl Storage {
         connection.execute_batch("PRAGMA incremental_vacuum(256);")?;
         Ok(())
     }
+
+    /// Locked wrapper over [`save_launch_events`] for the sampling loop.
+    pub fn save_launches(&self, events: &[LaunchEvent]) -> Result<()> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow::anyhow!("database lock poisoned"))?;
+        save_launch_events(&connection, events)
+    }
+
+    /// Locked wrapper over [`save_cmdline`]. `blob` is already redacted and
+    /// DPAPI-encrypted by the caller; this layer never sees plaintext.
+    pub fn save_launch_cmdline(
+        &self,
+        pid: u32,
+        start_time_ms: i64,
+        captured_at_ms: i64,
+        blob: &[u8],
+    ) -> Result<()> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow::anyhow!("database lock poisoned"))?;
+        save_cmdline(&connection, pid, start_time_ms, captured_at_ms, blob)
+    }
+
+    /// Locked wrapper over [`prune_cmdlines`]: command lines run on their own
+    /// (`commandLineRetentionHours`) clock, pruned hourly rather than by the
+    /// daily job that handles everything else.
+    pub fn prune_launch_cmdlines(&self, cutoff_ms: i64) -> Result<usize> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow::anyhow!("database lock poisoned"))?;
+        prune_cmdlines(&connection, cutoff_ms)
+    }
 }
 
 /// Upsert launch events (payload JSON keyed by `(pid, start_time_ms)`), then

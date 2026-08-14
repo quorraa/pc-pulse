@@ -3,8 +3,10 @@ use crate::{
     analysis::{AgentContextSource, build_agent_context},
     baselines::BaselineStore,
     config::Settings,
-    etw::EtwCollector,
+    etw::{CmdlineCollector, EtwCollector, EtwHealth},
+    etw_props::ParsedProcessEvent,
     eventlog::EventLogCollector,
+    launches::{CmdlineJoiner, LaunchTracker, LiveProcessInfo},
     metrics::{
         MetricCollector,
         dumps::{DumpEngine, WindowsDumpSource},
@@ -13,8 +15,9 @@ use crate::{
         live::LiveEngine,
     },
     models::{
-        DiagnosticLogResponse, DiagnosticLogStatus, OpenIncidentRef, PipeRequest, PipeResponse,
-        ProcessMetric, ProcessNode, Rating, RatingVerdict, Snapshot, SystemMetric,
+        DiagnosticLogResponse, DiagnosticLogStatus, LaunchCaptureStatus, LaunchEvent,
+        OpenIncidentRef, PipeRequest, PipeResponse, ProcessMetric, ProcessNode, Rating,
+        RatingVerdict, Snapshot, SystemMetric,
     },
     pipe,
     quality::{Calibration, derive_offsets},
@@ -609,6 +612,134 @@ fn observe_heavy_minute(
     marks.len().min(u16::MAX as usize) as u16
 }
 
+/// How often the command-line retention clock runs. Command lines have their
+/// own (`commandLineRetentionHours`) window, deliberately shorter and
+/// separate from the daily prune everything else rides on.
+const CMDLINE_PRUNE_INTERVAL: Duration = Duration::from_secs(3_600);
+/// How long the loop waits before retrying a command-line session that
+/// failed to start (typically the machine's eight system-logger slots being
+/// full). Long enough that a permanently full pool costs one log line and a
+/// `StartTraceW` call every five minutes, not one per tick.
+const CMDLINE_SESSION_RETRY: Duration = Duration::from_secs(300);
+
+/// One ETW session's loss counters, read as absolute per-session totals.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+struct EtwCounters {
+    dropped_channel: u64,
+    etw_events_lost: u64,
+    malformed_events: u64,
+    events_lost_query_failures: u64,
+}
+
+impl EtwCounters {
+    fn read(health: &EtwHealth) -> Self {
+        Self {
+            dropped_channel: health.dropped_channel.load(Ordering::Relaxed),
+            etw_events_lost: health.etw_events_lost.load(Ordering::Relaxed),
+            malformed_events: health.malformed_events.load(Ordering::Relaxed),
+            events_lost_query_failures: health.events_lost_query_failures.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Accumulates one ETW session's counters into service-lifetime totals.
+///
+/// `EtwHealth`'s counters are absolute **per collector session** and restart
+/// at zero whenever the collector is rebuilt (see [`EtwHealth`]). A naive
+/// `current - previous` underflows across such a restart, so every fold here
+/// goes through [`EtwCounterTotals::fold`]: a decrease is read as a restart
+/// and the new absolute value counts as the delta, never as negative loss.
+/// The service-lifetime totals this produces are what the snapshot reports,
+/// so a restart of the ETW collector never rewinds the operator's view of
+/// how much was lost.
+#[derive(Debug, Default)]
+struct EtwCounterTotals {
+    last: EtwCounters,
+    total: EtwCounters,
+}
+
+impl EtwCounterTotals {
+    fn observe(&mut self, current: EtwCounters) {
+        Self::fold(
+            &mut self.total.dropped_channel,
+            &mut self.last.dropped_channel,
+            current.dropped_channel,
+        );
+        Self::fold(
+            &mut self.total.etw_events_lost,
+            &mut self.last.etw_events_lost,
+            current.etw_events_lost,
+        );
+        Self::fold(
+            &mut self.total.malformed_events,
+            &mut self.last.malformed_events,
+            current.malformed_events,
+        );
+        Self::fold(
+            &mut self.total.events_lost_query_failures,
+            &mut self.last.events_lost_query_failures,
+            current.events_lost_query_failures,
+        );
+    }
+
+    fn fold(total: &mut u64, last: &mut u64, current: u64) {
+        let delta = if current < *last {
+            // The session restarted: everything it reports now is new loss.
+            current
+        } else {
+            current - *last
+        };
+        *total = total.saturating_add(delta);
+        *last = current;
+    }
+
+    /// The session this was tracking has gone away; the next one starts its
+    /// counters from zero.
+    fn session_ended(&mut self) {
+        self.last = EtwCounters::default();
+    }
+
+    fn totals(&self) -> EtwCounters {
+        self.total
+    }
+}
+
+/// One joined command line, ready to be stored encrypted.
+struct JoinedCmdline {
+    pid: u32,
+    start_time_ms: i64,
+    redacted: String,
+    redacted_fields: u32,
+}
+
+/// Attaches captured command lines to the launch rows about to be persisted
+/// and returns what to store encrypted.
+///
+/// Every row is left with `command_line: None` on the way out. `launch_events`
+/// payloads are plain JSON on disk, so a command line left on the row would
+/// be a second, *unencrypted* at-rest copy of exactly the data the design
+/// takes care to redact and DPAPI-protect. The only stored copy is the blob
+/// in `launch_cmdlines`; clients get it back through the service's
+/// per-request decrypt path.
+fn join_command_lines(
+    joiner: &mut CmdlineJoiner,
+    events: &mut [LaunchEvent],
+) -> Vec<JoinedCmdline> {
+    let mut joined = Vec::new();
+    for event in events.iter_mut() {
+        if let Some((redacted, redacted_fields)) = joiner.attach(event) {
+            joined.push(JoinedCmdline {
+                pid: event.pid,
+                start_time_ms: event.start_time_ms,
+                redacted,
+                redacted_fields,
+            });
+        }
+        event.command_line = None;
+    }
+    joined
+}
+
 fn sampling_loop(
     state: &Arc<AppState>,
     mut baselines: BaselineStore,
@@ -650,6 +781,24 @@ fn sampling_loop(
     // Which minutes of the trailing hour were heavy; see
     // [`observe_heavy_minute`]. Feeds the client's rating nudge.
     let mut heavy_minutes: VecDeque<i64> = VecDeque::new();
+    // Launch history. The tracker turns this tick's drained ETW start/stop
+    // events into rows; the joiner holds command lines only while the opt-in
+    // setting is on (it is cleared the moment it goes off).
+    let mut launches = LaunchTracker::new();
+    let mut joiner = CmdlineJoiner::new();
+    let mut cmdline_session: Option<CmdlineCollector> = None;
+    let mut next_cmdline_session_retry = Instant::now();
+    // Due immediately: a service that restarts more often than hourly must
+    // still enforce the command-line retention window, and anything already
+    // past it should go on this run's first sample, not an hour into it.
+    let mut next_cmdline_prune = Instant::now();
+    let mut process_totals = EtwCounterTotals::default();
+    let mut cmdline_totals = EtwCounterTotals::default();
+    let mut cmdlines_captured: u64 = 0;
+    let mut cmdlines_redacted_fields: u64 = 0;
+    // One line per failure mode, not one per event: a broken DPAPI or a
+    // failing insert repeats every tick and must not flood the log.
+    let mut cmdline_protect_logged = false;
     loop {
         let started = Instant::now();
         let settings = state
@@ -659,7 +808,13 @@ fn sampling_loop(
             .clone();
         if etw.is_none() && Instant::now() >= next_etw_retry {
             match EtwCollector::start() {
-                Ok(collector) => etw = Some(collector),
+                Ok(collector) => {
+                    // Fresh session, fresh (zeroed) counters: tell the
+                    // accumulator so the new session's totals are counted
+                    // from zero rather than diffed against the old one's.
+                    process_totals.session_ended();
+                    etw = Some(collector);
+                }
                 Err(error) => {
                     eprintln!("ETW retry failed: {error:#}");
                     next_etw_retry = Instant::now() + Duration::from_secs(60);
@@ -749,6 +904,148 @@ fn sampling_loop(
                 .map_err(|_| anyhow!("baseline lock poisoned"))?;
             live.clone_from(&baselines.machine);
         }
+
+        // ---- Launch history --------------------------------------------
+        // Opt-in command-line capture, toggled live. While the setting is
+        // off there is no session at all, so no command line ever enters
+        // this process -- turning it off also drops whatever the joiner was
+        // still holding, so nothing captured before the flip can be
+        // persisted after it.
+        if settings.capture_command_lines {
+            if cmdline_session.is_none() && Instant::now() >= next_cmdline_session_retry {
+                match CmdlineCollector::start() {
+                    Ok(collector) => {
+                        cmdline_totals.session_ended();
+                        cmdline_session = Some(collector);
+                    }
+                    Err(error) => {
+                        // Fail soft: the machine allows eight system-logger
+                        // sessions in total, and an exhausted pool means no
+                        // command lines, never a failed sample.
+                        eprintln!(
+                            "command-line capture session unavailable; \
+                             continuing without command lines: {error:#}"
+                        );
+                        next_cmdline_session_retry = Instant::now() + CMDLINE_SESSION_RETRY;
+                    }
+                }
+            }
+        } else if cmdline_session.take().is_some() {
+            cmdline_totals.session_ended();
+            joiner.clear();
+            next_cmdline_session_retry = Instant::now();
+        }
+        if let Some(collector) = cmdline_session.as_ref() {
+            for captured in collector.take_cmdlines() {
+                // `offer` redacts before storing; the raw line dies here.
+                joiner.offer(captured.pid, captured.start_ms, &captured.command_line);
+            }
+        }
+        // Drain the process-event queue every tick. The bounded channel is
+        // the only thing between the ETW callback and this loop: a tick that
+        // skips the drain costs events once 4096 pile up (`droppedChannel`).
+        if let Some(collector) = etw.as_ref() {
+            let by_pid: HashMap<u32, &ProcessMetric> = processes
+                .iter()
+                .map(|process| (process.pid, process))
+                .collect();
+            let live_lookup = |pid: u32| -> Option<LiveProcessInfo> {
+                by_pid.get(&pid).map(|process| LiveProcessInfo {
+                    name: process.name.clone(),
+                    path: (!process.executable_path.is_empty())
+                        .then(|| process.executable_path.clone()),
+                    parent_pid: process.parent_pid,
+                })
+            };
+            for event in collector.take_process_events() {
+                match event {
+                    ParsedProcessEvent::Start(props) => launches.on_start(props, &live_lookup),
+                    ParsedProcessEvent::Stop(props) => launches.on_stop(props, timestamp_ms),
+                }
+            }
+        }
+        // The window sweep this sample already performed: `has_visible_window`
+        // is the enumeration result for every sampled pid, which is exactly
+        // what decides a launch's final window state.
+        for process in &processes {
+            launches.observe_window(process.pid, process.has_visible_window);
+        }
+        // Runs every tick even with ETW down, so pending rows still age out.
+        let mut flushable = launches.drain_flushable(timestamp_ms);
+        // Attaching only happens while the opt-in is active; with it off the
+        // joiner is empty anyway, but the guard keeps that a policy rather
+        // than an accident.
+        let joined = if settings.capture_command_lines && cmdline_session.is_some() {
+            join_command_lines(&mut joiner, &mut flushable)
+        } else {
+            Vec::new()
+        };
+        if !flushable.is_empty()
+            && let Err(error) = state.storage.save_launches(&flushable)
+        {
+            eprintln!("failed to persist launch events: {error:#}");
+        }
+        for line in &joined {
+            // Redacted already; encrypted here, so the only at-rest copy of
+            // a command line is a DPAPI blob.
+            match crate::dpapi::protect(line.redacted.as_bytes()) {
+                Ok(blob) => match state.storage.save_launch_cmdline(
+                    line.pid,
+                    line.start_time_ms,
+                    timestamp_ms,
+                    &blob,
+                ) {
+                    Ok(()) => {
+                        cmdlines_captured += 1;
+                        cmdlines_redacted_fields += u64::from(line.redacted_fields);
+                    }
+                    Err(error) => {
+                        if !cmdline_protect_logged {
+                            cmdline_protect_logged = true;
+                            eprintln!("failed to persist a captured command line: {error:#}");
+                        }
+                    }
+                },
+                Err(status) => {
+                    if !cmdline_protect_logged {
+                        cmdline_protect_logged = true;
+                        eprintln!(
+                            "DPAPI encryption of a captured command line failed with status \
+                             0x{status:08x}; command lines will not be stored"
+                        );
+                    }
+                }
+            }
+        }
+        if let Some(collector) = etw.as_ref() {
+            process_totals.observe(EtwCounters::read(collector.health()));
+        }
+        if let Some(collector) = cmdline_session.as_ref() {
+            cmdline_totals.observe(EtwCounters::read(collector.health()));
+        }
+        let launch_capture = {
+            let process_etw = process_totals.totals();
+            let cmdline_etw = cmdline_totals.totals();
+            LaunchCaptureStatus {
+                dropped_channel: process_etw
+                    .dropped_channel
+                    .saturating_add(cmdline_etw.dropped_channel),
+                etw_events_lost: process_etw
+                    .etw_events_lost
+                    .saturating_add(cmdline_etw.etw_events_lost),
+                malformed_events: process_etw
+                    .malformed_events
+                    .saturating_add(cmdline_etw.malformed_events),
+                events_lost_query_failures: process_etw
+                    .events_lost_query_failures
+                    .saturating_add(cmdline_etw.events_lost_query_failures),
+                cmdline_session_active: cmdline_session.is_some(),
+                cmdlines_captured,
+                cmdlines_redacted_fields,
+                ..launches.status()
+            }
+        };
+
         forensics.observe(&evaluation.active, timestamp_ms);
         forensics.decorate(&mut evaluation.active);
         forensics.decorate(&mut evaluation.changed);
@@ -801,6 +1098,9 @@ fn sampling_loop(
             // hour was heavy enough to be worth asking about.
             snapshot.demand = Some(demand);
             snapshot.heavy_minutes_trailing_hour = Some(heavy_minutes_trailing_hour);
+            // Launch-capture health, with this tick's ETW loss counters
+            // already merged in (see `EtwCounterTotals`).
+            snapshot.launch_capture = launch_capture;
         }
         if Instant::now() >= next_system_write {
             state.storage.insert_system(&system)?;
@@ -826,6 +1126,18 @@ fn sampling_loop(
         if Instant::now() >= next_prune {
             state.storage.prune(&settings, timestamp_ms)?;
             next_prune = Instant::now() + Duration::from_secs(24 * 60 * 60);
+        }
+        if Instant::now() >= next_cmdline_prune {
+            // Command lines run on their own, much shorter clock than the
+            // daily prune everything else uses. Runs whether or not capture
+            // is currently on: turning the setting off must not leave
+            // already-captured lines sitting past their retention.
+            let cutoff_ms =
+                timestamp_ms - i64::from(settings.command_line_retention_hours) * 3_600_000;
+            if let Err(error) = state.storage.prune_launch_cmdlines(cutoff_ms) {
+                eprintln!("failed to prune captured command lines: {error:#}");
+            }
+            next_cmdline_prune = Instant::now() + CMDLINE_PRUNE_INTERVAL;
         }
         if Instant::now() >= next_baseline_save {
             state
@@ -1000,6 +1312,118 @@ mod tests {
         assert_eq!(entries[0].kind, "collectorBudget");
         assert_eq!(entries[0].bucket, DemandBucket::Heavy);
         assert!((entries[0].offset - 0.05).abs() < 1e-9);
+    }
+
+    fn launch_event(pid: u32, start_time_ms: i64) -> LaunchEvent {
+        LaunchEvent {
+            pid,
+            start_time_ms,
+            stop_time_ms: None,
+            exit_code: None,
+            exe_name: "x.exe".into(),
+            exe_path: r"c:\x.exe".into(),
+            raw_image_path: None,
+            session_id: 1,
+            parent_pid: 4,
+            lineage: Vec::new(),
+            window_state: crate::models::WindowState::Running,
+            console_host: false,
+            command_line: None,
+        }
+    }
+
+    #[test]
+    fn etw_counter_totals_accumulate_deltas_and_survive_a_collector_restart() {
+        let mut totals = EtwCounterTotals::default();
+        totals.observe(EtwCounters {
+            dropped_channel: 10,
+            etw_events_lost: 4,
+            malformed_events: 1,
+            events_lost_query_failures: 0,
+        });
+        totals.observe(EtwCounters {
+            dropped_channel: 25,
+            etw_events_lost: 4,
+            malformed_events: 3,
+            events_lost_query_failures: 2,
+        });
+        assert_eq!(
+            totals.totals(),
+            EtwCounters {
+                dropped_channel: 25,
+                etw_events_lost: 4,
+                malformed_events: 3,
+                events_lost_query_failures: 2,
+            }
+        );
+
+        // The collector died and was rebuilt: its counters restart at zero.
+        // A naive `current - previous` would underflow here; the totals must
+        // instead keep what was already counted and add the new session's
+        // absolute values as they arrive.
+        totals.observe(EtwCounters {
+            dropped_channel: 3,
+            etw_events_lost: 0,
+            malformed_events: 0,
+            events_lost_query_failures: 0,
+        });
+        assert_eq!(
+            totals.totals(),
+            EtwCounters {
+                dropped_channel: 28,
+                etw_events_lost: 4,
+                malformed_events: 3,
+                events_lost_query_failures: 2,
+            },
+            "a restart must never rewind or underflow the reported loss"
+        );
+        totals.observe(EtwCounters {
+            dropped_channel: 5,
+            ..EtwCounters::default()
+        });
+        assert_eq!(totals.totals().dropped_channel, 30);
+    }
+
+    #[test]
+    fn etw_counter_totals_count_a_fresh_session_from_zero() {
+        // The loop announces a deliberate restart (a new collector built
+        // after ETW came back), so the new session's first read is counted
+        // in full even if it happens to equal the dead session's last one.
+        let mut totals = EtwCounterTotals::default();
+        totals.observe(EtwCounters {
+            dropped_channel: 7,
+            ..EtwCounters::default()
+        });
+        totals.session_ended();
+        totals.observe(EtwCounters {
+            dropped_channel: 7,
+            ..EtwCounters::default()
+        });
+        assert_eq!(totals.totals().dropped_channel, 14);
+    }
+
+    #[test]
+    fn joined_command_lines_never_ride_along_in_the_launch_event_payload() {
+        // The redacted line goes to the encrypted table only. A copy left on
+        // the LaunchEvent would be written to `launch_events` as plain JSON
+        // -- a second, unencrypted at-rest copy of the very data the design
+        // redacts and DPAPI-protects.
+        let mut joiner = CmdlineJoiner::new();
+        joiner.offer(500, 10_000, "tool.exe --password hunter2");
+        let mut events = vec![launch_event(500, 10_100), launch_event(600, 10_100)];
+        let joined = join_command_lines(&mut joiner, &mut events);
+
+        assert_eq!(joined.len(), 1);
+        assert_eq!(joined[0].pid, 500);
+        assert_eq!(joined[0].start_time_ms, 10_100);
+        assert!(!joined[0].redacted.contains("hunter2"));
+        assert!(joined[0].redacted_fields >= 1);
+        assert!(
+            events.iter().all(|event| event.command_line.is_none()),
+            "no command line may be persisted in the launch_events payload"
+        );
+        let payload = serde_json::to_string(&events[0]).unwrap();
+        assert!(!payload.contains("commandLine"), "{payload}");
     }
 
     #[test]

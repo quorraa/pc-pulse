@@ -19,8 +19,9 @@ use windows::{
         Foundation::{ERROR_SUCCESS, WIN32_ERROR},
         System::Diagnostics::Etw::{
             CONTROLTRACE_HANDLE, CloseTrace, ControlTraceW, EVENT_CONTROL_CODE_ENABLE_PROVIDER,
-            EVENT_RECORD, EVENT_TRACE_CONTROL_QUERY, EVENT_TRACE_CONTROL_STOP,
-            EVENT_TRACE_LOGFILEW, EVENT_TRACE_PROPERTIES, EVENT_TRACE_REAL_TIME_MODE,
+            EVENT_HEADER_FLAG_32_BIT_HEADER, EVENT_RECORD, EVENT_TRACE_CONTROL_QUERY,
+            EVENT_TRACE_CONTROL_STOP, EVENT_TRACE_FLAG_PROCESS, EVENT_TRACE_LOGFILEW,
+            EVENT_TRACE_PROPERTIES, EVENT_TRACE_REAL_TIME_MODE, EVENT_TRACE_SYSTEM_LOGGER_MODE,
             EnableTraceEx2, OpenTraceW, PROCESS_TRACE_MODE_EVENT_RECORD,
             PROCESS_TRACE_MODE_REAL_TIME, PROCESSTRACE_HANDLE, ProcessTrace, StartTraceW,
             TRACE_LEVEL_INFORMATION, WNODE_FLAG_TRACED_GUID,
@@ -517,6 +518,370 @@ fn _status_is_success(status: WIN32_ERROR) -> bool {
     status == ERROR_SUCCESS
 }
 
+// ---------------------------------------------------------------------------
+// Opt-in command-line capture: a second, classic (MOF) system-logger session.
+//
+// PRIVACY INVARIANT: nothing below runs unless `captureCommandLines` is on.
+// The runtime constructs `CmdlineCollector` when the setting flips on and
+// drops it when the setting flips off; with the setting off there is no
+// session, no callback, and no command-line data anywhere in this process.
+// ---------------------------------------------------------------------------
+
+/// Classic MOF `Process` event class GUID. Kernel (system-logger) sessions
+/// report classic events with the MOF class GUID in `ProviderId` when the
+/// trace is opened in `EVENT_RECORD` mode.
+const PROCESS_MOF_GUID: GUID = GUID::from_u128(0x3d6fa8d0_fe05_11d0_9dda_00c04fd7ba7c);
+/// `Process_TypeGroup1` Start opcode. Rundown (`DCStart`, opcode 3) is
+/// deliberately ignored: its timestamp is the session's start, not the
+/// process's, so joining it by start-time proximity would attach a command
+/// line to the wrong launch.
+const PROCESS_MOF_START_OPCODE: u8 = 1;
+/// Bound on the command-line queue, mirroring [`PROCESS_EVENT_CAPACITY`].
+const CMDLINE_EVENT_CAPACITY: usize = 4096;
+
+/// One command line observed by the MOF session, as it left the kernel:
+/// **not yet redacted**. It is redacted the moment it reaches
+/// `CmdlineJoiner::offer`, which is the only consumer.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CapturedCmdline {
+    pub pid: u32,
+    /// The MOF event's own timestamp, in epoch milliseconds. The MOF
+    /// `Process_TypeGroup1` payload carries no create-time field, so the
+    /// event header's timestamp (which ETW converts to FILETIME for
+    /// non-raw-timestamp sessions) stands in for it. It is within
+    /// milliseconds of the manifest session's `CreateTime`, comfortably
+    /// inside the joiner's 2s window.
+    pub start_ms: i64,
+    pub command_line: String,
+}
+
+struct CmdlineCallbackState {
+    tx: Sender<CapturedCmdline>,
+    health: Arc<EtwHealth>,
+}
+
+impl CmdlineCallbackState {
+    fn offer(&self, captured: CapturedCmdline) {
+        match self.tx.try_send(captured) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
+                self.health.dropped_channel.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+/// The opt-in MOF session. Constructing it starts the session; dropping it
+/// stops the session and joins its consumer thread, which is what makes the
+/// live setting toggle work without a service restart.
+pub struct CmdlineCollector {
+    rx: Receiver<CapturedCmdline>,
+    health: Arc<EtwHealth>,
+    session_name: Vec<u16>,
+    control_handle: CONTROLTRACE_HANDLE,
+    worker: Option<JoinHandle<()>>,
+}
+
+unsafe impl Send for CmdlineCollector {}
+unsafe impl Sync for CmdlineCollector {}
+
+impl CmdlineCollector {
+    /// Starts the command-line session. Fails soft for the caller's
+    /// purposes: the system-logger pool is only eight sessions machine-wide,
+    /// and an exhausted pool surfaces here as an error the runtime logs
+    /// before reporting `cmdlineSessionActive = false`.
+    pub fn start() -> Result<Self> {
+        let session = format!("PcPulse-Cmdline-{}", std::process::id());
+        let session_name: Vec<u16> = session.encode_utf16().chain(Some(0)).collect();
+        let (tx, rx) = bounded(CMDLINE_EVENT_CAPACITY);
+        let health = Arc::new(EtwHealth::default());
+        let state = Arc::new(CmdlineCallbackState {
+            tx,
+            health: Arc::clone(&health),
+        });
+        let worker_name = session_name.clone();
+        let (initialized_tx, initialized_rx) = mpsc::sync_channel::<Result<u64>>(1);
+        let worker = thread::Builder::new()
+            .name("pcpulse-etw-cmdline".into())
+            .spawn(move || match run_cmdline_trace(&worker_name, state) {
+                Ok((control, processing, context)) => {
+                    let _ = initialized_tx.send(Ok(control.Value));
+                    unsafe {
+                        let _ = ProcessTrace(&[processing], None, None);
+                        let _ = CloseTrace(processing);
+                        drop(Arc::from_raw(context));
+                    }
+                }
+                Err(error) => {
+                    let _ = initialized_tx.send(Err(error));
+                }
+            })?;
+        let control_value = initialized_rx.recv().map_err(|_| {
+            anyhow::anyhow!("command-line ETW worker exited during initialization")
+        })??;
+        Ok(Self {
+            rx,
+            health,
+            session_name,
+            control_handle: CONTROLTRACE_HANDLE {
+                Value: control_value,
+            },
+            worker: Some(worker),
+        })
+    }
+
+    /// Loss/integrity counters for this session, same semantics (and same
+    /// restart caveat) as [`EtwCollector::health`]. Only `dropped_channel`
+    /// and `malformed_events` are populated here: this session is never
+    /// queried for `EventsLost`.
+    pub fn health(&self) -> &Arc<EtwHealth> {
+        &self.health
+    }
+
+    /// Drains everything captured since the last call. Never blocks.
+    pub fn take_cmdlines(&self) -> Vec<CapturedCmdline> {
+        self.rx.try_iter().collect()
+    }
+}
+
+impl Drop for CmdlineCollector {
+    fn drop(&mut self) {
+        let mut properties = property_buffer(&self.session_name);
+        unsafe {
+            let _ = ControlTraceW(
+                self.control_handle,
+                PCWSTR(self.session_name.as_ptr()),
+                properties.as_mut_ptr().cast::<EVENT_TRACE_PROPERTIES>(),
+                EVENT_TRACE_CONTROL_STOP,
+            );
+        }
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+fn run_cmdline_trace(
+    name: &[u16],
+    state: Arc<CmdlineCallbackState>,
+) -> Result<(
+    CONTROLTRACE_HANDLE,
+    PROCESSTRACE_HANDLE,
+    *const CmdlineCallbackState,
+)> {
+    let mut properties = system_property_buffer(name);
+    let properties_ptr = properties.as_mut_ptr().cast::<EVENT_TRACE_PROPERTIES>();
+    let mut control = CONTROLTRACE_HANDLE::default();
+    let status = unsafe { StartTraceW(&mut control, PCWSTR(name.as_ptr()), properties_ptr) };
+    if status != ERROR_SUCCESS {
+        // ERROR_NO_SYSTEM_RESOURCES here is the eight-slot system-logger pool
+        // being full; the caller logs and reports the session as inactive.
+        bail!(
+            "StartTraceW (command-line system logger) failed with status 0x{:08x}",
+            status.0
+        );
+    }
+    // A system logger's providers come from EnableFlags at start time, so
+    // there is no EnableTraceEx2 step here.
+
+    let context = Arc::into_raw(state) as *mut core::ffi::c_void;
+    let mut logfile = EVENT_TRACE_LOGFILEW {
+        LoggerName: PWSTR(name.as_ptr() as *mut u16),
+        Anonymous1: windows::Win32::System::Diagnostics::Etw::EVENT_TRACE_LOGFILEW_0 {
+            ProcessTraceMode: PROCESS_TRACE_MODE_REAL_TIME | PROCESS_TRACE_MODE_EVENT_RECORD,
+        },
+        Anonymous2: windows::Win32::System::Diagnostics::Etw::EVENT_TRACE_LOGFILEW_1 {
+            EventRecordCallback: Some(cmdline_record_callback),
+        },
+        Context: context,
+        ..Default::default()
+    };
+    let processing = unsafe { OpenTraceW(&mut logfile) };
+    if processing == PROCESSTRACE_HANDLE::default() || processing.Value == u64::MAX {
+        unsafe {
+            drop(Arc::from_raw(context.cast::<CmdlineCallbackState>()));
+            let _ = ControlTraceW(
+                control,
+                PCWSTR(name.as_ptr()),
+                properties_ptr,
+                EVENT_TRACE_CONTROL_STOP,
+            );
+        }
+        bail!("OpenTraceW failed for the command-line session");
+    }
+    Ok((control, processing, context.cast::<CmdlineCallbackState>()))
+}
+
+unsafe extern "system" fn cmdline_record_callback(record: *mut EVENT_RECORD) {
+    if record.is_null() {
+        return;
+    }
+    unsafe {
+        let event = &*record;
+        let Some(state) = (event.UserContext as *const CmdlineCallbackState).as_ref() else {
+            return;
+        };
+        if event.EventHeader.ProviderId != PROCESS_MOF_GUID
+            || event.EventHeader.EventDescriptor.Opcode != PROCESS_MOF_START_OPCODE
+        {
+            return;
+        }
+        if event.UserData.is_null() {
+            state
+                .health
+                .malformed_events
+                .fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        let payload =
+            std::slice::from_raw_parts(event.UserData.cast::<u8>(), event.UserDataLength as usize);
+        let pointer_size = if event.EventHeader.Flags & EVENT_HEADER_FLAG_32_BIT_HEADER as u16 != 0
+        {
+            4
+        } else {
+            8
+        };
+        match parse_mof_process_start(
+            payload,
+            pointer_size,
+            event.EventHeader.EventDescriptor.Version,
+        ) {
+            Some(parsed) => state.offer(CapturedCmdline {
+                pid: parsed.pid,
+                start_ms: crate::etw_props::filetime_to_epoch_ms(
+                    event.EventHeader.TimeStamp as u64,
+                ),
+                command_line: parsed.command_line,
+            }),
+            None => {
+                state
+                    .health
+                    .malformed_events
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+/// Property buffer for a *system logger* session: same layout as
+/// [`property_buffer`], plus `EVENT_TRACE_SYSTEM_LOGGER_MODE` and the kernel
+/// `EnableFlags` that select which kernel providers the session carries.
+///
+/// The name is this service's own (`PcPulse-Cmdline-<pid>`), not
+/// `NT Kernel Logger`: since Windows 8 a process may run its own
+/// system-logger session, of which the machine supports eight in total.
+/// `Wnode.Guid` is deliberately left zeroed -- setting it to
+/// `SystemTraceControlGuid` is what asks for the single, global NT Kernel
+/// Logger instead.
+fn system_property_buffer(name: &[u16]) -> Vec<u64> {
+    let mut buffer = property_buffer(name);
+    let properties = unsafe { &mut *buffer.as_mut_ptr().cast::<EVENT_TRACE_PROPERTIES>() };
+    properties.LogFileMode = EVENT_TRACE_REAL_TIME_MODE | EVENT_TRACE_SYSTEM_LOGGER_MODE;
+    properties.EnableFlags = EVENT_TRACE_FLAG_PROCESS;
+    buffer
+}
+
+/// What this module needs out of a classic `Process_TypeGroup1` payload.
+#[derive(Debug, PartialEq)]
+struct MofProcessStart {
+    pid: u32,
+    command_line: String,
+}
+
+/// Parses a classic MOF `Process_TypeGroup1` start payload.
+///
+/// MOF events carry no per-property metadata: the layout is fixed, and its
+/// field offsets depend on the *emitting* process's pointer size and on the
+/// event version. Anything unexpected -- an unsupported version, a truncated
+/// payload, a malformed SID, an unterminated string -- returns `None` so the
+/// caller can count it as malformed rather than guess at bytes.
+///
+/// ```text
+/// v2:  ptr PageDirectoryBase | u32 pid | u32 ppid | u32 session | i32 exit
+///      | SID | ANSI ImageFileName | UTF-16 CommandLine
+/// v3:  ptr UniqueProcessKey  | u32 pid | u32 ppid | u32 session | i32 exit
+///      | ptr DirectoryTableBase | SID | ANSI ImageFileName | UTF-16 CommandLine
+/// v4+: v3 with a u32 Flags between DirectoryTableBase and the SID
+///      (trailing fields after CommandLine are irrelevant here).
+/// ```
+fn parse_mof_process_start(
+    payload: &[u8],
+    pointer_size: usize,
+    version: u8,
+) -> Option<MofProcessStart> {
+    if !(2..=8).contains(&version) {
+        return None;
+    }
+    // PageDirectoryBase (v2) / UniqueProcessKey (v3+).
+    let mut offset = pointer_size;
+    let pid = read_u32_at(payload, offset)?;
+    // ProcessId, ParentId, SessionId, ExitStatus.
+    offset = offset.checked_add(16)?;
+    if version >= 3 {
+        offset = offset.checked_add(pointer_size)?; // DirectoryTableBase
+    }
+    if version >= 4 {
+        offset = offset.checked_add(4)?; // Flags
+    }
+    offset = skip_sid(payload, offset, pointer_size)?;
+    offset = skip_ansi_string(payload, offset)?; // ImageFileName
+    let command_line = read_wide_string_at(payload, offset)?;
+    Some(MofProcessStart { pid, command_line })
+}
+
+fn read_u32_at(payload: &[u8], offset: usize) -> Option<u32> {
+    let bytes: [u8; 4] = payload
+        .get(offset..offset.checked_add(4)?)?
+        .try_into()
+        .ok()?;
+    Some(u32::from_ne_bytes(bytes))
+}
+
+/// Skips the variable-length `UserSID` field, returning the offset just past
+/// it. An absent SID is encoded as a single 4-byte zero; a present one is a
+/// `TOKEN_USER` (a pointer-sized pair) followed by the `SID` itself, whose
+/// length is `8 + 4 * SubAuthorityCount`.
+fn skip_sid(payload: &[u8], offset: usize, pointer_size: usize) -> Option<usize> {
+    if read_u32_at(payload, offset)? == 0 {
+        return offset.checked_add(4);
+    }
+    let sid = offset.checked_add(pointer_size.checked_mul(2)?)?;
+    let revision = *payload.get(sid)?;
+    let sub_authority_count = *payload.get(sid.checked_add(1)?)?;
+    // A SID always has revision 1 and at most 15 sub-authorities; anything
+    // else means the offsets are wrong and the rest of the parse would be
+    // fiction.
+    if revision != 1 || sub_authority_count > 15 {
+        return None;
+    }
+    let end = sid.checked_add(8 + 4 * sub_authority_count as usize)?;
+    (end <= payload.len()).then_some(end)
+}
+
+/// Skips a NUL-terminated ANSI string, returning the offset just past its
+/// terminator, or `None` if the payload ends without one.
+fn skip_ansi_string(payload: &[u8], offset: usize) -> Option<usize> {
+    let rest = payload.get(offset..)?;
+    let nul = rest.iter().position(|&byte| byte == 0)?;
+    offset.checked_add(nul)?.checked_add(1)
+}
+
+/// Reads a NUL-terminated UTF-16LE string at `offset`, byte-pair by byte-pair
+/// so an odd (unaligned) offset is safe. `None` if the payload ends without a
+/// terminator -- a truncated command line is dropped, never half-reported.
+fn read_wide_string_at(payload: &[u8], offset: usize) -> Option<String> {
+    let rest = payload.get(offset..)?;
+    let mut units: Vec<u16> = Vec::new();
+    for chunk in rest.chunks_exact(2) {
+        let unit = u16::from_ne_bytes([chunk[0], chunk[1]]);
+        if unit == 0 {
+            return Some(String::from_utf16_lossy(&units));
+        }
+        units.push(unit);
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -592,6 +957,124 @@ mod tests {
             properties.LogFileNameOffset as usize + slot_bytes
                 <= std::mem::size_of_val(&buffer[..])
         );
+    }
+
+    // -- classic MOF Process_TypeGroup1 payload parsing --------------------
+
+    /// Builds a synthetic `Process_TypeGroup1` payload the way the kernel
+    /// lays one out, so the offset arithmetic is exercised without a live
+    /// kernel session.
+    fn mof_payload(
+        pointer_size: usize,
+        version: u8,
+        pid: u32,
+        image: &str,
+        command_line: &str,
+        with_sid: bool,
+    ) -> Vec<u8> {
+        let mut payload = vec![0u8; pointer_size]; // UniqueProcessKey
+        payload.extend_from_slice(&pid.to_ne_bytes());
+        payload.extend_from_slice(&7u32.to_ne_bytes()); // ParentId
+        payload.extend_from_slice(&1u32.to_ne_bytes()); // SessionId
+        payload.extend_from_slice(&0u32.to_ne_bytes()); // ExitStatus
+        if version >= 3 {
+            payload.extend_from_slice(&vec![0u8; pointer_size]); // DirectoryTableBase
+        }
+        if version >= 4 {
+            payload.extend_from_slice(&0u32.to_ne_bytes()); // Flags
+        }
+        if with_sid {
+            // TOKEN_USER (pointer-sized pair), then a 3-sub-authority SID.
+            payload.extend_from_slice(&vec![0x11u8; pointer_size * 2]);
+            payload.push(1); // Revision
+            payload.push(3); // SubAuthorityCount
+            payload.extend_from_slice(&[0, 0, 0, 0, 0, 5]); // IdentifierAuthority
+            payload.extend_from_slice(&[0u8; 12]); // three sub-authorities
+        } else {
+            payload.extend_from_slice(&0u32.to_ne_bytes()); // empty-SID encoding
+        }
+        payload.extend_from_slice(image.as_bytes());
+        payload.push(0);
+        for unit in command_line.encode_utf16() {
+            payload.extend_from_slice(&unit.to_ne_bytes());
+        }
+        payload.extend_from_slice(&0u16.to_ne_bytes());
+        payload
+    }
+
+    #[test]
+    fn mof_start_parses_pid_and_command_line_across_versions_and_pointer_sizes() {
+        for pointer_size in [4usize, 8] {
+            for version in [2u8, 3, 4] {
+                for with_sid in [true, false] {
+                    let payload = mof_payload(
+                        pointer_size,
+                        version,
+                        4242,
+                        "notepad.exe",
+                        r#"notepad.exe "c:\a b\notes.txt""#,
+                        with_sid,
+                    );
+                    let parsed = parse_mof_process_start(&payload, pointer_size, version)
+                        .unwrap_or_else(|| {
+                            panic!("v{version} ptr{pointer_size} sid={with_sid} failed to parse")
+                        });
+                    assert_eq!(parsed.pid, 4242);
+                    assert_eq!(parsed.command_line, r#"notepad.exe "c:\a b\notes.txt""#);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mof_start_rejects_truncation_at_every_length_without_panicking() {
+        let full = mof_payload(8, 4, 99, "x.exe", "x.exe --go", true);
+        for length in 0..full.len() {
+            // Every prefix is malformed (the command line's terminator is the
+            // last thing in the payload) and must be refused, not guessed at.
+            assert!(
+                parse_mof_process_start(&full[..length], 8, 4).is_none(),
+                "prefix of length {length} was accepted"
+            );
+        }
+        assert!(parse_mof_process_start(&full, 8, 4).is_some());
+    }
+
+    #[test]
+    fn mof_start_rejects_unsupported_versions_and_bogus_sids() {
+        let payload = mof_payload(8, 4, 1, "x.exe", "x", true);
+        assert!(parse_mof_process_start(&payload, 8, 1).is_none());
+        assert!(parse_mof_process_start(&payload, 8, 9).is_none());
+
+        // Corrupt the SID revision byte: the rest of the layout would be
+        // fiction, so the event is refused rather than mis-parsed.
+        let mut corrupt = payload.clone();
+        let sid_revision = 8 + 16 + 8 + 4 + 16;
+        corrupt[sid_revision] = 9;
+        assert!(parse_mof_process_start(&corrupt, 8, 4).is_none());
+    }
+
+    #[test]
+    fn mof_start_with_empty_command_line_parses_as_empty_not_missing() {
+        let payload = mof_payload(8, 4, 7, "svc.exe", "", true);
+        let parsed = parse_mof_process_start(&payload, 8, 4).unwrap();
+        assert_eq!(parsed.pid, 7);
+        assert_eq!(parsed.command_line, "");
+    }
+
+    #[test]
+    fn system_property_buffer_requests_a_process_system_logger() {
+        let name: Vec<u16> = "PcPulse-Cmdline-1".encode_utf16().chain(Some(0)).collect();
+        let mut buffer = system_property_buffer(&name);
+        let properties = unsafe { &*buffer.as_mut_ptr().cast::<EVENT_TRACE_PROPERTIES>() };
+        assert_eq!(
+            properties.LogFileMode,
+            EVENT_TRACE_REAL_TIME_MODE | EVENT_TRACE_SYSTEM_LOGGER_MODE
+        );
+        assert_eq!(properties.EnableFlags, EVENT_TRACE_FLAG_PROCESS);
+        // Never the global NT Kernel Logger: that is what a
+        // SystemTraceControlGuid here would ask for.
+        assert_eq!(properties.Wnode.Guid, GUID::zeroed());
     }
 
     #[test]

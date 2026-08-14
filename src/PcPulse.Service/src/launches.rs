@@ -550,6 +550,104 @@ impl Default for LaunchTracker {
     }
 }
 
+/// Cap on the pending command-line ring. Entries only live here between the
+/// MOF session observing a process start and the launch row for that same
+/// start being drained (a tick or two), so this is generous slack; it exists
+/// so an unmatched flood costs bounded memory rather than unbounded growth.
+const CMDLINE_JOIN_CAP: usize = 4096;
+/// How far apart the MOF session's create time and the manifest session's
+/// `CreateTime` may be and still describe the same launch. The two sessions
+/// timestamp the same kernel event from different clocks (manifest
+/// `CreateTime` FILETIME vs. the MOF event's header timestamp), so an exact
+/// match is not available; 2s is the spec's join window.
+const CMDLINE_JOIN_WINDOW_MS: i64 = 2_000;
+
+/// One redacted command line waiting to be joined to its launch row.
+///
+/// There is deliberately no field holding the original text: `offer`
+/// redacts before constructing this, so the raw line exists only as the
+/// caller's borrowed `&str` and is never owned by the joiner.
+struct PendingCmdline {
+    pid: u32,
+    start_ms: i64,
+    redacted: String,
+    redacted_fields: u32,
+}
+
+/// Joins command lines captured by the opt-in MOF session to the launch rows
+/// produced from the manifest session, by `(pid, |start delta| <= 2s)`.
+///
+/// Privacy invariant: this type never stores an un-redacted command line.
+/// [`redact_command_line`](crate::redact::redact_command_line) runs inside
+/// [`CmdlineJoiner::offer`], before the entry is created, so the raw line is
+/// dropped at the door rather than at persist time.
+#[derive(Default)]
+pub struct CmdlineJoiner {
+    entries: VecDeque<PendingCmdline>,
+}
+
+impl CmdlineJoiner {
+    pub fn new() -> Self {
+        Self {
+            entries: VecDeque::new(),
+        }
+    }
+
+    /// Redacts `raw_line` and remembers the result against
+    /// `(pid, event_start_ms)`. The raw text is never stored.
+    pub fn offer(&mut self, pid: u32, event_start_ms: i64, raw_line: &str) {
+        let (redacted, redacted_fields) = crate::redact::redact_command_line(raw_line);
+        self.entries.push_back(PendingCmdline {
+            pid,
+            start_ms: event_start_ms,
+            redacted,
+            redacted_fields,
+        });
+        while self.entries.len() > CMDLINE_JOIN_CAP {
+            self.entries.pop_front();
+        }
+    }
+
+    /// Attaches the closest matching capture to `ev` (same pid, start times
+    /// within [`CMDLINE_JOIN_WINDOW_MS`]), removing it from the ring so one
+    /// capture can never be attached to two launches. Returns the redacted
+    /// line and its redaction count for the caller to persist encrypted.
+    pub fn attach(&mut self, ev: &mut LaunchEvent) -> Option<(String, u32)> {
+        let index = self
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| {
+                entry.pid == ev.pid
+                    && delta_ms(entry.start_ms, ev.start_time_ms) <= CMDLINE_JOIN_WINDOW_MS
+            })
+            .min_by_key(|(_, entry)| delta_ms(entry.start_ms, ev.start_time_ms))
+            .map(|(index, _)| index)?;
+        let entry = self.entries.remove(index)?;
+        ev.command_line = Some(entry.redacted.clone());
+        Some((entry.redacted, entry.redacted_fields))
+    }
+
+    /// Drops every pending capture. Called when the opt-in setting is turned
+    /// off, so nothing captured before the flip can still be persisted after
+    /// it.
+    pub fn clear(&mut self) {
+        self.entries.clear();
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+/// Absolute distance between two epoch-millisecond timestamps, saturating
+/// rather than overflowing/panicking on extreme values (`i64::MIN.abs()`
+/// panics).
+fn delta_ms(a: i64, b: i64) -> i64 {
+    a.saturating_sub(b).saturating_abs()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -921,6 +1019,114 @@ mod tests {
         let evs = tr.drain_flushable(65_000); // past the 60s Running-flush threshold
         let child = evs.iter().find(|e| e.pid == 200).unwrap();
         assert_eq!(child.lineage[0].name, "first.exe");
+    }
+
+    // -- CmdlineJoiner (Task 7) ---------------------------------------
+
+    fn launch_event(pid: u32, start_time_ms: i64) -> LaunchEvent {
+        LaunchEvent {
+            pid,
+            start_time_ms,
+            stop_time_ms: None,
+            exit_code: None,
+            exe_name: "x.exe".into(),
+            exe_path: r"c:\x.exe".into(),
+            raw_image_path: None,
+            session_id: 1,
+            parent_pid: 4,
+            lineage: Vec::new(),
+            window_state: WindowState::Running,
+            console_host: false,
+            command_line: None,
+        }
+    }
+
+    #[test]
+    fn joiner_attaches_within_the_two_second_window_and_removes_the_entry() {
+        let mut joiner = CmdlineJoiner::new();
+        joiner.offer(500, 10_000, r"c:\x.exe --flag");
+        let mut ev = launch_event(500, 11_500); // 1.5s apart
+        let (line, fields) = joiner.attach(&mut ev).expect("within window");
+        assert_eq!(line, r"c:\x.exe --flag");
+        assert_eq!(fields, 0);
+        assert_eq!(ev.command_line.as_deref(), Some(r"c:\x.exe --flag"));
+        // Consumed: a second launch must not inherit the same capture.
+        let mut again = launch_event(500, 11_500);
+        assert!(joiner.attach(&mut again).is_none());
+        assert_eq!(joiner.len(), 0);
+    }
+
+    #[test]
+    fn joiner_exact_window_boundary_matches_and_beyond_it_does_not() {
+        let mut joiner = CmdlineJoiner::new();
+        joiner.offer(500, 10_000, "a");
+        let mut on_edge = launch_event(500, 12_000); // exactly 2 000 ms
+        assert!(joiner.attach(&mut on_edge).is_some());
+
+        joiner.offer(500, 10_000, "b");
+        let mut too_far = launch_event(500, 12_500); // 2.5s apart
+        assert!(joiner.attach(&mut too_far).is_none());
+        assert!(too_far.command_line.is_none());
+        assert_eq!(joiner.len(), 1, "a non-match must not consume the entry");
+    }
+
+    #[test]
+    fn joiner_matches_only_the_same_pid_and_prefers_the_closest_start() {
+        let mut joiner = CmdlineJoiner::new();
+        joiner.offer(500, 10_000, "far");
+        joiner.offer(500, 11_000, "near");
+        joiner.offer(999, 11_100, "other pid");
+        let mut ev = launch_event(500, 11_200);
+        let (line, _) = joiner.attach(&mut ev).unwrap();
+        assert_eq!(line, "near");
+        assert_eq!(joiner.len(), 2);
+    }
+
+    #[test]
+    fn joiner_redacts_on_entry_so_the_secret_is_never_stored() {
+        let mut joiner = CmdlineJoiner::new();
+        joiner.offer(1, 0, "tool.exe --password hunter2 --user bob");
+        let mut ev = launch_event(1, 0);
+        let (line, fields) = joiner.attach(&mut ev).unwrap();
+        assert!(
+            !line.contains("hunter2"),
+            "stored line still has it: {line}"
+        );
+        assert!(fields >= 1, "redaction count must reflect the hit");
+        assert_eq!(ev.command_line.as_deref(), Some(line.as_str()));
+    }
+
+    #[test]
+    fn joiner_attach_on_empty_ring_is_none() {
+        let mut joiner = CmdlineJoiner::new();
+        let mut ev = launch_event(1, 0);
+        assert!(joiner.attach(&mut ev).is_none());
+        assert!(ev.command_line.is_none());
+    }
+
+    #[test]
+    fn joiner_evicts_oldest_past_the_cap() {
+        let mut joiner = CmdlineJoiner::new();
+        for index in 0..(CMDLINE_JOIN_CAP + 10) {
+            joiner.offer(index as u32, index as i64, "x");
+        }
+        assert_eq!(joiner.len(), CMDLINE_JOIN_CAP);
+        // The ten oldest are gone; the newest are still joinable.
+        let mut oldest = launch_event(0, 0);
+        assert!(joiner.attach(&mut oldest).is_none());
+        let newest_pid = (CMDLINE_JOIN_CAP + 9) as u32;
+        let mut newest = launch_event(newest_pid, i64::from(newest_pid));
+        assert!(joiner.attach(&mut newest).is_some());
+    }
+
+    #[test]
+    fn joiner_clear_drops_everything_captured_before_the_toggle_flipped_off() {
+        let mut joiner = CmdlineJoiner::new();
+        joiner.offer(1, 0, "x");
+        joiner.clear();
+        let mut ev = launch_event(1, 0);
+        assert!(joiner.attach(&mut ev).is_none());
+        assert_eq!(joiner.len(), 0);
     }
 
     #[test]
