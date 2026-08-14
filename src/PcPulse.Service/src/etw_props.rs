@@ -1,0 +1,364 @@
+//! TDH property decode core for Microsoft-Windows-Kernel-Process events.
+//!
+//! `decode_event` is a pure, fixture-testable function that turns an
+//! already-extracted property bag into a [`ParsedProcessEvent`]. The unsafe
+//! shell (`parse_process_event`) walks `TRACE_EVENT_INFO` via
+//! `TdhGetEventInformation` and reads each top-level property via
+//! `TdhGetProperty`, then hands the resulting bag to `decode_event`.
+
+use windows::Win32::Foundation::ERROR_INSUFFICIENT_BUFFER;
+use windows::Win32::System::Diagnostics::Etw::{
+    EVENT_RECORD, PROPERTY_DATA_DESCRIPTOR, TDH_INTYPE_FILETIME, TDH_INTYPE_UINT32,
+    TDH_INTYPE_UINT64, TDH_INTYPE_UNICODESTRING, TRACE_EVENT_INFO, TdhGetEventInformation,
+    TdhGetProperty, TdhGetPropertySize,
+};
+
+const PROCESS_START_EVENT_ID: u16 = 1;
+const PROCESS_STOP_EVENT_ID: u16 = 2;
+
+/// FILETIME ticks (100ns intervals) between 1601-01-01 and 1970-01-01.
+const FILETIME_EPOCH_DIFF_TICKS: i64 = 116_444_736_000_000_000;
+const TICKS_PER_MS: i64 = 10_000;
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProcessStartProps {
+    pub pid: u32,
+    pub parent_pid: u32,
+    pub session_id: u32,
+    pub create_time_ms: i64,
+    pub image_name: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProcessStopProps {
+    pub pid: u32,
+    pub exit_code: u32,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ParsedProcessEvent {
+    Start(ProcessStartProps),
+    Stop(ProcessStopProps),
+}
+
+#[derive(Debug, PartialEq)]
+pub enum ParseError {
+    MissingProperty(&'static str),
+    BadType(&'static str),
+    Tdh(u32),
+    UnknownEventId(u16),
+}
+
+/// A single decoded top-level property value. Unknown in-types for
+/// properties we don't need are skipped by the unsafe shell rather than
+/// surfaced as an error.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum PropValue {
+    U32(u32),
+    U64(u64),
+    FileTime(i64),
+    Unicode(String),
+}
+
+fn get<'a>(
+    props: &'a [(String, PropValue)],
+    name: &'static str,
+) -> Result<&'a PropValue, ParseError> {
+    props
+        .iter()
+        .find(|(key, _)| key == name)
+        .map(|(_, value)| value)
+        .ok_or(ParseError::MissingProperty(name))
+}
+
+/// Reads a property as `u32`, accepting a lossless `U64` widening for
+/// manifest versions that emit certain fields as `UInt64`.
+fn get_u32(props: &[(String, PropValue)], name: &'static str) -> Result<u32, ParseError> {
+    match get(props, name)? {
+        PropValue::U32(value) => Ok(*value),
+        PropValue::U64(value) => u32::try_from(*value).map_err(|_| ParseError::BadType(name)),
+        _ => Err(ParseError::BadType(name)),
+    }
+}
+
+fn get_filetime_ms(props: &[(String, PropValue)], name: &'static str) -> Result<i64, ParseError> {
+    match get(props, name)? {
+        PropValue::FileTime(ms) => Ok(*ms),
+        _ => Err(ParseError::BadType(name)),
+    }
+}
+
+fn get_unicode<'a>(
+    props: &'a [(String, PropValue)],
+    name: &'static str,
+) -> Result<&'a str, ParseError> {
+    match get(props, name)? {
+        PropValue::Unicode(value) => Ok(value.as_str()),
+        _ => Err(ParseError::BadType(name)),
+    }
+}
+
+/// Pure, testable core: decode from an already-extracted property bag.
+pub(crate) fn decode_event(
+    event_id: u16,
+    props: &[(String, PropValue)],
+) -> Result<ParsedProcessEvent, ParseError> {
+    match event_id {
+        PROCESS_START_EVENT_ID => {
+            let pid = get_u32(props, "ProcessID")?;
+            let parent_pid = get_u32(props, "ParentProcessID")?;
+            let session_id = get_u32(props, "SessionID")?;
+            let create_time_ms = get_filetime_ms(props, "CreateTime")?;
+            let image_name = get_unicode(props, "ImageName")?.to_string();
+            Ok(ParsedProcessEvent::Start(ProcessStartProps {
+                pid,
+                parent_pid,
+                session_id,
+                create_time_ms,
+                image_name,
+            }))
+        }
+        PROCESS_STOP_EVENT_ID => {
+            let pid = get_u32(props, "ProcessID")?;
+            let exit_code = get_u32(props, "ExitCode")?;
+            Ok(ParsedProcessEvent::Stop(ProcessStopProps {
+                pid,
+                exit_code,
+            }))
+        }
+        other => Err(ParseError::UnknownEventId(other)),
+    }
+}
+
+/// Converts a raw FILETIME value (100ns ticks since 1601-01-01) to
+/// milliseconds since the Unix epoch.
+fn filetime_to_epoch_ms(filetime: u64) -> i64 {
+    (filetime as i64 - FILETIME_EPOCH_DIFF_TICKS) / TICKS_PER_MS
+}
+
+/// Reads a native-endian `u32` from the start of `bytes`, or `None` if too short.
+fn read_u32_le(bytes: &[u8]) -> Option<u32> {
+    let array: [u8; 4] = bytes.get(..4)?.try_into().ok()?;
+    Some(u32::from_ne_bytes(array))
+}
+
+/// Reads a native-endian `u64` from the start of `bytes`, or `None` if too short.
+fn read_u64_le(bytes: &[u8]) -> Option<u64> {
+    let array: [u8; 8] = bytes.get(..8)?.try_into().ok()?;
+    Some(u64::from_ne_bytes(array))
+}
+
+thread_local! {
+    /// Reused across calls on the dedicated `pcpulse-etw` thread to avoid
+    /// reallocating the TDH info buffer for every event.
+    static TDH_INFO_BUFFER: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Unsafe shell: `EVENT_RECORD` -> property bag via `TdhGetEventInformation`,
+/// then `decode_event`. Called only from the ETW callback (Task 2).
+///
+/// # Safety
+/// `record` must point to a valid, live `EVENT_RECORD` for the duration of
+/// this call, as provided by the ETW `EventRecordCallback`.
+pub unsafe fn parse_process_event(
+    record: *const EVENT_RECORD,
+) -> Result<ParsedProcessEvent, ParseError> {
+    if record.is_null() {
+        return Err(ParseError::MissingProperty("EVENT_RECORD"));
+    }
+    let event_id = unsafe { (*record).EventHeader.EventDescriptor.Id };
+
+    let info_ptr = TDH_INFO_BUFFER.with(|cell| -> Result<*const TRACE_EVENT_INFO, ParseError> {
+        let mut buffer = cell.borrow_mut();
+        if buffer.is_empty() {
+            buffer.resize(4096, 0);
+        }
+        loop {
+            let mut buffer_size = buffer.len() as u32;
+            let status = unsafe {
+                TdhGetEventInformation(
+                    record,
+                    None,
+                    Some(buffer.as_mut_ptr().cast::<TRACE_EVENT_INFO>()),
+                    &mut buffer_size,
+                )
+            };
+            if status == 0 {
+                return Ok(buffer.as_ptr().cast::<TRACE_EVENT_INFO>());
+            }
+            if status == ERROR_INSUFFICIENT_BUFFER.0 {
+                buffer.resize(buffer_size as usize, 0);
+                continue;
+            }
+            return Err(ParseError::Tdh(status));
+        }
+    })?;
+
+    let info = unsafe { &*info_ptr };
+    let base = info_ptr.cast::<u8>();
+    let property_count = info.TopLevelPropertyCount as usize;
+    let property_array =
+        unsafe { std::slice::from_raw_parts(info.EventPropertyInfoArray.as_ptr(), property_count) };
+
+    let mut props: Vec<(String, PropValue)> = Vec::with_capacity(property_count);
+    for property in property_array {
+        let name = unsafe { read_wide_string_at(base, property.NameOffset) };
+        let in_type = unsafe { property.Anonymous1.nonStructType.InType };
+
+        let mut name_wide: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
+        let descriptor = PROPERTY_DATA_DESCRIPTOR {
+            PropertyName: name_wide.as_mut_ptr() as u64,
+            ArrayIndex: u32::MAX,
+            Reserved: 0,
+        };
+
+        let mut property_size: u32 = 0;
+        let size_status = unsafe {
+            TdhGetPropertySize(
+                record,
+                None,
+                std::slice::from_ref(&descriptor),
+                &mut property_size,
+            )
+        };
+        if size_status != 0 {
+            return Err(ParseError::Tdh(size_status));
+        }
+
+        let mut value_buffer = vec![0u8; property_size as usize];
+        let get_status = unsafe {
+            TdhGetProperty(
+                record,
+                None,
+                std::slice::from_ref(&descriptor),
+                &mut value_buffer,
+            )
+        };
+        if get_status != 0 {
+            return Err(ParseError::Tdh(get_status));
+        }
+
+        let value = match in_type {
+            t if t == TDH_INTYPE_UINT32.0 as u16 => match read_u32_le(&value_buffer) {
+                Some(raw) => PropValue::U32(raw),
+                None => continue,
+            },
+            t if t == TDH_INTYPE_UINT64.0 as u16 => match read_u64_le(&value_buffer) {
+                Some(raw) => PropValue::U64(raw),
+                None => continue,
+            },
+            t if t == TDH_INTYPE_FILETIME.0 as u16 => match read_u64_le(&value_buffer) {
+                Some(raw) => PropValue::FileTime(filetime_to_epoch_ms(raw)),
+                None => continue,
+            },
+            t if t == TDH_INTYPE_UNICODESTRING.0 as u16 => {
+                let wide: &[u16] = unsafe {
+                    std::slice::from_raw_parts(
+                        value_buffer.as_ptr().cast::<u16>(),
+                        value_buffer.len() / 2,
+                    )
+                };
+                let end = wide.iter().position(|&c| c == 0).unwrap_or(wide.len());
+                PropValue::Unicode(String::from_utf16_lossy(&wide[..end]))
+            }
+            // Unknown in-types for properties we don't need are skipped, not errors.
+            _ => continue,
+        };
+
+        props.push((name, value));
+    }
+
+    decode_event(event_id, &props)
+}
+
+/// Reads a NUL-terminated UTF-16 string at the given byte offset from
+/// `base`, as used for the various `*Offset` fields in `TRACE_EVENT_INFO`.
+unsafe fn read_wide_string_at(base: *const u8, offset: u32) -> String {
+    if offset == 0 {
+        return String::new();
+    }
+    let ptr = unsafe { base.add(offset as usize).cast::<u16>() };
+    let mut len = 0usize;
+    // SAFETY: caller guarantees `base` points into a valid TRACE_EVENT_INFO
+    // buffer produced by TdhGetEventInformation, whose offset fields point
+    // to NUL-terminated UTF-16 strings within that same buffer.
+    unsafe {
+        while *ptr.add(len) != 0 {
+            len += 1;
+        }
+        let slice = std::slice::from_raw_parts(ptr, len);
+        String::from_utf16_lossy(slice)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn start_bag() -> Vec<(String, PropValue)> {
+        vec![
+            ("ProcessID".into(), PropValue::U32(4242)),
+            ("ParentProcessID".into(), PropValue::U32(1000)),
+            ("SessionID".into(), PropValue::U32(1)),
+            ("CreateTime".into(), PropValue::FileTime(1_786_600_000_000)),
+            (
+                "ImageName".into(),
+                PropValue::Unicode(r"\Device\HarddiskVolume4\Windows\System32\cmd.exe".into()),
+            ),
+        ]
+    }
+    #[test]
+    fn decodes_process_start() {
+        let ParsedProcessEvent::Start(s) = decode_event(1, &start_bag()).unwrap() else {
+            panic!("expected Start")
+        };
+        assert_eq!(s.pid, 4242);
+        assert_eq!(s.parent_pid, 1000);
+        assert_eq!(s.session_id, 1);
+        assert_eq!(s.create_time_ms, 1_786_600_000_000);
+        assert!(s.image_name.ends_with("cmd.exe"));
+    }
+    #[test]
+    fn decodes_process_stop() {
+        let bag = vec![
+            ("ProcessID".into(), PropValue::U32(4242)),
+            ("ExitCode".into(), PropValue::U32(0)),
+        ];
+        let ParsedProcessEvent::Stop(s) = decode_event(2, &bag).unwrap() else {
+            panic!("expected Stop")
+        };
+        assert_eq!(s.pid, 4242);
+        assert_eq!(s.exit_code, 0);
+    }
+    #[test]
+    fn missing_property_is_error_not_panic() {
+        let mut bag = start_bag();
+        bag.retain(|(k, _)| k != "ParentProcessID");
+        assert_eq!(
+            decode_event(1, &bag).unwrap_err(),
+            ParseError::MissingProperty("ParentProcessID")
+        );
+    }
+    #[test]
+    fn wrong_type_is_error() {
+        let mut bag = start_bag();
+        bag.iter_mut().find(|(k, _)| k == "ProcessID").unwrap().1 = PropValue::Unicode("42".into());
+        assert_eq!(
+            decode_event(1, &bag).unwrap_err(),
+            ParseError::BadType("ProcessID")
+        );
+    }
+    #[test]
+    fn unknown_event_id_is_error() {
+        assert_eq!(
+            decode_event(15, &start_bag()).unwrap_err(),
+            ParseError::UnknownEventId(15)
+        );
+    }
+    #[test]
+    fn sessionid_u64_widening_accepted() {
+        // Some manifest versions emit UInt64 for SessionID; accept lossless widening.
+        let mut bag = start_bag();
+        bag.iter_mut().find(|(k, _)| k == "SessionID").unwrap().1 = PropValue::U64(1);
+        assert!(decode_event(1, &bag).is_ok());
+    }
+}

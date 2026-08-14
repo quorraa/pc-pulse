@@ -5,6 +5,7 @@ pub mod analysis;
 pub mod baselines;
 pub mod config;
 pub mod etw;
+pub mod etw_props;
 pub mod eventlog;
 pub mod metrics;
 pub mod models;
