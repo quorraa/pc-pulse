@@ -85,6 +85,34 @@ fn device_prefix_matches(lower: &str, device: &str) -> bool {
         .is_some_and(|rest| rest.is_empty() || rest.starts_with(['\\', '/']))
 }
 
+/// Decodes the first target string out of a `QueryDosDeviceW` result buffer.
+///
+/// `QueryDosDeviceW` fills `buf` with a `MULTI_SZ`: one or more
+/// NUL-terminated strings followed by an extra terminating NUL, and `len`
+/// (the value it returns) counts every character written, including all of
+/// those NULs. Naively decoding `buf[..len - 1]` therefore leaves an
+/// embedded NUL at the end of a single-target result (only the final,
+/// list-terminating NUL is stripped), which then never matches as a path
+/// prefix downstream. Splitting on the first NUL both fixes that and picks
+/// just the first target when a drive letter unusually has more than one
+/// (a symbolic-link chain), matching what production code has always
+/// wanted here.
+///
+/// Returns `None` if `len` is `0` or the first target is empty.
+pub(crate) fn first_multi_sz_target(buf: &[u16], len: usize) -> Option<String> {
+    if len == 0 {
+        return None;
+    }
+
+    let bytes = &buf[..len.min(buf.len())];
+    let first = bytes.split(|&c| c == 0).next().unwrap_or(&[]);
+    if first.is_empty() {
+        return None;
+    }
+
+    Some(String::from_utf16_lossy(first))
+}
+
 /// Builds a live `\Device\HarddiskVolumeN` -> drive-letter map by calling
 /// `QueryDosDeviceW` for each drive letter A:..Z:. Only existing mappings
 /// are returned. Callers should cache the result rather than rebuilding it
@@ -101,14 +129,10 @@ pub fn build_device_map() -> Vec<(String, String)> {
         // `buf` is a valid, appropriately-sized output buffer for the
         // duration of the call.
         let len = unsafe { QueryDosDeviceW(PCWSTR(wide_drive.as_ptr()), Some(&mut buf)) };
-        if len == 0 {
-            continue;
-        }
 
-        let device = String::from_utf16_lossy(&buf[..(len as usize).saturating_sub(1)]);
-        if device.is_empty() {
+        let Some(device) = first_multi_sz_target(&buf, len as usize) else {
             continue;
-        }
+        };
 
         map.push((device.to_lowercase(), drive.to_lowercase()));
     }
@@ -980,6 +1004,71 @@ mod tests {
         let (p, mapped) = normalize_image_path(r"\Device\Mup\share\x.exe", &[]);
         assert_eq!(p, r"\device\mup\share\x.exe");
         assert!(!mapped);
+    }
+
+    /// Builds a `QueryDosDeviceW`-shaped buffer: `target` encoded as UTF-16,
+    /// NUL-terminated, followed by the list-terminating extra NUL -- exactly
+    /// what a single-target `MULTI_SZ` result looks like, with `len` set the
+    /// way the real API reports it (counting every char written, both NULs
+    /// included).
+    fn multi_sz_buf(target: &str) -> (Vec<u16>, usize) {
+        let mut buf: Vec<u16> = target.encode_utf16().collect();
+        buf.push(0); // terminates this target
+        buf.push(0); // terminates the MULTI_SZ list
+        let len = buf.len();
+        (buf, len)
+    }
+
+    #[test]
+    fn first_multi_sz_target_decodes_single_target_past_its_nul() {
+        let (buf, len) = multi_sz_buf(r"\Device\HarddiskVolume5");
+        let decoded = first_multi_sz_target(&buf, len);
+        assert_eq!(decoded.as_deref(), Some(r"\Device\HarddiskVolume5"));
+    }
+
+    #[test]
+    fn first_multi_sz_target_picks_first_of_multiple_targets() {
+        let mut buf: Vec<u16> = r"\Device\HarddiskVolume5".encode_utf16().collect();
+        buf.push(0);
+        buf.extend(r"\Device\HarddiskVolumeShadowCopy1".encode_utf16());
+        buf.push(0);
+        buf.push(0); // list-terminating NUL
+        let len = buf.len();
+
+        let decoded = first_multi_sz_target(&buf, len);
+        assert_eq!(decoded.as_deref(), Some(r"\Device\HarddiskVolume5"));
+    }
+
+    #[test]
+    fn first_multi_sz_target_none_when_target_empty() {
+        // An immediate NUL (empty first target) decodes to `None` rather
+        // than an empty string.
+        let buf: Vec<u16> = vec![0, 0];
+        let len = buf.len();
+        assert_eq!(first_multi_sz_target(&buf, len), None);
+    }
+
+    #[test]
+    fn first_multi_sz_target_none_when_len_zero() {
+        let buf: Vec<u16> = vec![0u16; 260];
+        assert_eq!(first_multi_sz_target(&buf, 0), None);
+    }
+
+    #[test]
+    fn device_path_with_trailing_embedded_nul_does_not_match_normalize() {
+        // Documents the pre-fix bug shape: if the device string in the map
+        // still carries a trailing embedded NUL (as `build_device_map` used
+        // to produce before decoding via `first_multi_sz_target`), the
+        // stored prefix never matches a real (NUL-free) image path, so every
+        // launch silently falls through to "unmapped".
+        let device_with_trailing_nul = format!("{}{}", r"\device\harddiskvolume5", '\0');
+        let map = vec![(device_with_trailing_nul, "c:".to_string())];
+
+        let (p, mapped) =
+            normalize_image_path(r"\Device\HarddiskVolume5\Windows\System32\cmd.exe", &map);
+
+        assert!(!mapped, "a NUL-contaminated device prefix must not match");
+        assert_eq!(p, r"\device\harddiskvolume5\windows\system32\cmd.exe");
     }
 
     #[test]
