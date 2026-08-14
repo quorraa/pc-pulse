@@ -377,7 +377,12 @@ fn redact_query_pair(pair: &[char], count: &mut u32) -> String {
         let value = &pair[eq_idx + 1..];
         let mut out = key_str;
         out.push('=');
-        out.push_str(&redact_opaque_runs_in_word(value, count));
+        // Query values are commonly percent-encoded, and a signature like
+        // `aBcD%2Fef12%2B34gh%3Dij56kl78mn90` would otherwise be chopped
+        // into several sub-20-char runs by the `%` separators and survive
+        // in the clear. Inside a query value (and only there) `%` counts as
+        // an opaque character, so the encoded blob is seen as one run.
+        out.push_str(&redact_opaque_runs_inner(value, count, true));
         out
     } else {
         redact_opaque_runs_in_word(pair, count)
@@ -408,14 +413,22 @@ fn redact_path_segment(segment: &[char], count: &mut u32) -> String {
 }
 
 fn redact_opaque_runs_in_word(word: &[char], count: &mut u32) -> String {
+    redact_opaque_runs_inner(word, count, false)
+}
+
+/// As `redact_opaque_runs_in_word`, but `percent_opaque` widens the opaque
+/// alphabet to include `%`. Used only for URL query *values*, which are
+/// routinely percent-encoded.
+fn redact_opaque_runs_inner(word: &[char], count: &mut u32, percent_opaque: bool) -> String {
+    let opaque = |c: char| is_opaque_char(c) || (percent_opaque && c == '%');
     let mut out = String::with_capacity(word.len());
     let mut i = 0usize;
 
     while i < word.len() {
-        if is_opaque_char(word[i]) {
+        if opaque(word[i]) {
             let start = i;
             let mut end = i;
-            while end < word.len() && is_opaque_char(word[end]) {
+            while end < word.len() && opaque(word[end]) {
                 end += 1;
             }
             let token: String = word[start..end].iter().collect();
@@ -558,22 +571,34 @@ fn redact_url_query(input: &str, count: &mut u32) -> String {
 
 /// Pass 4: connection-string fragments `(Password|Pwd|User Id|Uid)\s*=\s*value`.
 ///
-/// Value termination is decided *locally*, at each character, by the
-/// earliest of:
-/// (a) a `;`;
-/// (b) the closing `"`, when the match sits inside a quoted argv element;
-/// (c) an "argument boundary" — whitespace immediately followed by `-` or
-///     `/` (the start of another CLI flag) — so a value can still contain
-///     embedded spaces (`Password=my secret;`, `User Id=john smith;`)
-///     without pass 4 running off the end of the command line whenever no
-///     `;` happens to follow. An earlier version of this pass decided
-///     whitespace-vs-`;` termination by whether a `;` occurred *anywhere
-///     later in the whole input*, which over-triggered `;`-only mode any
-///     time a stray `;` showed up downstream for any reason (e.g. inside a
-///     later `--exec "a;b"` argument), destroying unrelated trailing
-///     arguments and unbalancing quotes. The boundary check here only ever
-///     looks at the value's own immediate neighborhood.
-/// (d) end of string.
+/// Value termination uses a **quote-aware `;` lookahead** to decide, per
+/// match, whether the surrounding text is genuine `;`-delimited
+/// connection-string syntax or just a bare `key=value` token on a command
+/// line. From the value's start:
+/// - If the match sits *inside* a double-quoted argv element, the search
+///   region is bounded by that element's closing `"`, and any `;` within it
+///   qualifies.
+/// - If the match sits *outside* quotes, only an **unquoted** `;` anywhere
+///   later qualifies — a `;` that lives inside some other quoted argument
+///   (e.g. a later `--exec "a;b"`) is not evidence of connection-string
+///   syntax and is ignored.
+///
+/// Then:
+/// - **A qualifying `;` exists** → the value runs to that `;` (or the
+///   closing quote, whichever comes first when inside quotes). There is no
+///   argument-boundary early-out, so a spaced value like
+///   `Password=my -secret;` is redacted whole.
+/// - **No qualifying `;` exists** → the value terminates at the first
+///   whitespace (still bounded by the closing quote when inside quotes), so
+///   a bare `password=hunter2 --verbose --port 80` or
+///   `myapp.exe password=hunter2 input.csv` keeps its trailing arguments.
+///
+/// Two earlier designs failed here: a *whole-input* "does a `;` appear
+/// later" lookahead over-triggered `;`-only mode on stray downstream
+/// semicolons, and a purely local "whitespace followed by `-`/`/` is an
+/// argument boundary" rule cut genuine connection-string values short
+/// (`Password=my -secret;` leaked `-secret`). Quote parity is what lets one
+/// rule do both jobs.
 ///
 /// Already-redacted guard: skip only when the value is *exactly* the
 /// redaction token — not merely prefixed by it — so attacker-supplied text
@@ -601,8 +626,7 @@ fn redact_connection_strings(input: &str, count: &mut u32) -> String {
                     j += 1;
                     j = skip_ws(&chars, j);
                     let val_start = j;
-                    let in_q = in_quotes_at(&in_quotes, val_start);
-                    let val_end = connection_string_value_end(&chars, val_start, in_q);
+                    let val_end = connection_string_value_end(&chars, val_start, &in_quotes);
                     let value: String = chars[val_start..val_end].iter().collect();
                     if val_end > val_start && value != REDACTED {
                         out.push_str(&chars[i..val_start].iter().collect::<String>());
@@ -621,24 +645,40 @@ fn redact_connection_strings(input: &str, count: &mut u32) -> String {
     out
 }
 
-/// Finds where a pass-4 connection-string value ends, per the local
-/// termination rule documented on `redact_connection_strings`.
-fn connection_string_value_end(chars: &[char], val_start: usize, in_quotes: bool) -> usize {
-    let mut val_end = val_start;
-    while val_end < chars.len() {
-        let c = chars[val_end];
-        if c == ';' {
-            break;
+/// Finds where a pass-4 connection-string value ends, per the quote-aware
+/// `;` lookahead documented on `redact_connection_strings`.
+fn connection_string_value_end(chars: &[char], val_start: usize, in_quotes: &[bool]) -> usize {
+    let inside = in_quotes_at(in_quotes, val_start);
+
+    // A value inside a quoted argv element can never run past that
+    // element's closing quote.
+    let region_end = if inside {
+        let mut e = val_start;
+        while e < chars.len() && chars[e] != '"' {
+            e += 1;
         }
-        if in_quotes && c == '"' {
-            break;
+        e
+    } else {
+        chars.len()
+    };
+
+    // Quote-aware ';' lookahead: inside quotes, any ';' up to the closing
+    // quote qualifies; outside quotes, only an unquoted ';' does.
+    let mut k = val_start;
+    while k < region_end {
+        if chars[k] == ';' && (inside || !in_quotes_at(in_quotes, k)) {
+            return k;
         }
-        if c.is_whitespace() && matches!(chars.get(val_end + 1), Some('-') | Some('/')) {
-            break;
-        }
-        val_end += 1;
+        k += 1;
     }
-    val_end
+
+    // No qualifying ';' — this is not connection-string syntax, so the
+    // value is a single whitespace-delimited token.
+    let mut e = val_start;
+    while e < region_end && !chars[e].is_whitespace() {
+        e += 1;
+    }
+    e
 }
 
 /// Matches `key` (which may contain a single literal space for "user id")
@@ -1026,10 +1066,161 @@ mod tests {
         assert_eq!(n, 1);
     }
 
+    // AMENDED in fix round 4 per spec-owner ruling. Round 3 pinned the
+    // opposite result (`app Uid=‹redacted› --port 80;`), on the theory that
+    // an argument boundary should cut the value short. That rule is what
+    // leaked `-secret` out of `Password=my -secret;` (round 3's Critical),
+    // so it is gone. Under the quote-aware `;` lookahead this input has an
+    // unquoted `;` downstream, so `;`-mode applies and the trailing flags
+    // are eaten along with the value. Privacy wins over fidelity here.
     #[test]
     fn n2_uid_with_space_then_trailing_flags_both_handled() {
         let (r, n) = redact_command_line("app Uid=john smith --port 80;");
-        assert_eq!(r, "app Uid=\u{2039}redacted\u{203a} --port 80;");
+        assert_eq!(r, "app Uid=\u{2039}redacted\u{203a};");
         assert_eq!(n, 1);
+    }
+
+    // -- Security review, fix round 4 -----------------------------------
+    //
+    // The pass-4 value terminator is now a quote-aware `;` lookahead (see
+    // `redact_connection_strings`). The twelve cases below are the full
+    // verification matrix the design must satisfy simultaneously — the
+    // previous three designs each passed some of these while failing
+    // others, oscillating between leaking secret tails and eating
+    // unrelated arguments.
+
+    // ';'-mode: value runs to the ';' across embedded whitespace.
+    #[test]
+    fn r4_1_spaced_connection_string_value_runs_to_semicolon() {
+        let (r, _n) = redact_command_line("app Server=x;Password=my secret;");
+        assert_eq!(r, "app Server=x;Password=\u{2039}redacted\u{203a};");
+    }
+
+    #[test]
+    fn r4_2_spaced_user_id_value_runs_to_semicolon() {
+        let (r, _n) = redact_command_line("app Server=x;User Id=john smith;");
+        assert_eq!(r, "app Server=x;User Id=\u{2039}redacted\u{203a};");
+    }
+
+    // Round-3 Critical: a value whose second word starts with '-' used to
+    // trip the argument-boundary early-out and leak the tail.
+    #[test]
+    fn r4_3_dash_prefixed_value_tail_does_not_leak() {
+        let (r, _n) = redact_command_line("app Server=x;Password=my -secret;");
+        assert_eq!(r, "app Server=x;Password=\u{2039}redacted\u{203a};");
+    }
+
+    // Same, for a '/'-prefixed tail word.
+    #[test]
+    fn r4_4_slash_prefixed_value_tail_does_not_leak() {
+        let (r, _n) = redact_command_line("app Server=x;Password=abc /def;");
+        assert_eq!(r, "app Server=x;Password=\u{2039}redacted\u{203a};");
+    }
+
+    // In-quotes: the value runs to the ';' inside the same quoted region,
+    // leaving the rest of the connection string intact.
+    #[test]
+    fn r4_5_in_quote_value_runs_to_semicolon_not_closing_quote() {
+        let (r, _n) = redact_command_line(r#"app "Server=x;User Id=john -smith;Database=d""#);
+        assert_eq!(
+            r,
+            "app \"Server=x;User Id=\u{2039}redacted\u{203a};Database=d\""
+        );
+    }
+
+    // No qualifying ';' → whitespace mode → trailing flags survive.
+    #[test]
+    fn r4_6_no_semicolon_trailing_flags_survive() {
+        let (r, n) = redact_command_line("app password=hunter2 --verbose --port 80");
+        assert_eq!(
+            r,
+            "app password=\u{2039}redacted\u{203a} --verbose --port 80"
+        );
+        assert_eq!(n, 1);
+    }
+
+    // The only ';' is inside a *later, unrelated* quoted argument, so it
+    // does not qualify: whitespace mode, args and quotes both survive.
+    #[test]
+    fn r4_7_quoted_semicolon_elsewhere_does_not_qualify() {
+        let (r, n) = redact_command_line(r#"app password=hunter2 --verbose --exec "a;b""#);
+        assert_eq!(
+            r,
+            "app password=\u{2039}redacted\u{203a} --verbose --exec \"a;b\""
+        );
+        assert_eq!(n, 1);
+    }
+
+    // Round-3 Important: a plain positional tail (no '-'/'/' prefix, no
+    // ';') must survive untouched.
+    #[test]
+    fn r4_8_positional_argument_tail_survives() {
+        let (r, n) = redact_command_line("myapp.exe password=hunter2 input.csv output.csv");
+        assert_eq!(
+            r,
+            "myapp.exe password=\u{2039}redacted\u{203a} input.csv output.csv"
+        );
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn r4_9_bare_pwd_does_not_eat_following_assignments() {
+        let (r, n) = redact_command_line("app pwd=abc DEBUG=1 run");
+        assert_eq!(r, "app pwd=\u{2039}redacted\u{203a} DEBUG=1 run");
+        assert_eq!(n, 1);
+    }
+
+    // Row 10 is the amended ruling case, pinned by
+    // `n2_uid_with_space_then_trailing_flags_both_handled` above.
+
+    // I1, re-confirmed under the new terminator.
+    #[test]
+    fn r4_11_forged_redaction_prefix_in_quotes_still_redacted() {
+        let (r, n) = redact_command_line("app \"User Id=\u{2039}redacted\u{203a}joe;\"");
+        assert!(!r.contains("joe"), "{r}");
+        assert_eq!(n, 1);
+    }
+
+    // H3, re-confirmed: pass 1 owns this one (pass 4 never matches a
+    // `--`-prefixed key), and no tail escapes.
+    #[test]
+    fn r4_12_quoted_flag_value_with_spaces_has_no_tail_leak() {
+        let (r, n) = redact_command_line(r#"app "--password=my secret phrase""#);
+        assert_eq!(r, "app \"--password=\u{2039}redacted\u{203a}\"");
+        assert_eq!(n, 1);
+    }
+
+    // -- Fix round 4: percent-encoded query signatures --------------------
+    //
+    // '%' is opaque inside a query value, so a percent-encoded signature is
+    // seen as one long run rather than several short ones.
+    #[test]
+    fn r4_percent_encoded_sas_signature_is_redacted() {
+        let (r, _n) = redact_command_line(
+            "curl \"https://acct.blob.core.windows.net/c/b.txt?sig=aBcD%2Fef12%2B34gh%3Dij56kl78mn90\"",
+        );
+        assert!(!r.contains("aBcD%2Fef12"), "{r}");
+        assert!(r.contains("sig=\u{2039}redacted\u{203a}"), "{r}");
+    }
+
+    #[test]
+    fn r4_percent_encoded_aws_signature_is_redacted() {
+        let (r, _n) = redact_command_line(
+            "curl \"https://s3.amazonaws.com/b/k?X-Amz-Signature=abc%2F123%2Bdef%2F456%2Bghi%2F789\"",
+        );
+        assert!(!r.contains("abc%2F123"), "{r}");
+        assert!(
+            r.contains("X-Amz-Signature=\u{2039}redacted\u{203a}"),
+            "{r}"
+        );
+    }
+
+    #[test]
+    fn r4_percent_opacity_does_not_eat_short_query_values() {
+        let (r, _n) = redact_command_line(
+            "curl https://x.io/a?token=abc123def456abc123def456&page=2&q=50%25",
+        );
+        assert!(r.contains("&page=2"), "{r}");
+        assert!(r.contains("&q=50%25"), "{r}");
     }
 }
