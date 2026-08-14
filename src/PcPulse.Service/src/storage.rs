@@ -1,8 +1,8 @@
 use crate::{
     config::Settings,
     models::{
-        Alert, DiagnosticLog, Evidence, HistoryResponse, IncidentState, OptimizationPlan,
-        ProcessMetric, Rating, SystemMetric,
+        Alert, DiagnosticLog, Evidence, HistoryResponse, IncidentState, LaunchEvent,
+        OptimizationPlan, ProcessMetric, Rating, SystemMetric,
     },
 };
 use anyhow::{Context, Result};
@@ -15,6 +15,13 @@ pub struct Storage {
 
 /// Evidence label the startup force-resolve stamps on findings it closes.
 const RESTART_RESOLUTION_LABEL: &str = "Resolved by";
+
+/// Launch-history rows are retained for 7 days, matched to the retention
+/// window used by `prune_launch_events`.
+pub const LAUNCH_RETENTION_MS: i64 = 7 * 24 * 3600 * 1000;
+/// Hard cap on `launch_events` row count, enforced by `save_launch_events`
+/// evicting the oldest rows (by `start_time_ms`) beyond this count.
+pub const LAUNCH_ROW_CAP: usize = 100_000;
 
 impl Storage {
     pub fn open(path: &Path) -> Result<Self> {
@@ -80,7 +87,24 @@ impl Storage {
                at_ms INTEGER NOT NULL,
                payload TEXT NOT NULL
              ) WITHOUT ROWID;
-             CREATE INDEX IF NOT EXISTS idx_rating_time ON ratings(at_ms DESC);",
+             CREATE INDEX IF NOT EXISTS idx_rating_time ON ratings(at_ms DESC);
+             CREATE TABLE IF NOT EXISTS launch_events (
+               pid INTEGER NOT NULL,
+               start_time_ms INTEGER NOT NULL,
+               payload TEXT NOT NULL,
+               PRIMARY KEY (pid, start_time_ms)
+             ) WITHOUT ROWID;
+             CREATE INDEX IF NOT EXISTS idx_launch_events_start
+               ON launch_events(start_time_ms DESC);
+             CREATE TABLE IF NOT EXISTS launch_cmdlines (
+               pid INTEGER NOT NULL,
+               start_time_ms INTEGER NOT NULL,
+               captured_at_ms INTEGER NOT NULL,
+               blob BLOB NOT NULL,
+               PRIMARY KEY (pid, start_time_ms)
+             ) WITHOUT ROWID;
+             CREATE INDEX IF NOT EXISTS idx_launch_cmdlines_captured
+               ON launch_cmdlines(captured_at_ms DESC);",
         )?;
         // Databases created before the archive feature lack the column; the
         // flag itself also rides in the alert payload (like `acknowledged`),
@@ -557,9 +581,114 @@ impl Storage {
             "DELETE FROM optimization_plans WHERE generated_at_ms < ?1",
             [cutoff],
         )?;
+        prune_launch_events(&connection, now_ms)?;
         connection.execute_batch("PRAGMA incremental_vacuum(256);")?;
         Ok(())
     }
+}
+
+/// Upsert launch events (payload JSON keyed by `(pid, start_time_ms)`), then
+/// enforce [`LAUNCH_ROW_CAP`] by evicting the oldest rows beyond that count.
+/// `INSERT OR REPLACE` means saving a `Running` snapshot and later saving the
+/// finalized (stopped) event for the same identity collapses to one row.
+pub fn save_launch_events(conn: &Connection, events: &[LaunchEvent]) -> Result<()> {
+    save_launch_events_with_cap(conn, events, LAUNCH_ROW_CAP)
+}
+
+/// Real implementation behind [`save_launch_events`], with the row cap
+/// parameterized so tests can exercise eviction without inserting
+/// [`LAUNCH_ROW_CAP`] rows.
+pub fn save_launch_events_with_cap(
+    conn: &Connection,
+    events: &[LaunchEvent],
+    cap: usize,
+) -> Result<()> {
+    if events.is_empty() {
+        return Ok(());
+    }
+    for event in events {
+        conn.execute(
+            "INSERT OR REPLACE INTO launch_events(pid, start_time_ms, payload)
+             VALUES (?1, ?2, ?3)",
+            params![
+                event.pid,
+                event.start_time_ms,
+                serde_json::to_string(event)?
+            ],
+        )?;
+    }
+    conn.execute(
+        "DELETE FROM launch_events WHERE (pid, start_time_ms) IN (
+           SELECT pid, start_time_ms FROM launch_events
+           ORDER BY start_time_ms ASC
+           LIMIT MAX(0, (SELECT COUNT(*) FROM launch_events) - ?1)
+         )",
+        [cap as i64],
+    )?;
+    Ok(())
+}
+
+/// Launch events with `start_time_ms >= from_ms`, newest first.
+pub fn load_launch_events(conn: &Connection, from_ms: i64) -> Result<Vec<LaunchEvent>> {
+    query_json_rows::<LaunchEvent>(
+        conn,
+        "SELECT payload FROM launch_events WHERE start_time_ms >= ?1
+         ORDER BY start_time_ms DESC",
+        [from_ms],
+    )
+}
+
+/// Delete launch events older than the [`LAUNCH_RETENTION_MS`] window,
+/// returning the count removed.
+pub fn prune_launch_events(conn: &Connection, now_ms: i64) -> Result<usize> {
+    let cutoff = now_ms - LAUNCH_RETENTION_MS;
+    Ok(conn.execute(
+        "DELETE FROM launch_events WHERE start_time_ms < ?1",
+        [cutoff],
+    )?)
+}
+
+/// Save a captured command-line blob (already redacted/encoded upstream) for
+/// a launch identity, replacing any prior blob for the same identity.
+pub fn save_cmdline(
+    conn: &Connection,
+    pid: u32,
+    start_time_ms: i64,
+    captured_at_ms: i64,
+    blob: &[u8],
+) -> Result<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO launch_cmdlines(pid, start_time_ms, captured_at_ms, blob)
+         VALUES (?1, ?2, ?3, ?4)",
+        params![pid, start_time_ms, captured_at_ms, blob],
+    )?;
+    Ok(())
+}
+
+/// Load a captured command-line blob for a launch identity, if any.
+pub fn load_cmdline(conn: &Connection, pid: u32, start_time_ms: i64) -> Result<Option<Vec<u8>>> {
+    conn.query_row(
+        "SELECT blob FROM launch_cmdlines WHERE pid = ?1 AND start_time_ms = ?2",
+        params![pid, start_time_ms],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+/// Delete command-line blobs captured before `cutoff_ms`, returning the count
+/// removed. Exported for Task 7's hourly prune call; not wired to a schedule
+/// here.
+pub fn prune_cmdlines(conn: &Connection, cutoff_ms: i64) -> Result<usize> {
+    Ok(conn.execute(
+        "DELETE FROM launch_cmdlines WHERE captured_at_ms < ?1",
+        [cutoff_ms],
+    )?)
+}
+
+/// Delete all command-line blobs, returning the count removed.
+pub fn delete_all_cmdlines(conn: &Connection) -> Result<usize> {
+    Ok(conn.execute("DELETE FROM launch_cmdlines", [])?)
 }
 
 /// Run an `ALTER TABLE … ADD COLUMN` migration, tolerating a database that
@@ -920,5 +1049,149 @@ mod tests {
         let loaded = storage.ratings(10).unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].id, "good");
+    }
+
+    fn sample_launch(pid: u32, start_time_ms: i64) -> LaunchEvent {
+        LaunchEvent {
+            pid,
+            start_time_ms,
+            stop_time_ms: None,
+            exit_code: None,
+            exe_name: "worker.exe".into(),
+            exe_path: r"C:\worker.exe".into(),
+            raw_image_path: None,
+            session_id: 1,
+            parent_pid: 4,
+            lineage: Vec::new(),
+            window_state: crate::models::WindowState::Unobserved,
+            console_host: false,
+            command_line: None,
+        }
+    }
+
+    fn open_test_connection() -> Connection {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS launch_events (
+                   pid INTEGER NOT NULL,
+                   start_time_ms INTEGER NOT NULL,
+                   payload TEXT NOT NULL,
+                   PRIMARY KEY (pid, start_time_ms)
+                 ) WITHOUT ROWID;
+                 CREATE INDEX IF NOT EXISTS idx_launch_events_start
+                   ON launch_events(start_time_ms DESC);
+                 CREATE TABLE IF NOT EXISTS launch_cmdlines (
+                   pid INTEGER NOT NULL,
+                   start_time_ms INTEGER NOT NULL,
+                   captured_at_ms INTEGER NOT NULL,
+                   blob BLOB NOT NULL,
+                   PRIMARY KEY (pid, start_time_ms)
+                 ) WITHOUT ROWID;
+                 CREATE INDEX IF NOT EXISTS idx_launch_cmdlines_captured
+                   ON launch_cmdlines(captured_at_ms DESC);",
+            )
+            .unwrap();
+        connection
+    }
+
+    #[test]
+    fn launch_events_round_trip() {
+        let connection = open_test_connection();
+        let event = sample_launch(100, 1_000);
+        save_launch_events(&connection, &[event.clone()]).unwrap();
+
+        let loaded = load_launch_events(&connection, 0).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].pid, event.pid);
+        assert_eq!(loaded[0].start_time_ms, event.start_time_ms);
+        assert_eq!(loaded[0].exe_name, event.exe_name);
+    }
+
+    #[test]
+    fn saving_a_stop_finalizes_the_running_row_in_place() {
+        let connection = open_test_connection();
+        let mut running = sample_launch(100, 1_000);
+        running.window_state = crate::models::WindowState::Running;
+        save_launch_events(&connection, &[running]).unwrap();
+
+        let mut stopped = sample_launch(100, 1_000);
+        stopped.stop_time_ms = Some(2_000);
+        stopped.exit_code = Some(0);
+        stopped.window_state = crate::models::WindowState::NeverWindowed;
+        save_launch_events(&connection, &[stopped]).unwrap();
+
+        let loaded = load_launch_events(&connection, 0).unwrap();
+        assert_eq!(
+            loaded.len(),
+            1,
+            "upsert finalizes the same (pid, start_time_ms) row"
+        );
+        assert_eq!(loaded[0].stop_time_ms, Some(2_000));
+        assert_eq!(
+            loaded[0].window_state,
+            crate::models::WindowState::NeverWindowed
+        );
+    }
+
+    #[test]
+    fn launch_events_older_than_retention_are_pruned() {
+        let connection = open_test_connection();
+        let now_ms = 1_000_000_000_000_i64;
+        let old = sample_launch(1, now_ms - LAUNCH_RETENTION_MS - 1);
+        let recent = sample_launch(2, now_ms - LAUNCH_RETENTION_MS + 1);
+        save_launch_events(&connection, &[old, recent]).unwrap();
+
+        let removed = prune_launch_events(&connection, now_ms).unwrap();
+        assert_eq!(removed, 1);
+
+        let loaded = load_launch_events(&connection, 0).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].pid, 2);
+    }
+
+    #[test]
+    fn launch_events_are_capped_evicting_oldest() {
+        let connection = open_test_connection();
+        let cap = 20usize;
+        let events: Vec<LaunchEvent> = (0..cap + 10)
+            .map(|i| sample_launch(i as u32, i as i64))
+            .collect();
+        save_launch_events_with_cap(&connection, &events, cap).unwrap();
+
+        let loaded = load_launch_events(&connection, 0).unwrap();
+        assert_eq!(loaded.len(), cap);
+        let oldest_surviving = loaded.iter().map(|e| e.start_time_ms).min().unwrap();
+        assert_eq!(oldest_surviving, 10, "the 10 oldest rows were evicted");
+        let newest = loaded.iter().map(|e| e.start_time_ms).max().unwrap();
+        assert_eq!(newest as usize, cap + 10 - 1, "the newest row is kept");
+    }
+
+    #[test]
+    fn cmdline_save_load_prune_and_delete_all() {
+        let connection = open_test_connection();
+        save_cmdline(&connection, 1, 100, 500, b"cmd /c foo").unwrap();
+        save_cmdline(&connection, 2, 200, 1_500, b"cmd /c bar").unwrap();
+
+        assert_eq!(
+            load_cmdline(&connection, 1, 100).unwrap(),
+            Some(b"cmd /c foo".to_vec())
+        );
+        assert_eq!(load_cmdline(&connection, 99, 999).unwrap(), None);
+
+        let removed = prune_cmdlines(&connection, 1_000).unwrap();
+        assert_eq!(
+            removed, 1,
+            "only the row captured before the cutoff is pruned"
+        );
+        assert_eq!(load_cmdline(&connection, 1, 100).unwrap(), None);
+        assert_eq!(
+            load_cmdline(&connection, 2, 200).unwrap(),
+            Some(b"cmd /c bar".to_vec())
+        );
+
+        let deleted = delete_all_cmdlines(&connection).unwrap();
+        assert_eq!(deleted, 1);
+        assert_eq!(load_cmdline(&connection, 2, 200).unwrap(), None);
     }
 }
