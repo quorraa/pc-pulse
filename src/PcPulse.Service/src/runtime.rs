@@ -892,6 +892,73 @@ fn forget_generation_advanced(seen: &mut u64, current: u64) -> bool {
     }
 }
 
+/// How long a periodic storage task that just failed waits before its next
+/// attempt. Only the slow clocks feel this: the daily prune and the
+/// five-minute baseline save come back within minutes of the database
+/// healing instead of waiting out their full period, while tasks that
+/// already run faster than this keep their own cadence (see
+/// [`next_attempt`]).
+const STORAGE_RETRY_INTERVAL: Duration = Duration::from_secs(300);
+
+/// Once-per-outage log gate for the sampling loop's fallible calls.
+///
+/// A broken database or collector fails identically on every tick, and the
+/// loop must keep running through it (a transient failure that kills the
+/// loop also kills launch capture and all sampling until service restart).
+/// Log-and-continue therefore needs a gate: the first failure of an outage
+/// logs, the tick-after-tick repeats stay quiet, and the success that ends
+/// the outage re-arms the gate — so a service that runs for months gets one
+/// line per outage, not one per tick and not one per process lifetime.
+#[derive(Default)]
+struct FailureGate {
+    failing: bool,
+}
+
+impl FailureGate {
+    /// True exactly on an outage's first failure — the caller logs then.
+    fn first_failure(&mut self) -> bool {
+        !std::mem::replace(&mut self.failing, true)
+    }
+
+    /// True when this success ends an outage — the caller logs the
+    /// recovery; steady-state successes stay quiet.
+    fn recovered(&mut self) -> bool {
+        std::mem::replace(&mut self.failing, false)
+    }
+}
+
+/// Applies the once-per-outage log policy to one fallible call's outcome
+/// and reports whether it succeeded (feeds [`next_attempt`] for the calls
+/// that run on a clock).
+fn note_outcome<T>(gate: &mut FailureGate, what: &str, result: &Result<T>) -> bool {
+    match result {
+        Ok(_) => {
+            if gate.recovered() {
+                eprintln!("{what} recovered");
+            }
+            true
+        }
+        Err(error) => {
+            if gate.first_failure() {
+                eprintln!("{what} failed; the sampling loop continues and will retry: {error:#}");
+            }
+            false
+        }
+    }
+}
+
+/// Deadline for a periodic storage task's next attempt: its normal cadence
+/// after a success, the bounded [`STORAGE_RETRY_INTERVAL`] after a failure.
+/// The retry never exceeds the cadence itself, so a task that already runs
+/// more often than the retry interval is never slowed down by failing.
+fn next_attempt(now: Instant, succeeded: bool, cadence: Duration) -> Instant {
+    now + if succeeded {
+        cadence
+    } else {
+        cadence.min(STORAGE_RETRY_INTERVAL)
+    }
+}
+
 fn sampling_loop(
     state: &Arc<AppState>,
     mut baselines: BaselineStore,
@@ -958,6 +1025,18 @@ fn sampling_loop(
     // One line per failure mode, not one per event: a broken DPAPI or a
     // failing insert repeats every tick and must not flood the log.
     let mut cmdline_protect_logged = false;
+    // Log-and-continue gates for the loop's remaining fallible core calls.
+    // A transient database or collector failure must degrade the tick it
+    // hits, never end the loop: this same loop drives launch-history
+    // capture, so a loop that dies on a failed insert silently ends launch
+    // capture and all sampling until the service restarts. One log line
+    // per outage and one per recovery (see [`FailureGate`]).
+    let mut collect_gate = FailureGate::default();
+    let mut alert_upsert_gate = FailureGate::default();
+    let mut system_write_gate = FailureGate::default();
+    let mut process_write_gate = FailureGate::default();
+    let mut prune_gate = FailureGate::default();
+    let mut baseline_save_gate = FailureGate::default();
     loop {
         let started = Instant::now();
         let settings = state
@@ -984,8 +1063,22 @@ fn sampling_loop(
         let etw_snapshot = etw
             .as_ref()
             .map_or_else(crate::etw::EtwSnapshot::default, EtwCollector::snapshot);
-        let (system, processes, hardware) =
-            collector.collect(timestamp_ms, &settings, &etw_snapshot)?;
+        let collected = collector.collect(timestamp_ms, &settings, &etw_snapshot);
+        note_outcome(&mut collect_gate, "metric collection", &collected);
+        let Ok((system, processes, hardware)) = collected else {
+            // Without a sample nothing downstream — alerts, baselines, the
+            // launch joins — has anything to work on, so the whole tick is
+            // skipped and retried on the normal cadence. Launch events that
+            // arrive meanwhile sit in ETW's bounded channels (drops beyond
+            // that are counted as `droppedChannel`), so a transient failure
+            // costs a gap in samples, not the loop.
+            let delay = Duration::from_millis(settings.sample_interval_ms)
+                .saturating_sub(started.elapsed());
+            match stop.recv_timeout(delay) {
+                Ok(()) | Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
+            }
+        };
         // Slide the trailing demand window: add this sample, then drop
         // whatever has aged out of the last ten minutes.
         recent_samples.push_back(system.clone());
@@ -1287,7 +1380,18 @@ fn sampling_loop(
         evaluation
             .active
             .sort_by_key(|alert| std::cmp::Reverse(alert.first_seen_ms));
-        state.storage.upsert_alerts(&evaluation.changed)?;
+        // Gated on non-empty because `upsert_alerts` returns Ok without
+        // touching the database when there is nothing to write — an empty
+        // tick must not read as "the database healed" mid-outage. A batch
+        // that does fail is dropped (the snapshot below still carries the
+        // live state); the loop outliving the outage is the priority.
+        if !evaluation.changed.is_empty() {
+            note_outcome(
+                &mut alert_upsert_gate,
+                "alert persistence",
+                &state.storage.upsert_alerts(&evaluation.changed),
+            );
+        }
         {
             let mut snapshot = state
                 .snapshot
@@ -1320,12 +1424,20 @@ fn sampling_loop(
             snapshot.launch_capture = launch_capture;
         }
         if Instant::now() >= next_system_write {
-            state.storage.insert_system(&system)?;
-            next_system_write = Instant::now() + Duration::from_secs(10);
+            let ok = note_outcome(
+                &mut system_write_gate,
+                "system-history write",
+                &state.storage.insert_system(&system),
+            );
+            next_system_write = next_attempt(Instant::now(), ok, Duration::from_secs(10));
         }
         if Instant::now() >= next_process_write {
-            state.storage.insert_processes(&processes, 64)?;
-            next_process_write = Instant::now() + Duration::from_secs(30);
+            let ok = note_outcome(
+                &mut process_write_gate,
+                "process-history write",
+                &state.storage.insert_processes(&processes, 64),
+            );
+            next_process_write = next_attempt(Instant::now(), ok, Duration::from_secs(30));
         }
         if Instant::now() >= next_event_log_poll {
             let logs = event_logs.poll(timestamp_ms, &settings.agent_process_patterns);
@@ -1341,8 +1453,12 @@ fn sampling_loop(
             next_event_log_poll = Instant::now() + Duration::from_secs(30);
         }
         if Instant::now() >= next_prune {
-            state.storage.prune(&settings, timestamp_ms)?;
-            next_prune = Instant::now() + Duration::from_secs(24 * 60 * 60);
+            let ok = note_outcome(
+                &mut prune_gate,
+                "history prune",
+                &state.storage.prune(&settings, timestamp_ms),
+            );
+            next_prune = next_attempt(Instant::now(), ok, Duration::from_secs(24 * 60 * 60));
         }
         if Instant::now() >= next_cmdline_prune {
             // Command lines run on their own, much shorter clock than the
@@ -1357,10 +1473,14 @@ fn sampling_loop(
             next_cmdline_prune = Instant::now() + CMDLINE_PRUNE_INTERVAL;
         }
         if Instant::now() >= next_baseline_save {
-            state
-                .storage
-                .save_baselines(&baselines.to_rows(), timestamp_ms)?;
-            next_baseline_save = Instant::now() + Duration::from_secs(5 * 60);
+            let ok = note_outcome(
+                &mut baseline_save_gate,
+                "baseline save",
+                &state
+                    .storage
+                    .save_baselines(&baselines.to_rows(), timestamp_ms),
+            );
+            next_baseline_save = next_attempt(Instant::now(), ok, Duration::from_secs(5 * 60));
         }
         let delay =
             Duration::from_millis(settings.sample_interval_ms).saturating_sub(started.elapsed());
@@ -1716,6 +1836,42 @@ mod tests {
         // A second delete bumps it again: fires again.
         assert!(forget_generation_advanced(&mut seen, 2));
         assert!(!forget_generation_advanced(&mut seen, 2));
+    }
+
+    #[test]
+    fn failure_gate_speaks_once_per_outage_and_once_per_recovery() {
+        let mut gate = FailureGate::default();
+        // Steady state: successes stay quiet.
+        assert!(!gate.recovered());
+        // An outage's first failure logs...
+        assert!(gate.first_failure());
+        // ...and its tick-after-tick repeats stay quiet.
+        assert!(!gate.first_failure());
+        assert!(!gate.first_failure());
+        // The success that ends the outage reports the recovery, once.
+        assert!(gate.recovered());
+        assert!(!gate.recovered());
+        // The next outage is a new one: it logs again rather than staying
+        // silenced for the rest of the service's weeks-long lifetime.
+        assert!(gate.first_failure());
+    }
+
+    #[test]
+    fn next_attempt_retries_failed_slow_clocks_sooner_without_slowing_fast_ones() {
+        let now = Instant::now();
+        let daily = Duration::from_secs(24 * 60 * 60);
+        // Success: the task keeps its normal cadence.
+        assert_eq!(next_attempt(now, true, daily), now + daily);
+        // Failure on a slow clock: the next attempt is the bounded retry
+        // interval away, not a full period.
+        assert_eq!(
+            next_attempt(now, false, daily),
+            now + STORAGE_RETRY_INTERVAL
+        );
+        // Failure on a clock already faster than the retry interval: the
+        // cadence itself is the retry; failing must never slow a task down.
+        let fast = Duration::from_secs(10);
+        assert_eq!(next_attempt(now, false, fast), now + fast);
     }
 
     #[test]
