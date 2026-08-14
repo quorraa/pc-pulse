@@ -194,15 +194,22 @@ pub unsafe fn parse_process_event(
         }
     })?;
 
+    // Bound every offset-based read against the buffer TdhGetEventInformation
+    // actually populated, never against the pointer alone: NameOffset (and
+    // other *Offset fields) are TDH-supplied and must not be trusted to stay
+    // within the allocation if TDH ever misbehaves or a future refactor
+    // changes buffer sizing.
+    let info_buffer_len = TDH_INFO_BUFFER.with(|cell| cell.borrow().len());
     let info = unsafe { &*info_ptr };
     let base = info_ptr.cast::<u8>();
+    let info_buffer: &[u8] = unsafe { std::slice::from_raw_parts(base, info_buffer_len) };
     let property_count = info.TopLevelPropertyCount as usize;
     let property_array =
         unsafe { std::slice::from_raw_parts(info.EventPropertyInfoArray.as_ptr(), property_count) };
 
     let mut props: Vec<(String, PropValue)> = Vec::with_capacity(property_count);
     for property in property_array {
-        let name = unsafe { read_wide_string_at(base, property.NameOffset) };
+        let name = read_wide_string_at(info_buffer, property.NameOffset);
         let in_type = unsafe { property.Anonymous1.nonStructType.InType };
 
         let mut name_wide: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
@@ -222,7 +229,12 @@ pub unsafe fn parse_process_event(
             )
         };
         if size_status != 0 {
-            return Err(ParseError::Tdh(size_status));
+            // A property that fails to size/fetch is simply absent from the
+            // bag, not a fatal error for the whole event: exotic manifest
+            // properties we don't need can fail without killing otherwise-
+            // decodable events. If a *required* property is missing,
+            // decode_event surfaces that as MissingProperty.
+            continue;
         }
 
         let mut value_buffer = vec![0u8; property_size as usize];
@@ -235,7 +247,7 @@ pub unsafe fn parse_process_event(
             )
         };
         if get_status != 0 {
-            return Err(ParseError::Tdh(get_status));
+            continue;
         }
 
         let value = match in_type {
@@ -271,24 +283,36 @@ pub unsafe fn parse_process_event(
     decode_event(event_id, &props)
 }
 
-/// Reads a NUL-terminated UTF-16 string at the given byte offset from
-/// `base`, as used for the various `*Offset` fields in `TRACE_EVENT_INFO`.
-unsafe fn read_wide_string_at(base: *const u8, offset: u32) -> String {
+/// Scans `buffer` for a NUL-terminated UTF-16LE string starting at byte
+/// `offset`, without ever reading past `buffer`'s end. Returns `None` if
+/// `offset` is out of range or no NUL code unit is found before the end of
+/// `buffer` (a bounded miss, never an out-of-bounds read). Pure and safe:
+/// this is the testable core of `read_wide_string_at`.
+fn scan_wide_string_bounded(buffer: &[u8], offset: usize) -> Option<String> {
     if offset == 0 {
-        return String::new();
+        return Some(String::new());
     }
-    let ptr = unsafe { base.add(offset as usize).cast::<u16>() };
-    let mut len = 0usize;
-    // SAFETY: caller guarantees `base` points into a valid TRACE_EVENT_INFO
-    // buffer produced by TdhGetEventInformation, whose offset fields point
-    // to NUL-terminated UTF-16 strings within that same buffer.
-    unsafe {
-        while *ptr.add(len) != 0 {
-            len += 1;
+    let rest = buffer.get(offset..)?;
+    let mut units: Vec<u16> = Vec::new();
+    for chunk in rest.chunks_exact(2) {
+        // SAFETY-free: plain byte indexing, no pointer arithmetic.
+        let unit = u16::from_ne_bytes([chunk[0], chunk[1]]);
+        if unit == 0 {
+            return Some(String::from_utf16_lossy(&units));
         }
-        let slice = std::slice::from_raw_parts(ptr, len);
-        String::from_utf16_lossy(slice)
+        units.push(unit);
     }
+    None
+}
+
+/// Reads a NUL-terminated UTF-16 string at the given byte offset within
+/// `buffer`, as used for the various `*Offset` fields in `TRACE_EVENT_INFO`.
+/// Bounded to `buffer`'s actual length: an offset or missing terminator that
+/// would run past the end of `buffer` yields an empty string instead of
+/// reading past the allocation. `buffer` must be the full TDH info buffer
+/// that `offset` is relative to (not just the tail from `offset` onward).
+fn read_wide_string_at(buffer: &[u8], offset: u32) -> String {
+    scan_wide_string_bounded(buffer, offset as usize).unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -353,6 +377,44 @@ mod tests {
             decode_event(15, &start_bag()).unwrap_err(),
             ParseError::UnknownEventId(15)
         );
+    }
+    #[test]
+    fn scan_wide_string_bounded_offset_zero_is_empty() {
+        assert_eq!(
+            scan_wide_string_bounded(&[1, 2, 3, 4], 0),
+            Some(String::new())
+        );
+    }
+    #[test]
+    fn scan_wide_string_bounded_reads_nul_terminated_string() {
+        // "Hi" as UTF-16LE followed by a NUL terminator.
+        let mut buffer = vec![0u8; 4];
+        buffer.extend_from_slice(&[b'H', 0, b'i', 0, 0, 0]);
+        assert_eq!(scan_wide_string_bounded(&buffer, 4), Some("Hi".to_string()));
+    }
+    #[test]
+    fn scan_wide_string_bounded_missing_nul_returns_none_not_panic() {
+        // Data runs to the very end of the buffer with no NUL terminator:
+        // must return None rather than reading past the allocation.
+        let mut buffer = vec![0u8; 4];
+        buffer.extend_from_slice(&[b'H', 0, b'i', 0]); // no trailing NUL
+        assert_eq!(scan_wide_string_bounded(&buffer, 4), None);
+    }
+    #[test]
+    fn scan_wide_string_bounded_offset_out_of_range_returns_none() {
+        let buffer = vec![0u8; 4];
+        assert_eq!(scan_wide_string_bounded(&buffer, 100), None);
+    }
+    #[test]
+    fn scan_wide_string_bounded_offset_at_exact_end_returns_none() {
+        let buffer = vec![0u8; 4];
+        assert_eq!(scan_wide_string_bounded(&buffer, 4), None);
+    }
+    #[test]
+    fn read_wide_string_at_falls_back_to_empty_on_bounded_miss() {
+        let mut buffer = vec![0u8; 4];
+        buffer.extend_from_slice(&[b'H', 0, b'i', 0]); // no trailing NUL
+        assert_eq!(read_wide_string_at(&buffer, 4), "");
     }
     #[test]
     fn sessionid_u64_widening_accepted() {
