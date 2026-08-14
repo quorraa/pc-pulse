@@ -1009,6 +1009,83 @@ pub enum PipeResponse {
     Error { code: String, message: String },
 }
 
+/// One ancestor in a launch's parent chain, resolved at capture time (see
+/// `LaunchTracker`). `name` is `"unknown"` when the ancestor pid could not be
+/// resolved via the live process table or the tracker's recent-launch ring;
+/// the walk stops at the first unresolvable ancestor rather than guessing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LineageEntry {
+    pub pid: u32,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+}
+
+/// Whether a launch was ever observed to own a visible top-level window,
+/// honestly distinguishing "never sampled" from "sampled but never visible"
+/// rather than defaulting either to a guess.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum WindowState {
+    Windowed,
+    NeverWindowed,
+    Unobserved,
+    /// Still running when flushed past the 60s threshold; a snapshot, not a
+    /// final state -- the row is finalized (and window state re-resolved)
+    /// once the matching stop event lands.
+    Running,
+}
+
+/// One recorded process launch, built by `LaunchTracker` from ETW start/stop
+/// events. Never fabricated: a launch only exists here because a start event
+/// was actually observed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LaunchEvent {
+    pub pid: u32,
+    pub start_time_ms: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop_time_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<u32>,
+    pub exe_name: String,
+    pub exe_path: String,
+    /// The original, unmapped kernel image path, kept only when
+    /// `normalize_image_path` could not translate the `\Device\...` prefix
+    /// to a drive letter -- present exactly when the mapping failed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw_image_path: Option<String>,
+    pub session_id: u32,
+    pub parent_pid: u32,
+    /// Ancestor chain, nearest first, depth <= 5.
+    pub lineage: Vec<LineageEntry>,
+    pub window_state: WindowState,
+    pub console_host: bool,
+    /// Set only by the Task 7 command-line join; absent otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command_line: Option<String>,
+}
+
+/// Capture-health counters for the launch-history pipeline. The `etw_*`
+/// fields are tracker-owned zeros here; the runtime (Task 7) merges in the
+/// live `EtwHealth` counters before serving this to clients.
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LaunchCaptureStatus {
+    pub starts_seen: u64,
+    pub stops_seen: u64,
+    pub persisted: u64,
+    pub dropped_channel: u64,
+    pub etw_events_lost: u64,
+    pub events_lost_query_failures: u64,
+    pub malformed_events: u64,
+    pub orphan_stops: u64,
+    pub cmdline_session_active: bool,
+    pub cmdlines_captured: u64,
+    pub cmdlines_redacted_fields: u64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
