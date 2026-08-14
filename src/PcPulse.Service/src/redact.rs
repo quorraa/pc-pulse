@@ -93,6 +93,21 @@ fn in_quotes_at(in_quotes: &[bool], idx: usize) -> bool {
     in_quotes.get(idx).copied().unwrap_or(false)
 }
 
+/// For each character position `i`, whether a `;` occurs anywhere in
+/// `chars[i..]`. Built once per pass in O(n) (backward scan) so pass 4 can
+/// decide, per match, whether it's looking at a genuine `;`-delimited
+/// connection string (in which case only `;` should terminate a value) or a
+/// bare `key=value` with no connection-string structure at all (in which
+/// case whitespace should terminate it too, so it can't run off the end of
+/// the command line).
+fn compute_has_semicolon_suffix(chars: &[char]) -> Vec<bool> {
+    let mut result = vec![false; chars.len() + 1];
+    for idx in (0..chars.len()).rev() {
+        result[idx] = chars[idx] == ';' || result[idx + 1];
+    }
+    result
+}
+
 /// Pass 1: credential vocabulary as `key=value`, `key:value`, `--key value`,
 /// `--key=value`, `/key:value`; plus, per spec-owner ruling, the bare
 /// `Bearer <token>` form specifically (not extended to the rest of the
@@ -253,10 +268,21 @@ fn read_value(chars: &[char], start: usize, in_quotes: bool) -> (usize, usize) {
 /// containing a `\` is treated as a filesystem path and left entirely
 /// untouched (splitting a path on `\` would otherwise expose bare segments
 /// like `deadbeefdeadbeefdeadbeef` that look like standalone opaque runs).
+///
 /// A word containing `/` (URLs, forward-slash paths) is *not* wholly
-/// exempt — it's split on `/` and each segment is checked independently, so
-/// a secret-looking path/URL segment (e.g. a Slack webhook token) still
-/// gets caught.
+/// exempt: the path portion (everything before the first `?`, if any) is
+/// split on `/` and each segment is checked independently, so a
+/// secret-looking path/URL segment (e.g. a Slack webhook token) still gets
+/// caught. Two refinements keep this from over-redacting:
+/// - The query portion (from the first `?` onward) is left completely
+///   untouched here — it's pass 3's job, which redacts query *values* by
+///   vocabulary key while preserving the key name (`?token=abc...` must
+///   stay `?token=‹redacted›`, not have its key name eaten too).
+/// - Within the path portion, a segment's trailing `.extension` (1-5
+///   alphanumeric characters after the final `.`) is set aside before the
+///   opaque-run check, and reattached after — so a hashed asset filename
+///   like `application-a1b2c3d4e5f6.js` redacts to `‹redacted›.js` instead
+///   of losing its extension.
 fn redact_long_opaque_runs(input: &str, count: &mut u32) -> String {
     let chars: Vec<char> = input.chars().collect();
     let mut out = String::with_capacity(input.len());
@@ -282,16 +308,25 @@ fn redact_long_opaque_runs(input: &str, count: &mut u32) -> String {
                 out.push(*c);
             }
         } else if word.contains(&'/') {
+            let query_idx = word.iter().position(|c| *c == '?').unwrap_or(word.len());
+            let (path_part, query_part) = word.split_at(query_idx);
+
             let mut seg_start = 0usize;
-            for idx in 0..=word.len() {
-                if idx == word.len() || word[idx] == '/' {
-                    let segment = &word[seg_start..idx];
-                    out.push_str(&redact_opaque_runs_in_word(segment, count));
-                    if idx < word.len() {
+            for idx in 0..=path_part.len() {
+                if idx == path_part.len() || path_part[idx] == '/' {
+                    let segment = &path_part[seg_start..idx];
+                    out.push_str(&redact_path_segment(segment, count));
+                    if idx < path_part.len() {
                         out.push('/');
                     }
                     seg_start = idx + 1;
                 }
+            }
+
+            // Query portion (starting at '?', if present) is left verbatim
+            // for pass 3's key-aware query redaction.
+            for c in query_part {
+                out.push(*c);
             }
         } else {
             out.push_str(&redact_opaque_runs_in_word(word, count));
@@ -301,6 +336,29 @@ fn redact_long_opaque_runs(input: &str, count: &mut u32) -> String {
     }
 
     out
+}
+
+/// Redacts a single `/`-delimited path segment, preserving a short trailing
+/// file extension across the redaction if one is present. With no
+/// recognizable extension (or an empty stem), falls back to checking the
+/// segment as a whole, which is what keeps extension-less opaque tokens
+/// (webhook path components, etc.) redacted exactly as before.
+fn redact_path_segment(segment: &[char], count: &mut u32) -> String {
+    if let Some(dot_idx) = segment.iter().rposition(|c| *c == '.') {
+        let stem = &segment[..dot_idx];
+        let ext = &segment[dot_idx + 1..];
+        let ext_is_short_alnum =
+            !ext.is_empty() && ext.len() <= 5 && ext.iter().all(|c| c.is_ascii_alphanumeric());
+        if !stem.is_empty() && ext_is_short_alnum {
+            let mut out = redact_opaque_runs_in_word(stem, count);
+            out.push('.');
+            for c in ext {
+                out.push(*c);
+            }
+            return out;
+        }
+    }
+    redact_opaque_runs_in_word(segment, count)
 }
 
 fn redact_opaque_runs_in_word(word: &[char], count: &mut u32) -> String {
@@ -450,17 +508,33 @@ fn redact_url_query(input: &str, count: &mut u32) -> String {
 }
 
 /// Pass 4: connection-string fragments `(Password|Pwd|User Id|Uid)\s*=\s*value`.
-/// Outside a quoted connection string, the value runs up to the next `;` or
-/// whitespace (whichever comes first) so this pass can never swallow
-/// trailing, unrelated command-line text (e.g. `--verbose --port 80`)
-/// that follows a bare `key=value` secret already redacted by pass 1.
-/// Inside a quoted connection string, only `;` terminates the value, since
-/// connection strings can legitimately contain spaces in values.
+///
+/// Value termination:
+/// - Inside a quoted connection string (`in_q`), the value always runs to
+///   the next `;` or the closing `"`, since connection strings can
+///   legitimately contain spaces in values, and the value must never run
+///   past the argv element it lives in.
+/// - Outside quotes, if a `;` occurs anywhere later in the input, this is a
+///   genuine `;`-delimited connection string fragment and the value still
+///   runs only to the next `;` — even across embedded spaces (e.g.
+///   `Password=my secret;`), or the tail of the secret leaks.
+/// - Outside quotes, if no `;` occurs anywhere later in the input, there is
+///   no connection-string structure to speak of (this is really pass 1's
+///   bare `key=value` leftover), so the value also stops at the next
+///   whitespace — otherwise it would swallow unrelated trailing
+///   command-line text all the way to end-of-string.
+///
+/// Already-redacted guard: skip only when the value is *exactly* the
+/// redaction token — not merely prefixed by it — so attacker-supplied text
+/// that starts with a fake `‹redacted›` marker (e.g. `User
+/// Id=‹redacted›joe;`) still gets its genuine tail redacted rather than
+/// waved through.
 fn redact_connection_strings(input: &str, count: &mut u32) -> String {
     const KEYS: &[&str] = &["password", "pwd", "user id", "uid"];
 
     let chars: Vec<char> = input.chars().collect();
     let in_quotes = compute_in_quotes(&chars);
+    let has_semicolon_after = compute_has_semicolon_suffix(&chars);
     let mut out = String::with_capacity(input.len());
     let mut i = 0usize;
 
@@ -478,22 +552,24 @@ fn redact_connection_strings(input: &str, count: &mut u32) -> String {
                     j = skip_ws(&chars, j);
                     let val_start = j;
                     let in_q = in_quotes_at(&in_quotes, val_start);
+                    let has_semicolon_ahead =
+                        has_semicolon_after.get(val_start).copied().unwrap_or(false);
                     let mut val_end = val_start;
-                    while val_end < chars.len()
-                        && chars[val_end] != ';'
-                        && (in_q || !chars[val_end].is_whitespace())
-                    {
+                    while val_end < chars.len() {
+                        let c = chars[val_end];
+                        if c == ';' {
+                            break;
+                        }
+                        if in_q && c == '"' {
+                            break;
+                        }
+                        if !in_q && !has_semicolon_ahead && c.is_whitespace() {
+                            break;
+                        }
                         val_end += 1;
                     }
                     let value: String = chars[val_start..val_end].iter().collect();
-                    // Already redacted by an earlier pass (the literal key=
-                    // text pass 1 leaves behind still matches here) — don't
-                    // re-match and re-count it. `starts_with` rather than an
-                    // exact match because the value we just scanned can
-                    // legitimately carry a trailing character straight after
-                    // the token (e.g. a closing quote) that isn't part of
-                    // the secret itself.
-                    if val_end > val_start && !value.starts_with(REDACTED) {
+                    if val_end > val_start && value != REDACTED {
                         out.push_str(&chars[i..val_start].iter().collect::<String>());
                         out.push_str(REDACTED);
                         *count += 1;
@@ -714,5 +790,86 @@ mod tests {
         let (r, _n) = redact_command_line(&s);
         assert!(r.ends_with(TRUNCATED_MARKER), "{r}");
         assert!(!r.contains("hunter2"), "{r}");
+    }
+
+    // -- Security review, fix round 2 -----------------------------------
+
+    // C1 (critical regression from round 1's M1 fix): an unquoted
+    // connection-string value containing a space used to get half-leaked,
+    // because pass 4's new whitespace terminator fired even when a `;`
+    // later in the string proved this really was `;`-delimited
+    // connection-string syntax, not a bare trailing `key=value`.
+    #[test]
+    fn c1_unquoted_connection_string_value_with_space_is_fully_redacted() {
+        let (r, n) = redact_command_line("app Server=x;Password=my secret;");
+        assert_eq!(r, "app Server=x;Password=\u{2039}redacted\u{203a};");
+        // "secret" is itself a vocabulary word, so pass 1 catches "my" on
+        // its own first and pass 4 mops up the rest ("secret") in a second
+        // pass — both counted, but with no leak either way, which is the
+        // property under test.
+        assert_eq!(n, 2);
+    }
+
+    #[test]
+    fn c1_unquoted_user_id_with_space_is_fully_redacted() {
+        let (r, n) = redact_command_line("app Server=x;User Id=john smith;");
+        assert!(!r.contains("john"), "{r}");
+        assert!(!r.contains("smith"), "{r}");
+        assert!(r.contains("Server=x"), "{r}");
+        assert_eq!(n, 1);
+    }
+
+    // The M1 reproducer itself (no ';' anywhere) must still not swallow
+    // trailing, unrelated command-line text.
+    #[test]
+    fn c1_does_not_regress_m1_no_semicolon_case() {
+        let (r, n) = redact_command_line("app password=hunter2 --verbose --port 80");
+        assert!(!r.contains("hunter2"), "{r}");
+        assert!(r.contains("--verbose"), "{r}");
+        assert!(r.contains("--port 80"), "{r}");
+        assert_eq!(n, 1);
+    }
+
+    // I1: the round-1 `starts_with(REDACTED)` guard let attacker-supplied
+    // text that merely *starts* with the redaction token through unredacted,
+    // leaking whatever followed it.
+    #[test]
+    fn i1_fake_redacted_prefix_does_not_bypass_redaction() {
+        let (r, n) = redact_command_line("app User Id=\u{2039}redacted\u{203a}joe;");
+        assert!(!r.contains("joe"), "{r}");
+        assert_eq!(n, 1);
+    }
+
+    // I2: the per-segment '/' rule from round 1's M2 fix over-applied,
+    // eating URL query key names and stripping extensions off hashed asset
+    // filenames. Ruling: split a '/'-word at the first '?' and only apply
+    // the opaque-run rule to the path portion (the query portion is pass
+    // 3's job); within the path portion, set aside a short trailing
+    // extension before testing a segment.
+    #[test]
+    fn i2_webhook_token_in_url_path_still_redacted() {
+        let (r, n) = redact_command_line(
+            "https://hooks.slack.com/services/T000/B000/XXXXXXXXXXXXXXXXXXXXXXXX",
+        );
+        assert!(!r.contains("XXXXXXXXXXXXXXXXXXXXXXXX"), "{r}");
+        assert!(n >= 1);
+    }
+
+    #[test]
+    fn i2_query_key_name_survives_only_value_redacted_by_pass3() {
+        let (r, n) =
+            redact_command_line("curl https://x.io/a?token=abc123def456abc123def456&page=2");
+        assert!(r.contains("?token=\u{2039}redacted\u{203a}"), "{r}");
+        assert!(r.contains("&page=2"), "{r}");
+        assert!(!r.contains("abc123def456"), "{r}");
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn i2_hashed_asset_filename_keeps_its_extension() {
+        let (r, n) = redact_command_line("/dist/application-a1b2c3d4e5f6.js");
+        assert!(r.contains("\u{2039}redacted\u{203a}.js"), "{r}");
+        assert!(!r.contains("application-a1b2c3d4e5f6"), "{r}");
+        assert_eq!(n, 1);
     }
 }
