@@ -17,6 +17,12 @@ const REDACTED: &str = "‹redacted›";
 /// Windows command line (which itself is capped well under that).
 const MAX_SCAN_BYTES: usize = 32 * 1024;
 
+/// Appended to the output whenever the input was longer than
+/// `MAX_SCAN_BYTES` and had to be truncated, so callers can distinguish a
+/// clipped result from a clean one. The dropped tail is never scanned or
+/// persisted, redacted or not.
+const TRUNCATED_MARKER: &str = "…[truncated]";
+
 const VOCAB: &[&str] = &[
     "password",
     "passwd",
@@ -34,13 +40,18 @@ const VOCAB: &[&str] = &[
 
 /// Returns (redacted string, number of fields redacted). Irreversible.
 pub fn redact_command_line(input: &str) -> (String, u32) {
+    let was_truncated = input.len() > MAX_SCAN_BYTES;
     let truncated = truncate_at_char_boundary(input, MAX_SCAN_BYTES);
     let mut count = 0u32;
 
     let s = redact_vocabulary(truncated, &mut count);
     let s = redact_long_opaque_runs(&s, &mut count);
     let s = redact_urls(&s, &mut count);
-    let s = redact_connection_strings(&s, &mut count);
+    let mut s = redact_connection_strings(&s, &mut count);
+
+    if was_truncated {
+        s.push_str(TRUNCATED_MARKER);
+    }
 
     (s, count)
 }
@@ -61,10 +72,34 @@ fn is_vocab_word(word: &str) -> bool {
     VOCAB.iter().any(|v| *v == lower)
 }
 
+/// For each character position, whether it lies inside an (unescaped)
+/// double-quoted region. The quote character itself is marked `false` (it's
+/// a delimiter, not content); parity simply toggles on each `"`.
+fn compute_in_quotes(chars: &[char]) -> Vec<bool> {
+    let mut result = vec![false; chars.len()];
+    let mut inside = false;
+    for (idx, c) in chars.iter().enumerate() {
+        if *c == '"' {
+            result[idx] = false;
+            inside = !inside;
+        } else {
+            result[idx] = inside;
+        }
+    }
+    result
+}
+
+fn in_quotes_at(in_quotes: &[bool], idx: usize) -> bool {
+    in_quotes.get(idx).copied().unwrap_or(false)
+}
+
 /// Pass 1: credential vocabulary as `key=value`, `key:value`, `--key value`,
-/// `--key=value`, `/key:value`.
+/// `--key=value`, `/key:value`; plus, per spec-owner ruling, the bare
+/// `Bearer <token>` form specifically (not extended to the rest of the
+/// vocabulary, which would over-redact things like `--session name`).
 fn redact_vocabulary(input: &str, count: &mut u32) -> String {
     let chars: Vec<char> = input.chars().collect();
+    let in_quotes = compute_in_quotes(&chars);
     let mut out = String::with_capacity(input.len());
     let mut i = 0usize;
 
@@ -86,41 +121,60 @@ fn redact_vocabulary(input: &str, count: &mut u32) -> String {
             (i, 0)
         };
 
-        if let Some((key_end, word)) = read_word(&chars, key_start)
-            && is_vocab_word(&word)
-        {
-            // Look at what follows the word: optional whitespace then
-            // one of '=' ':' or (if this was a flag form) whitespace then value.
-            let mut j = key_end;
-            let after_word_ws = skip_ws(&chars, j);
-            if after_word_ws < chars.len()
-                && (chars[after_word_ws] == '=' || chars[after_word_ws] == ':')
-            {
-                // key=value / key:value form (works with or without -- or / prefix)
-                j = after_word_ws + 1;
-                let (value_end, _value) = read_value(&chars, j);
-                // emit prefix + key + separator + REDACTED
-                for c in &chars[i..after_word_ws] {
-                    out.push(*c);
-                }
-                out.push(chars[after_word_ws]);
-                out.push_str(REDACTED);
-                *count += 1;
-                i = value_end;
-                continue;
-            } else if prefix_len == 2 {
-                // --key value form (space separated), only valid with -- prefix
-                let val_start = skip_ws(&chars, key_end);
-                if val_start < chars.len() && val_start > key_end {
-                    let (value_end, _value) = read_value(&chars, val_start);
-                    for c in &chars[i..key_end] {
+        if let Some((key_end, word)) = read_word(&chars, key_start) {
+            let word_lower = word.to_ascii_lowercase();
+            if is_vocab_word(&word) {
+                // Look at what follows the word: optional whitespace then
+                // one of '=' ':' or (if this was a flag form, or the word is
+                // `bearer`) whitespace then value.
+                let after_word_ws = skip_ws(&chars, key_end);
+                if after_word_ws < chars.len()
+                    && (chars[after_word_ws] == '=' || chars[after_word_ws] == ':')
+                {
+                    // key=value / key:value form (works with or without --
+                    // or / prefix). Skip whitespace around the separator on
+                    // both sides, emitting whatever we skip verbatim, so we
+                    // never leave a "phantom" empty match and never lose the
+                    // real value to a separately-copied space.
+                    let sep_idx = after_word_ws;
+                    let value_scan_start = sep_idx + 1;
+                    let ws_end = skip_ws(&chars, value_scan_start);
+                    let in_q = in_quotes_at(&in_quotes, ws_end);
+                    let (value_end, value_len) = read_value(&chars, ws_end, in_q);
+
+                    for c in &chars[i..sep_idx] {
                         out.push(*c);
                     }
-                    out.push(' ');
-                    out.push_str(REDACTED);
-                    *count += 1;
+                    out.push(chars[sep_idx]);
+                    for c in &chars[value_scan_start..ws_end] {
+                        out.push(*c);
+                    }
+                    if value_len > 0 {
+                        out.push_str(REDACTED);
+                        *count += 1;
+                    }
                     i = value_end;
                     continue;
+                } else if prefix_len == 2 || word_lower == "bearer" {
+                    // `--key value` form (space separated); also the bare
+                    // `Bearer value` form specifically.
+                    let val_start = skip_ws(&chars, key_end);
+                    if val_start < chars.len() && val_start > key_end {
+                        let in_q = in_quotes_at(&in_quotes, val_start);
+                        let (value_end, value_len) = read_value(&chars, val_start, in_q);
+                        if value_len > 0 {
+                            for c in &chars[i..key_end] {
+                                out.push(*c);
+                            }
+                            for c in &chars[key_end..val_start] {
+                                out.push(*c);
+                            }
+                            out.push_str(REDACTED);
+                            *count += 1;
+                            i = value_end;
+                            continue;
+                        }
+                    }
                 }
             }
         }
@@ -150,21 +204,33 @@ fn read_word(chars: &[char], start: usize) -> Option<(usize, String)> {
 
 fn skip_ws(chars: &[char], start: usize) -> usize {
     let mut i = start;
-    while i < chars.len() && chars[i] == ' ' {
+    while i < chars.len() && chars[i].is_whitespace() {
         i += 1;
     }
     i
 }
 
-/// Reads a "value" token: everything up to the next whitespace, or, if the
-/// value starts with a quote, everything up to the matching closing quote
-/// (inclusive of quotes being left in place is not needed since we replace
-/// the whole thing).
-fn read_value(chars: &[char], start: usize) -> (usize, String) {
+/// Reads a "value" token starting at `start`, returning `(end_index,
+/// chars_consumed)`. Behavior depends on context:
+/// - If `in_quotes` is true (the position lies inside an outer double-quoted
+///   argv element), the value runs to the next `"` or end of string — this
+///   is what lets `"--password=my secret phrase"` redact the whole phrase
+///   instead of stopping at the first space.
+/// - Otherwise, if the value itself starts with a quote character, read the
+///   quoted token (matching close quote), matching a separately-quoted CLI
+///   value like `--password "hunter 2"`.
+/// - Otherwise, read up to the next whitespace or `&`.
+fn read_value(chars: &[char], start: usize, in_quotes: bool) -> (usize, usize) {
     if start >= chars.len() {
-        return (start, String::new());
+        return (start, 0);
     }
-    if chars[start] == '"' || chars[start] == '\'' {
+    if in_quotes {
+        let mut end = start;
+        while end < chars.len() && chars[end] != '"' {
+            end += 1;
+        }
+        (end, end - start)
+    } else if chars[start] == '"' || chars[start] == '\'' {
         let quote = chars[start];
         let mut end = start + 1;
         while end < chars.len() && chars[end] != quote {
@@ -173,22 +239,24 @@ fn read_value(chars: &[char], start: usize) -> (usize, String) {
         if end < chars.len() {
             end += 1; // include closing quote
         }
-        (end, chars[start..end].iter().collect())
+        (end, end - start)
     } else {
         let mut end = start;
-        while end < chars.len() && chars[end] != ' ' && chars[end] != '&' {
+        while end < chars.len() && !chars[end].is_whitespace() && chars[end] != '&' {
             end += 1;
         }
-        (end, chars[start..end].iter().collect())
+        (end, end - start)
     }
 }
 
-/// Pass 2: long opaque base64-ish / hex runs, excluding anything that looks
-/// like a filesystem path or URL (i.e. the whitespace-delimited word
-/// containing the run has a `\` or `/` in it anywhere). Path segments such
-/// as `deadbeefdeadbeefdeadbeef` inside `c:\some\deadbeef...\file.txt` would
-/// otherwise look like a standalone opaque run once split on `\`, so the
-/// exemption is evaluated per *word*, not per opaque run.
+/// Pass 2: long opaque base64-ish / hex runs. A whitespace-delimited word
+/// containing a `\` is treated as a filesystem path and left entirely
+/// untouched (splitting a path on `\` would otherwise expose bare segments
+/// like `deadbeefdeadbeefdeadbeef` that look like standalone opaque runs).
+/// A word containing `/` (URLs, forward-slash paths) is *not* wholly
+/// exempt — it's split on `/` and each segment is checked independently, so
+/// a secret-looking path/URL segment (e.g. a Slack webhook token) still
+/// gets caught.
 fn redact_long_opaque_runs(input: &str, count: &mut u32) -> String {
     let chars: Vec<char> = input.chars().collect();
     let mut out = String::with_capacity(input.len());
@@ -208,10 +276,22 @@ fn redact_long_opaque_runs(input: &str, count: &mut u32) -> String {
         }
         let word = &chars[word_start..word_end];
 
-        if word.contains(&'\\') || word.contains(&'/') {
-            // Path- or URL-shaped word; leave entirely to later passes.
+        if word.contains(&'\\') {
+            // Path-shaped word; leave entirely to later passes.
             for c in word {
                 out.push(*c);
+            }
+        } else if word.contains(&'/') {
+            let mut seg_start = 0usize;
+            for idx in 0..=word.len() {
+                if idx == word.len() || word[idx] == '/' {
+                    let segment = &word[seg_start..idx];
+                    out.push_str(&redact_opaque_runs_in_word(segment, count));
+                    if idx < word.len() {
+                        out.push('/');
+                    }
+                    seg_start = idx + 1;
+                }
             }
         } else {
             out.push_str(&redact_opaque_runs_in_word(word, count));
@@ -369,12 +449,18 @@ fn redact_url_query(input: &str, count: &mut u32) -> String {
     out
 }
 
-/// Pass 4: connection-string fragments `(Password|Pwd|User Id|Uid)\s*=\s*value`
-/// where value runs up to the next `;` (or end of string).
+/// Pass 4: connection-string fragments `(Password|Pwd|User Id|Uid)\s*=\s*value`.
+/// Outside a quoted connection string, the value runs up to the next `;` or
+/// whitespace (whichever comes first) so this pass can never swallow
+/// trailing, unrelated command-line text (e.g. `--verbose --port 80`)
+/// that follows a bare `key=value` secret already redacted by pass 1.
+/// Inside a quoted connection string, only `;` terminates the value, since
+/// connection strings can legitimately contain spaces in values.
 fn redact_connection_strings(input: &str, count: &mut u32) -> String {
     const KEYS: &[&str] = &["password", "pwd", "user id", "uid"];
 
     let chars: Vec<char> = input.chars().collect();
+    let in_quotes = compute_in_quotes(&chars);
     let mut out = String::with_capacity(input.len());
     let mut i = 0usize;
 
@@ -391,12 +477,23 @@ fn redact_connection_strings(input: &str, count: &mut u32) -> String {
                     j += 1;
                     j = skip_ws(&chars, j);
                     let val_start = j;
+                    let in_q = in_quotes_at(&in_quotes, val_start);
                     let mut val_end = val_start;
-                    while val_end < chars.len() && chars[val_end] != ';' {
+                    while val_end < chars.len()
+                        && chars[val_end] != ';'
+                        && (in_q || !chars[val_end].is_whitespace())
+                    {
                         val_end += 1;
                     }
                     let value: String = chars[val_start..val_end].iter().collect();
-                    if val_end > val_start && value != REDACTED {
+                    // Already redacted by an earlier pass (the literal key=
+                    // text pass 1 leaves behind still matches here) — don't
+                    // re-match and re-count it. `starts_with` rather than an
+                    // exact match because the value we just scanned can
+                    // legitimately carry a trailing character straight after
+                    // the token (e.g. a closing quote) that isn't part of
+                    // the secret itself.
+                    if val_end > val_start && !value.starts_with(REDACTED) {
                         out.push_str(&chars[i..val_start].iter().collect::<String>());
                         out.push_str(REDACTED);
                         *count += 1;
@@ -501,6 +598,121 @@ mod tests {
 
         let long = "a".repeat(64 * 1024);
         let (r2, _n2) = redact_command_line(&long);
-        assert!(r2.len() <= long.len());
+        assert!(r2.len() <= long.len() + TRUNCATED_MARKER.len());
+    }
+
+    // -- Security review, fix round 1 -----------------------------------
+
+    // H1: whitespace around the separator used to leak the value verbatim
+    // and record a phantom (zero-length) redaction.
+    #[test]
+    fn h1_whitespace_around_equals_separator_is_redacted_without_phantom_count() {
+        let (r, n) = redact_command_line("app --password = hunter2");
+        assert!(!r.contains("hunter2"), "{r}");
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn h1_colon_separator_with_trailing_space_is_redacted() {
+        let (r, n) = redact_command_line("app token: abc123");
+        assert!(!r.contains("abc123"), "{r}");
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn h1_quoted_header_style_cookie_is_redacted() {
+        let (r, n) = redact_command_line(r#"curl -H "Cookie: sid=abc""#);
+        assert!(!r.contains("abc"), "{r}");
+        assert_eq!(n, 1);
+    }
+
+    // H2: tab/newline separators used to bypass the flag-value form
+    // entirely because skip_ws only recognized ' '.
+    #[test]
+    fn h2_tab_separated_flag_value_is_redacted() {
+        let (r, n) = redact_command_line("app --password\thunter2");
+        assert!(!r.contains("hunter2"), "{r}");
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn h2_newline_separated_flag_value_is_redacted() {
+        let (r, n) = redact_command_line("--password\nhunter2");
+        assert!(!r.contains("hunter2"), "{r}");
+        assert_eq!(n, 1);
+    }
+
+    // H3 (fixed together with M1): a quoted argv element's value must run
+    // to the closing quote, not the first embedded space, or the tail of
+    // the secret leaks.
+    #[test]
+    fn h3_quoted_value_with_spaces_is_fully_redacted() {
+        let (r, n) = redact_command_line(r#"app "--password=my secret phrase""#);
+        assert!(!r.contains("my"), "{r}");
+        assert!(!r.contains("secret"), "{r}");
+        assert!(!r.contains("phrase"), "{r}");
+        assert_eq!(n, 1);
+    }
+
+    // M1: pass 4 used to swallow to end-of-string when no ';' followed a
+    // bare `key=value` secret already redacted by pass 1, destroying
+    // trailing command-line text and double-counting.
+    #[test]
+    fn m1_bare_password_does_not_swallow_trailing_flags() {
+        let (r, n) = redact_command_line("app password=hunter2 --verbose --port 80");
+        assert!(!r.contains("hunter2"), "{r}");
+        assert!(r.contains("--verbose"), "{r}");
+        assert!(r.contains("--port 80"), "{r}");
+        assert_eq!(n, 1);
+    }
+
+    // M2: words containing '/' used to be wholly exempt from opaque-run
+    // detection, letting path/URL-embedded secrets (e.g. webhook tokens)
+    // through untouched.
+    #[test]
+    fn m2_slash_path_segment_opaque_token_is_redacted() {
+        let (r, n) = redact_command_line(
+            "https://hooks.slack.com/services/T000/B000/XXXXXXXXXXXXXXXXXXXXXXXX",
+        );
+        assert!(!r.contains("XXXXXXXXXXXXXXXXXXXXXXXX"), "{r}");
+        assert!(n >= 1);
+    }
+
+    // M3 (spec-owner ruling): `Bearer <token>` is a recognized form even
+    // though it's a bare `key value` pair, and even for tokens shorter
+    // than pass 2's 20-char opaque-run threshold. This must NOT extend to
+    // the rest of the vocabulary (that would over-redact e.g. `--session name`).
+    #[test]
+    fn m3_bearer_token_form_is_redacted_even_under_20_chars() {
+        let (r, n) = redact_command_line(r#"curl -H "Authorization: Bearer abcdefghijklmnop""#);
+        assert!(!r.contains("abcdefghijklmnop"), "{r}");
+        assert!(r.contains("Bearer"), "{r}");
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn m3_bare_key_value_not_extended_to_whole_vocabulary() {
+        let s = "app session name";
+        assert_eq!(redact_command_line(s), (s.to_string(), 0));
+    }
+
+    // L1: an empty value at end-of-string must not count as a redaction.
+    #[test]
+    fn l1_empty_value_at_eos_not_counted() {
+        let (r, n) = redact_command_line("app password=");
+        assert_eq!(r, "app password=");
+        assert_eq!(n, 0);
+    }
+
+    // L4: when the input exceeds the scan cap, the truncated tail must
+    // never appear in the output, and the result is marked so callers can
+    // tell a clipped result from a clean one.
+    #[test]
+    fn l4_oversized_input_is_marked_truncated_and_never_leaks_the_tail() {
+        let mut s = "a".repeat(MAX_SCAN_BYTES + 100);
+        s.push_str(" --password hunter2");
+        let (r, _n) = redact_command_line(&s);
+        assert!(r.ends_with(TRUNCATED_MARKER), "{r}");
+        assert!(!r.contains("hunter2"), "{r}");
     }
 }
