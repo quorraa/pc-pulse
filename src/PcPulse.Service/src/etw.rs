@@ -16,7 +16,7 @@ use std::{
 };
 use windows::{
     Win32::{
-        Foundation::{ERROR_SUCCESS, WIN32_ERROR},
+        Foundation::{ERROR_ALREADY_EXISTS, ERROR_SUCCESS, WIN32_ERROR},
         System::Diagnostics::Etw::{
             CONTROLTRACE_HANDLE, CloseTrace, ControlTraceW, EVENT_CONTROL_CODE_ENABLE_PROVIDER,
             EVENT_HEADER_FLAG_32_BIT_HEADER, EVENT_RECORD, EVENT_TRACE_CONTROL_QUERY,
@@ -43,6 +43,26 @@ const PROCESS_EVENT_CAPACITY: usize = 4096;
 /// WCHARs reserved for each of the two names a query writes back. 1024 is the
 /// canonical slack used with `ControlTraceW`.
 const QUERY_NAME_SLOT_CHARS: usize = 1024;
+
+/// Session name for the manifest (Kernel-Process) session.
+///
+/// Deliberately *fixed*, not suffixed with the process id. ETW sessions
+/// outlive the process that created them: a service killed non-gracefully
+/// (`taskkill /f`, a crash, a hard power event) leaves its session running,
+/// and a pid-suffixed name means the next run picks a *different* name and
+/// never reclaims the orphan. With a fixed name the orphan is found on the
+/// next start (`ERROR_ALREADY_EXISTS`) and stopped, so a session can leak at
+/// most once. See [`start_trace_reclaiming_stale`].
+const PROCESS_SESSION_NAME: &str = "PcPulse";
+/// Session name for the opt-in command-line system logger. Fixed for the
+/// reason above, and doubly important here: a machine allows only eight
+/// system-logger sessions in total, so four hard kills of a pid-named
+/// session would burn half the pool permanently.
+const CMDLINE_SESSION_NAME: &str = "PcPulse-Cmdline";
+
+fn wide_session_name(name: &str) -> Vec<u16> {
+    name.encode_utf16().chain(Some(0)).collect()
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct EtwSnapshot {
@@ -166,8 +186,7 @@ unsafe impl Sync for EtwCollector {}
 
 impl EtwCollector {
     pub fn start() -> Result<Self> {
-        let session = format!("PcPulse-{}", std::process::id());
-        let session_name: Vec<u16> = session.encode_utf16().chain(Some(0)).collect();
+        let session_name = wide_session_name(PROCESS_SESSION_NAME);
         let (queue, sink) = EtwProcessQueue::new(PROCESS_EVENT_CAPACITY);
         let callback = Arc::new(CallbackState {
             event_count: AtomicU64::new(0),
@@ -329,6 +348,98 @@ impl Drop for EtwCollector {
     }
 }
 
+/// What to do with a `StartTraceW` status. Pure so the reclaim policy is
+/// testable without a live ETW session.
+#[derive(Debug, PartialEq)]
+enum StartOutcome {
+    Started,
+    /// The name is taken by a session this process does not own -- an orphan
+    /// left by a previous, non-graceful termination. Stop it and retry once.
+    ReclaimStale,
+    Failed(WIN32_ERROR),
+}
+
+fn classify_start_status(status: WIN32_ERROR) -> StartOutcome {
+    match status {
+        ERROR_SUCCESS => StartOutcome::Started,
+        ERROR_ALREADY_EXISTS => StartOutcome::ReclaimStale,
+        other => StartOutcome::Failed(other),
+    }
+}
+
+/// Stops a session by name. Used both for teardown-on-failure and for
+/// reclaiming an orphan; a name-based stop needs no handle, which is exactly
+/// why an orphan from a previous process can be stopped at all.
+fn stop_session_by_name(name: &[u16]) {
+    let mut properties = property_buffer(name);
+    unsafe {
+        let _ = ControlTraceW(
+            CONTROLTRACE_HANDLE::default(),
+            PCWSTR(name.as_ptr()),
+            properties.as_mut_ptr().cast::<EVENT_TRACE_PROPERTIES>(),
+            EVENT_TRACE_CONTROL_STOP,
+        );
+    }
+}
+
+/// Starts a trace session, reclaiming an orphan of the same name if one is
+/// already running.
+///
+/// Both sessions here are named after the *service*, not the process, so an
+/// instance killed non-gracefully leaves a session that would otherwise sit
+/// there forever with the kernel buffering events nobody consumes -- and for
+/// the command-line system logger, holding one of the machine's eight slots.
+/// A single `ERROR_ALREADY_EXISTS` retry turns that permanent leak into a
+/// self-healing one. The retry is deliberately once: a second failure is a
+/// real error, not something to loop on.
+///
+/// `properties` is rebuilt for the retry because `StartTraceW` writes into
+/// the buffer it is given.
+fn start_trace_reclaiming_stale(
+    name: &[u16],
+    properties: fn(&[u16]) -> Vec<u64>,
+) -> Result<CONTROLTRACE_HANDLE> {
+    let mut buffer = properties(name);
+    let mut control = CONTROLTRACE_HANDLE::default();
+    let status = unsafe {
+        StartTraceW(
+            &mut control,
+            PCWSTR(name.as_ptr()),
+            buffer.as_mut_ptr().cast::<EVENT_TRACE_PROPERTIES>(),
+        )
+    };
+    match classify_start_status(status) {
+        StartOutcome::Started => return Ok(control),
+        StartOutcome::Failed(status) => {
+            bail!("StartTraceW failed with status 0x{:08x}", status.0)
+        }
+        StartOutcome::ReclaimStale => {}
+    }
+
+    eprintln!(
+        "reclaiming an orphaned ETW session left by a previous run \
+         (its name was already in use)"
+    );
+    stop_session_by_name(name);
+    let mut buffer = properties(name);
+    let mut control = CONTROLTRACE_HANDLE::default();
+    let status = unsafe {
+        StartTraceW(
+            &mut control,
+            PCWSTR(name.as_ptr()),
+            buffer.as_mut_ptr().cast::<EVENT_TRACE_PROPERTIES>(),
+        )
+    };
+    if status != ERROR_SUCCESS {
+        bail!(
+            "StartTraceW failed with status 0x{:08x} after stopping a stale session of the \
+             same name",
+            status.0
+        );
+    }
+    Ok(control)
+}
+
 fn run_trace(
     name: &[u16],
     state: Arc<CallbackState>,
@@ -337,13 +448,7 @@ fn run_trace(
     PROCESSTRACE_HANDLE,
     *const CallbackState,
 )> {
-    let mut properties = property_buffer(name);
-    let properties_ptr = properties.as_mut_ptr().cast::<EVENT_TRACE_PROPERTIES>();
-    let mut control = CONTROLTRACE_HANDLE::default();
-    let status = unsafe { StartTraceW(&mut control, PCWSTR(name.as_ptr()), properties_ptr) };
-    if status != ERROR_SUCCESS {
-        bail!("StartTraceW failed with status 0x{:08x}", status.0);
-    }
+    let control = start_trace_reclaiming_stale(name, property_buffer)?;
     let enable_status = unsafe {
         EnableTraceEx2(
             control,
@@ -357,14 +462,7 @@ fn run_trace(
         )
     };
     if enable_status != ERROR_SUCCESS {
-        unsafe {
-            let _ = ControlTraceW(
-                control,
-                PCWSTR(name.as_ptr()),
-                properties_ptr,
-                EVENT_TRACE_CONTROL_STOP,
-            );
-        }
+        stop_session_by_name(name);
         bail!(
             "EnableTraceEx2 failed with status 0x{:08x}",
             enable_status.0
@@ -387,13 +485,8 @@ fn run_trace(
     if processing == PROCESSTRACE_HANDLE::default() || processing.Value == u64::MAX {
         unsafe {
             drop(Arc::from_raw(context.cast::<CallbackState>()));
-            let _ = ControlTraceW(
-                control,
-                PCWSTR(name.as_ptr()),
-                properties_ptr,
-                EVENT_TRACE_CONTROL_STOP,
-            );
         }
+        stop_session_by_name(name);
         bail!("OpenTraceW failed");
     }
     // ProcessTrace owns the callback context until the processing handle is closed.
@@ -542,7 +635,12 @@ const CMDLINE_EVENT_CAPACITY: usize = 4096;
 /// One command line observed by the MOF session, as it left the kernel:
 /// **not yet redacted**. It is redacted the moment it reaches
 /// `CmdlineJoiner::offer`, which is the only consumer.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// `Debug` is hand-written to elide the line itself: this is the one place a
+/// raw, unredacted command line exists, and a stray `{:?}` in a log or a
+/// panic message would put the credentials the pipeline exists to strip
+/// straight into a diagnostic file.
+#[derive(Clone, PartialEq)]
 pub struct CapturedCmdline {
     pub pid: u32,
     /// The MOF event's own timestamp, in epoch milliseconds. The MOF
@@ -553,6 +651,17 @@ pub struct CapturedCmdline {
     /// inside the joiner's 2s window.
     pub start_ms: i64,
     pub command_line: String,
+}
+
+impl std::fmt::Debug for CapturedCmdline {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CapturedCmdline")
+            .field("pid", &self.pid)
+            .field("start_ms", &self.start_ms)
+            .field("command_line", &"‹elided›")
+            .finish()
+    }
 }
 
 struct CmdlineCallbackState {
@@ -591,8 +700,7 @@ impl CmdlineCollector {
     /// and an exhausted pool surfaces here as an error the runtime logs
     /// before reporting `cmdlineSessionActive = false`.
     pub fn start() -> Result<Self> {
-        let session = format!("PcPulse-Cmdline-{}", std::process::id());
-        let session_name: Vec<u16> = session.encode_utf16().chain(Some(0)).collect();
+        let session_name = wide_session_name(CMDLINE_SESSION_NAME);
         let (tx, rx) = bounded(CMDLINE_EVENT_CAPACITY);
         let health = Arc::new(EtwHealth::default());
         let state = Arc::new(CmdlineCallbackState {
@@ -669,18 +777,12 @@ fn run_cmdline_trace(
     PROCESSTRACE_HANDLE,
     *const CmdlineCallbackState,
 )> {
-    let mut properties = system_property_buffer(name);
-    let properties_ptr = properties.as_mut_ptr().cast::<EVENT_TRACE_PROPERTIES>();
-    let mut control = CONTROLTRACE_HANDLE::default();
-    let status = unsafe { StartTraceW(&mut control, PCWSTR(name.as_ptr()), properties_ptr) };
-    if status != ERROR_SUCCESS {
-        // ERROR_NO_SYSTEM_RESOURCES here is the eight-slot system-logger pool
-        // being full; the caller logs and reports the session as inactive.
-        bail!(
-            "StartTraceW (command-line system logger) failed with status 0x{:08x}",
-            status.0
-        );
-    }
+    // A failure here (typically `windows::Win32::Foundation::ERROR_NO_SYSTEM_RESOURCES`: the eight-slot
+    // system-logger pool is full) is reported to the caller, which logs it and
+    // reports the session as inactive rather than failing the sample. An
+    // orphan of this same name left by a killed instance is reclaimed rather
+    // than counted against that pool forever.
+    let control = start_trace_reclaiming_stale(name, system_property_buffer)?;
     // A system logger's providers come from EnableFlags at start time, so
     // there is no EnableTraceEx2 step here.
 
@@ -700,13 +802,8 @@ fn run_cmdline_trace(
     if processing == PROCESSTRACE_HANDLE::default() || processing.Value == u64::MAX {
         unsafe {
             drop(Arc::from_raw(context.cast::<CmdlineCallbackState>()));
-            let _ = ControlTraceW(
-                control,
-                PCWSTR(name.as_ptr()),
-                properties_ptr,
-                EVENT_TRACE_CONTROL_STOP,
-            );
         }
+        stop_session_by_name(name);
         bail!("OpenTraceW failed for the command-line session");
     }
     Ok((control, processing, context.cast::<CmdlineCallbackState>()))
@@ -809,7 +906,11 @@ fn parse_mof_process_start(
     pointer_size: usize,
     version: u8,
 ) -> Option<MofProcessStart> {
-    if !(2..=8).contains(&version) {
+    // Only the layouts documented above are parsed. A future version could
+    // insert a field anywhere ahead of `CommandLine`, and parsing it as v4
+    // would not fail loudly -- it would hand back plausible-looking garbage.
+    // An unknown version is counted as malformed instead.
+    if !(2..=4).contains(&version) {
         return None;
     }
     // PageDirectoryBase (v2) / UniqueProcessKey (v3+).
@@ -1044,6 +1145,9 @@ mod tests {
     fn mof_start_rejects_unsupported_versions_and_bogus_sids() {
         let payload = mof_payload(8, 4, 1, "x.exe", "x", true);
         assert!(parse_mof_process_start(&payload, 8, 1).is_none());
+        // A version past the layouts documented here is refused rather than
+        // parsed as v4 and quietly mis-read.
+        assert!(parse_mof_process_start(&payload, 8, 5).is_none());
         assert!(parse_mof_process_start(&payload, 8, 9).is_none());
 
         // Corrupt the SID revision byte: the rest of the layout would be
@@ -1060,6 +1164,38 @@ mod tests {
         let parsed = parse_mof_process_start(&payload, 8, 4).unwrap();
         assert_eq!(parsed.pid, 7);
         assert_eq!(parsed.command_line, "");
+    }
+
+    #[test]
+    fn session_names_are_fixed_so_an_orphan_is_reclaimable() {
+        // A pid in the name would mean a killed instance's session is never
+        // found again by the next run -- and for the system logger, one of
+        // the machine's eight slots gone until reboot.
+        let pid = std::process::id().to_string();
+        for name in [PROCESS_SESSION_NAME, CMDLINE_SESSION_NAME] {
+            assert!(!name.contains(&pid), "{name} embeds the process id");
+            assert!(
+                !name.chars().any(|character| character.is_ascii_digit()),
+                "{name} looks process-specific"
+            );
+        }
+        assert_ne!(PROCESS_SESSION_NAME, CMDLINE_SESSION_NAME);
+        // NUL-terminated, as every PCWSTR session name must be.
+        assert_eq!(wide_session_name(CMDLINE_SESSION_NAME).last(), Some(&0));
+    }
+
+    #[test]
+    fn an_already_existing_session_name_asks_for_a_reclaim_not_a_failure() {
+        assert_eq!(
+            classify_start_status(ERROR_ALREADY_EXISTS),
+            StartOutcome::ReclaimStale
+        );
+        assert_eq!(classify_start_status(ERROR_SUCCESS), StartOutcome::Started);
+        assert_eq!(
+            classify_start_status(windows::Win32::Foundation::ERROR_NO_SYSTEM_RESOURCES),
+            StartOutcome::Failed(windows::Win32::Foundation::ERROR_NO_SYSTEM_RESOURCES),
+            "a full system-logger pool is a real failure, not a stale session"
+        );
     }
 
     #[test]

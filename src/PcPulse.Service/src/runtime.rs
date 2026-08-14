@@ -796,6 +796,7 @@ fn sampling_loop(
     let mut cmdline_totals = EtwCounterTotals::default();
     let mut cmdlines_captured: u64 = 0;
     let mut cmdlines_redacted_fields: u64 = 0;
+    let mut cmdlines_persist_failures: u64 = 0;
     // One line per failure mode, not one per event: a broken DPAPI or a
     // failing insert repeats every tick and must not flood the log.
     let mut cmdline_protect_logged = false;
@@ -940,6 +941,12 @@ fn sampling_loop(
                 // `offer` redacts before storing; the raw line dies here.
                 joiner.offer(captured.pid, captured.start_ms, &captured.command_line);
             }
+            // The MOF session sees every process on the machine, while only
+            // tracked launches ever claim a line, so the ring must age out on
+            // the clock and not merely under cap pressure -- otherwise stale
+            // entries at the front push out captures still waiting for their
+            // launch row to flush.
+            joiner.evict_older_than(timestamp_ms);
         }
         // Drain the process-event queue every tick. The bounded channel is
         // the only thing between the ETW callback and this loop: a tick that
@@ -1000,6 +1007,9 @@ fn sampling_loop(
                         cmdlines_redacted_fields += u64::from(line.redacted_fields);
                     }
                     Err(error) => {
+                        // The join already consumed the capture, so this is
+                        // unrecoverable loss: counted, not just logged once.
+                        cmdlines_persist_failures += 1;
                         if !cmdline_protect_logged {
                             cmdline_protect_logged = true;
                             eprintln!("failed to persist a captured command line: {error:#}");
@@ -1007,6 +1017,7 @@ fn sampling_loop(
                     }
                 },
                 Err(status) => {
+                    cmdlines_persist_failures += 1;
                     if !cmdline_protect_logged {
                         cmdline_protect_logged = true;
                         eprintln!(
@@ -1042,6 +1053,8 @@ fn sampling_loop(
                 cmdline_session_active: cmdline_session.is_some(),
                 cmdlines_captured,
                 cmdlines_redacted_fields,
+                cmdlines_unmatched_evicted: joiner.unmatched_evicted(),
+                cmdlines_persist_failures,
                 ..launches.status()
             }
         };

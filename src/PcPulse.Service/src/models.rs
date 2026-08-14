@@ -1096,6 +1096,19 @@ pub struct LaunchCaptureStatus {
     pub cmdline_session_active: bool,
     pub cmdlines_captured: u64,
     pub cmdlines_redacted_fields: u64,
+    /// Captured command lines dropped before any launch row claimed them --
+    /// aged out of the join window or evicted by its cap. Mostly ordinary
+    /// (the MOF session sees every process on the machine, while only
+    /// tracked launches ever claim a line), but a figure climbing alongside
+    /// a flat `cmdlinesCaptured` means the join itself is failing.
+    #[serde(default)]
+    pub cmdlines_unmatched_evicted: u64,
+    /// Joined command lines that could not be stored (DPAPI encryption or
+    /// the insert failed). The line is gone by then -- the join consumed it
+    /// -- so this is real, unrecoverable loss, counted rather than left to a
+    /// single log line.
+    #[serde(default)]
+    pub cmdlines_persist_failures: u64,
 }
 
 #[cfg(test)]

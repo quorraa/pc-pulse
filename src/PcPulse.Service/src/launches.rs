@@ -561,6 +561,14 @@ const CMDLINE_JOIN_CAP: usize = 4096;
 /// `CreateTime` FILETIME vs. the MOF event's header timestamp), so an exact
 /// match is not available; 2s is the spec's join window.
 const CMDLINE_JOIN_WINDOW_MS: i64 = 2_000;
+/// How long an unclaimed capture is kept. A launch row can wait up to the
+/// 60s `Running` flush before it asks for its command line, so this is
+/// generous slack past that; beyond it the capture belongs to a process the
+/// tracker never recorded (the MOF session sees every process on the
+/// machine, not just tracked launches) and is evicted. Age eviction matters
+/// as much as the cap: on a machine churning starts, cap-only eviction would
+/// silently discard *recent* captures while stale ones sat at the front.
+const CMDLINE_JOIN_MAX_AGE_MS: i64 = 5 * 60_000;
 
 /// One redacted command line waiting to be joined to its launch row.
 ///
@@ -584,12 +592,14 @@ struct PendingCmdline {
 #[derive(Default)]
 pub struct CmdlineJoiner {
     entries: VecDeque<PendingCmdline>,
+    unmatched_evicted: u64,
 }
 
 impl CmdlineJoiner {
     pub fn new() -> Self {
         Self {
             entries: VecDeque::new(),
+            unmatched_evicted: 0,
         }
     }
 
@@ -605,7 +615,32 @@ impl CmdlineJoiner {
         });
         while self.entries.len() > CMDLINE_JOIN_CAP {
             self.entries.pop_front();
+            self.unmatched_evicted += 1;
         }
+    }
+
+    /// Drops captures older than [`CMDLINE_JOIN_MAX_AGE_MS`]. Called once per
+    /// tick so eviction happens on the clock rather than only under pressure
+    /// from new captures.
+    ///
+    /// Entries are kept in offer order, which is the MOF session's event
+    /// order, so this scans from the front and stops at the first entry young
+    /// enough to keep -- an out-of-order straggler costs at most one extra
+    /// entry's lifetime, never a full scan per tick.
+    pub fn evict_older_than(&mut self, now_ms: i64) {
+        while let Some(entry) = self.entries.front() {
+            if now_ms.saturating_sub(entry.start_ms) <= CMDLINE_JOIN_MAX_AGE_MS {
+                break;
+            }
+            self.entries.pop_front();
+            self.unmatched_evicted += 1;
+        }
+    }
+
+    /// Captures dropped without ever being claimed by a launch row, by age or
+    /// by the cap. Absolute total for the joiner's lifetime.
+    pub fn unmatched_evicted(&self) -> u64 {
+        self.unmatched_evicted
     }
 
     /// Attaches the closest matching capture to `ev` (same pid, start times
@@ -631,6 +666,10 @@ impl CmdlineJoiner {
     /// Drops every pending capture. Called when the opt-in setting is turned
     /// off, so nothing captured before the flip can still be persisted after
     /// it.
+    ///
+    /// Deliberately *not* counted as unmatched eviction: this is the user
+    /// withdrawing consent, not the join losing data, and mixing the two
+    /// would make the counter useless for spotting a broken join.
     pub fn clear(&mut self) {
         self.entries.clear();
     }
@@ -1105,12 +1144,51 @@ mod tests {
     }
 
     #[test]
+    fn joiner_evicts_by_age_and_counts_what_was_never_claimed() {
+        let mut joiner = CmdlineJoiner::new();
+        joiner.offer(1, 0, "old");
+        joiner.offer(2, CMDLINE_JOIN_MAX_AGE_MS, "young");
+
+        // Exactly at the age limit the oldest still stays: eviction is for
+        // captures that are *past* the window, not at its edge.
+        joiner.evict_older_than(CMDLINE_JOIN_MAX_AGE_MS);
+        assert_eq!(joiner.len(), 2);
+        assert_eq!(joiner.unmatched_evicted(), 0);
+
+        joiner.evict_older_than(CMDLINE_JOIN_MAX_AGE_MS + 1);
+        assert_eq!(joiner.len(), 1);
+        assert_eq!(joiner.unmatched_evicted(), 1);
+        // The survivor is the young one, still joinable.
+        let mut ev = launch_event(2, CMDLINE_JOIN_MAX_AGE_MS);
+        assert_eq!(joiner.attach(&mut ev).unwrap().0, "young");
+        // An attached capture is not an eviction.
+        assert_eq!(joiner.unmatched_evicted(), 1);
+    }
+
+    #[test]
+    fn joiner_clear_is_consent_withdrawal_not_counted_loss() {
+        let mut joiner = CmdlineJoiner::new();
+        joiner.offer(1, 0, "x");
+        joiner.clear();
+        assert_eq!(
+            joiner.unmatched_evicted(),
+            0,
+            "turning the setting off is not a join failure"
+        );
+    }
+
+    #[test]
     fn joiner_evicts_oldest_past_the_cap() {
         let mut joiner = CmdlineJoiner::new();
         for index in 0..(CMDLINE_JOIN_CAP + 10) {
             joiner.offer(index as u32, index as i64, "x");
         }
         assert_eq!(joiner.len(), CMDLINE_JOIN_CAP);
+        assert_eq!(
+            joiner.unmatched_evicted(),
+            10,
+            "cap eviction is silent loss unless it is counted"
+        );
         // The ten oldest are gone; the newest are still joinable.
         let mut oldest = launch_event(0, 0);
         assert!(joiner.attach(&mut oldest).is_none());
