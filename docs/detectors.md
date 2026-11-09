@@ -98,7 +98,11 @@ Privacy boundary: findings carry metadata and codes only — bugcheck numbers, e
 
 When the Debugging Tools for Windows are installed, the terminal client can run WinDbg's full `!analyze -v` against a specific dump on explicit demand. This tier lives client-side (`crashdump.rs`), never in the service. It locates `cdb.exe` by probing `PCPULSE_CDB_PATH`, the Windows SDK Debugging Tools under both Program Files roots, the winget/Store WinDbg app-execution alias (`cdbX64.exe` under `%LOCALAPPDATA%\Microsoft\WindowsApps`), and finally PATH; runs `cdb -z <dump> -c "!analyze -v; q"` under a timeout (`PCPULSE_CDB_TIMEOUT_SECS`, default 120 s, clamped 30–1800); preserves the full output to a rotated `%LOCALAPPDATA%\PcPulse\crash-analysis-<n>.log`; and parses the headline fields (`FAILURE_BUCKET_ID`, `IMAGE_NAME`, `MODULE_NAME`, `PROCESS_NAME`, `SYMBOL_NAME`, `BUGCHECK_STR`) into bounded evidence rows that also feed the analyzer's evidence bundle.
 
-**Network note:** this is the only diagnostic path in PC Pulse that touches the network, and only when the user explicitly requests a deep analysis — `cdb` is pointed at the Microsoft public symbol server (`msdl.microsoft.com`) with a local cache under `%LOCALAPPDATA%\PcPulse\symbols`. The service-side scanner performs no network access ever. Missing symbols degrade to whatever cdb can still attribute; nothing is fabricated.
+**Network note:** this deep-analysis path accesses the network only when explicitly requested — `cdb` is pointed at the Microsoft public symbol server (`msdl.microsoft.com`) with a local cache under `%LOCALAPPDATA%\PcPulse\symbols`. The service-side dump scanner performs no network access. Separately, the opt-in [network health monitor](network-health.md) makes bounded public DNS/connection probes in the service. Missing symbols degrade to whatever cdb can still attribute; nothing is fabricated.
+
+## Network health
+
+`networkDns`, `networkIpv6`, and `networkConnectivity` require repeated independent probe reports. `networkPorts` records recent Windows allocation events without identifying the requester as the resource holder. `networkMonitor` reports an unavailable probe worker. These findings share the ordinary acknowledgement, archive, retention, and notification policy. The service's sparse worker supplies new observations; ordinary sampling ticks do not inflate counts or persist cached evidence. See [network health checks](network-health.md) for timing, privacy, recovery and resource limits.
 
 ## Attribution limits
 

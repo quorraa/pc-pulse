@@ -5,7 +5,8 @@ use pcpulse_service::{
     launches::LaunchGroup,
     models::{
         AgentContext, Alert, DiagnosticLogResponse, HistoryResponse, LaunchEvent, LiveSample,
-        OptimizationPlan, PipeRequest, PipeResponse, ProcessNode, Rating, RatingVerdict, Snapshot,
+        NotificationState, OptimizationPlan, PipeRequest, PipeResponse, ProcessNode, Rating,
+        RatingVerdict, Snapshot,
     },
 };
 use serde::Deserialize;
@@ -60,6 +61,11 @@ impl PipeClient {
 
     pub fn snapshot(&self) -> Result<Snapshot> {
         self.send(&PipeRequest::GetSnapshot)
+    }
+
+    /// Tray-only state: never transfers process tables or queries history.
+    pub fn notification_state(&self) -> Result<NotificationState> {
+        self.send(&PipeRequest::GetNotificationState)
     }
 
     /// The most recent high-rate system sample; also keeps the service's

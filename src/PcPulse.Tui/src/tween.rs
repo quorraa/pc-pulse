@@ -24,6 +24,11 @@ pub const TWEEN: Duration = Duration::from_millis(400);
 /// the next refresh tier.
 pub const OVERRUN_LIMIT: u32 = 3;
 
+/// Review sustained render work every two seconds at 60 fps (four at 30).
+/// Making each deadline alone can still spend nearly an entire core drawing.
+const DUTY_WINDOW_FRAMES: u32 = 120;
+const MAX_RENDER_DUTY_DIVISOR: u32 = 4;
+
 /// The classic cubic-out easing curve on `0..=1`.
 pub fn cubic_out(t: f64) -> f64 {
     let inverse = 1.0 - t.clamp(0.0, 1.0);
@@ -66,31 +71,46 @@ pub const fn next_tier(fps: u32) -> u32 {
     }
 }
 
-/// Pure downgrade decision: counts consecutive frame-budget overruns and
-/// reports `true` exactly when [`OVERRUN_LIMIT`] is reached, then rearms.
+/// Downgrade on missed deadlines or sustained rendering above 25% of the
+/// frame interval. This is elapsed render work, not a CPU utilization reading;
+/// slow terminal writes count too because they also burden the desktop.
 #[derive(Debug, Default)]
 pub struct FrameGovernor {
     consecutive_overruns: u32,
+    window_frames: u32,
+    window_cost: Duration,
+    window_budget: Duration,
 }
 
 impl FrameGovernor {
     pub const fn new() -> Self {
         Self {
             consecutive_overruns: 0,
+            window_frames: 0,
+            window_cost: Duration::ZERO,
+            window_budget: Duration::ZERO,
         }
     }
 
     /// Record one frame's cost against its budget. Returns `true` when the
     /// caller should drop to the next refresh tier.
     pub fn note_frame(&mut self, cost: Duration, budget: Duration) -> bool {
+        self.window_frames += 1;
+        self.window_cost += cost;
+        self.window_budget += budget;
         if cost > budget {
             self.consecutive_overruns += 1;
             if self.consecutive_overruns >= OVERRUN_LIMIT {
-                self.consecutive_overruns = 0;
+                *self = Self::new();
                 return true;
             }
         } else {
             self.consecutive_overruns = 0;
+        }
+        if self.window_frames >= DUTY_WINDOW_FRAMES {
+            let overloaded = self.window_cost > self.window_budget / MAX_RENDER_DUTY_DIVISOR;
+            *self = Self::new();
+            return overloaded;
         }
         false
     }
@@ -394,7 +414,11 @@ pub fn display_system(smooth: &SmoothState, target: &SystemMetric, t: f64) -> Sy
 /// from `previous` toward `target`; every other field (timestamps, pool
 /// bytes, counts, collector self-metrics) passes through from `target`.
 /// Shared by the snapshot tween, its mid-tween capture, and the live layer.
-pub fn lerp_system_channels(previous: &SystemMetric, target: &SystemMetric, t: f64) -> SystemMetric {
+pub fn lerp_system_channels(
+    previous: &SystemMetric,
+    target: &SystemMetric,
+    t: f64,
+) -> SystemMetric {
     let mut shown = target.clone();
     shown.cpu_percent = lerp(previous.cpu_percent, target.cpu_percent, t);
     shown.memory_used_bytes = lerp(
@@ -486,7 +510,7 @@ mod tests {
     }
 
     #[test]
-    fn governor_downgrades_only_on_three_consecutive_overruns() {
+    fn governor_downgrades_immediately_on_three_consecutive_overruns() {
         let budget = Duration::from_millis(16);
         let over = Duration::from_millis(20);
         let under = Duration::from_millis(4);
@@ -500,6 +524,33 @@ mod tests {
         assert!(governor.note_frame(over, budget), "third consecutive");
         // The governor rearms after firing.
         assert!(!governor.note_frame(over, budget));
+    }
+
+    #[test]
+    fn governor_bounds_sustained_render_work_even_when_every_frame_is_on_time() {
+        let mut governor = FrameGovernor::new();
+        let budget = Duration::from_millis(16);
+        let cost = Duration::from_millis(8);
+        for _ in 1..DUTY_WINDOW_FRAMES {
+            assert!(!governor.note_frame(cost, budget));
+        }
+        assert!(governor.note_frame(cost, budget));
+        // A reduction starts a fresh window instead of cascading immediately.
+        assert!(!governor.note_frame(cost, budget));
+    }
+
+    #[test]
+    fn governor_allows_cheap_frames_and_isolated_expensive_frames() {
+        let mut governor = FrameGovernor::new();
+        let budget = Duration::from_millis(16);
+        for frame in 0..DUTY_WINDOW_FRAMES * 3 {
+            let cost = if frame % DUTY_WINDOW_FRAMES == 0 {
+                Duration::from_millis(24)
+            } else {
+                Duration::from_millis(1)
+            };
+            assert!(!governor.note_frame(cost, budget));
+        }
     }
 
     #[test]
@@ -599,28 +650,30 @@ mod tests {
         use pcpulse_service::models::Snapshot;
         let mut smooth = SmoothState::default();
         let mut snapshot = Snapshot::default();
-        snapshot.processes.push(pcpulse_service::models::ProcessMetric {
-            timestamp_ms: 0,
-            pid: 42,
-            parent_pid: 1,
-            name: "worker.exe".into(),
-            executable_path: String::new(),
-            cpu_percent: 10.0,
-            working_set_bytes: 1_000,
-            private_bytes: 0,
-            handle_count: 0,
-            thread_count: 0,
-            read_bytes_per_sec: 0.0,
-            write_bytes_per_sec: 0.0,
-            total_read_bytes: 0,
-            total_write_bytes: 0,
-            started_at_ms: 0,
-            session_id: 0,
-            responsive: true,
-            has_visible_window: false,
-            launch_duration_ms: None,
-            is_agent_candidate: false,
-        });
+        snapshot
+            .processes
+            .push(pcpulse_service::models::ProcessMetric {
+                timestamp_ms: 0,
+                pid: 42,
+                parent_pid: 1,
+                name: "worker.exe".into(),
+                executable_path: String::new(),
+                cpu_percent: 10.0,
+                working_set_bytes: 1_000,
+                private_bytes: 0,
+                handle_count: 0,
+                thread_count: 0,
+                read_bytes_per_sec: 0.0,
+                write_bytes_per_sec: 0.0,
+                total_read_bytes: 0,
+                total_write_bytes: 0,
+                started_at_ms: 0,
+                session_id: 0,
+                responsive: true,
+                has_visible_window: false,
+                launch_duration_ms: None,
+                is_agent_candidate: false,
+            });
         let start = Instant::now();
         smooth.begin(sample_from_snapshot(&snapshot), start);
         let before = smooth.previous_process(42).copied().unwrap();

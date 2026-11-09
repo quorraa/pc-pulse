@@ -57,23 +57,7 @@ impl EventLogCollector {
         for channel in CHANNELS {
             match query_channel(channel, lookback, agent_patterns) {
                 Ok((events, truncated, malformed)) => {
-                    self.status.malformed_events += malformed;
-                    if truncated {
-                        self.status.truncated_polls += 1;
-                    }
-                    for event in events {
-                        self.status.events_seen += 1;
-                        let identity = format!(
-                            "{}:{}:{}",
-                            event.channel, event.record_id, event.timestamp_ms
-                        );
-                        if !self.remember(identity) {
-                            self.status.duplicate_events += 1;
-                            continue;
-                        }
-                        self.status.events_stored += 1;
-                        result.push(event);
-                    }
+                    self.accept_events(events, truncated, malformed, &mut result);
                 }
                 Err(error) => errors.push(format!("{channel}: {error:#}")),
             }
@@ -87,12 +71,67 @@ impl EventLogCollector {
         result
     }
 
+    /// Recover high-signal network events crowded out of a capped general
+    /// poll. The caller invokes this only when that poll's truncation counter
+    /// advances and network monitoring is enabled. It shares parsing, bounds,
+    /// and deduplication with the ordinary collector; it is not another
+    /// standing event-log scan.
+    pub fn poll_network_signals(
+        &mut self,
+        now_ms: i64,
+        agent_patterns: &[String],
+    ) -> Vec<DiagnosticLog> {
+        self.status.last_poll_ms = Some(now_ms);
+        let mut result = Vec::new();
+        match query_channel_with_filter("System", &network_signal_query(), agent_patterns) {
+            Ok((events, truncated, malformed)) => {
+                self.accept_events(events, truncated, malformed, &mut result);
+                // A successful fallback cannot erase an error from the
+                // general poll, whose other channels still matter.
+            }
+            Err(error) => {
+                let message = format!("System network fallback: {error:#}");
+                self.status.last_error = Some(match self.status.last_error.take() {
+                    Some(previous) => format!("{previous}; {message}"),
+                    None => message,
+                });
+            }
+        }
+        result
+    }
+
     pub fn status(&self) -> DiagnosticLogStatus {
         self.status.clone()
     }
 
     pub fn note_storage_error(&mut self, message: String) {
         self.status.last_error = Some(message);
+    }
+
+    fn accept_events(
+        &mut self,
+        events: Vec<DiagnosticLog>,
+        truncated: bool,
+        malformed: u64,
+        result: &mut Vec<DiagnosticLog>,
+    ) {
+        self.status.malformed_events = self.status.malformed_events.saturating_add(malformed);
+        if truncated {
+            self.status.truncated_polls = self.status.truncated_polls.saturating_add(1);
+        }
+        for event in events {
+            self.status.events_seen = self.status.events_seen.saturating_add(1);
+            let identity = format!(
+                "{}:{}:{}",
+                event.channel, event.record_id, event.timestamp_ms
+            );
+            if !self.remember(identity) {
+                self.status.duplicate_events = self.status.duplicate_events.saturating_add(1);
+                continue;
+            }
+            self.status.events_stored = self.status.events_stored.saturating_add(1);
+            result.push(event);
+        }
     }
 
     fn remember(&mut self, identity: String) -> bool {
@@ -114,10 +153,28 @@ fn query_channel(
     lookback_ms: i64,
     agent_patterns: &[String],
 ) -> Result<(Vec<DiagnosticLog>, bool, u64)> {
-    let path = HSTRING::from(channel);
-    let query = HSTRING::from(format!(
+    let query = format!(
         "*[System[((Level=1 or Level=2 or Level=3) and TimeCreated[timediff(@SystemTime) <= {lookback_ms}])]]"
-    ));
+    );
+    query_channel_with_filter(channel, &query, agent_patterns)
+}
+
+fn network_signal_query() -> String {
+    format!(
+        "*[System[TimeCreated[timediff(@SystemTime) <= {STEADY_LOOKBACK_MS}] and \
+         ((Provider[@Name='Microsoft-Windows-DNS-Client'] and EventID=1014) or \
+         ((Provider[@Name='Tcpip'] or Provider[@Name='Microsoft-Windows-TCPIP']) and \
+         (EventID=4231 or EventID=4227)))]]"
+    )
+}
+
+fn query_channel_with_filter(
+    channel: &str,
+    filter: &str,
+    agent_patterns: &[String],
+) -> Result<(Vec<DiagnosticLog>, bool, u64)> {
+    let path = HSTRING::from(channel);
+    let query = HSTRING::from(filter);
     let handle = unsafe {
         EvtQuery(
             None,
@@ -484,22 +541,24 @@ fn classify(
     agent_patterns: &[String],
 ) -> DiagnosticCategory {
     let provider = provider.to_ascii_lowercase();
-    let searchable = format!(
-        "{} {} {}",
-        provider,
-        related_process.unwrap_or_default().to_ascii_lowercase(),
-        fields
+    if !agent_patterns.is_empty() {
+        let searchable = format!(
+            "{} {} {}",
+            provider,
+            related_process.unwrap_or_default().to_ascii_lowercase(),
+            fields
+                .iter()
+                .map(|field| field.value.to_ascii_lowercase())
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        if agent_patterns
             .iter()
-            .map(|field| field.value.to_ascii_lowercase())
-            .collect::<Vec<_>>()
-            .join(" ")
-    );
-    if agent_patterns
-        .iter()
-        .filter(|pattern| pattern.len() >= 3)
-        .any(|pattern| searchable.contains(&pattern.to_ascii_lowercase()))
-    {
-        return DiagnosticCategory::AgentRuntime;
+            .filter(|pattern| pattern.len() >= 3)
+            .any(|pattern| searchable.contains(&pattern.to_ascii_lowercase()))
+        {
+            return DiagnosticCategory::AgentRuntime;
+        }
     }
     if provider.contains("whea") {
         DiagnosticCategory::Hardware
@@ -513,17 +572,26 @@ fn classify(
         .any(|needle| provider.contains(needle))
     {
         DiagnosticCategory::Graphics
-    } else if provider.contains("resource-exhaustion") || event_id == 2004 {
+    } else if channel.eq_ignore_ascii_case("System")
+        && provider == "microsoft-windows-resource-exhaustion-detector"
+        && event_id == 2004
+    {
         DiagnosticCategory::ResourceExhaustion
-    } else if (provider.contains("application hang") || provider.contains("applicationhang"))
-        || (channel.eq_ignore_ascii_case("Application") && event_id == 1002)
+    } else if channel.eq_ignore_ascii_case("Application")
+        && matches!(provider.as_str(), "application hang" | "applicationhang")
+        && event_id == 1002
     {
         DiagnosticCategory::ApplicationHang
-    } else if provider.contains("application error")
-        || provider.contains("windows error reporting")
-        || (channel.eq_ignore_ascii_case("Application") && matches!(event_id, 1000 | 1001))
+    } else if channel.eq_ignore_ascii_case("Application")
+        && provider == "application error"
+        && event_id == 1000
     {
         DiagnosticCategory::ApplicationCrash
+    } else if channel.eq_ignore_ascii_case("Application")
+        && provider == "windows error reporting"
+        && event_id == 1001
+    {
+        classify_wer_report(fields)
     } else if provider.contains("kernel-power") || provider.contains("power") {
         DiagnosticCategory::Power
     } else if provider.contains("service control manager") {
@@ -535,6 +603,48 @@ fn classify(
         DiagnosticCategory::Network
     } else {
         DiagnosticCategory::Other
+    }
+}
+
+fn classify_wer_report(fields: &[DiagnosticField]) -> DiagnosticCategory {
+    // WER also reports hangs, memory leak checks and live kernel events.
+    // The event ID alone does not identify an application crash.
+    let Some(report_type) = fields
+        .iter()
+        .find(|field| field.name.eq_ignore_ascii_case("EventName"))
+        .map(|field| field.value.trim().to_ascii_lowercase())
+    else {
+        return DiagnosticCategory::Other;
+    };
+    if report_type.starts_with("apphang") || report_type.starts_with("moapphang") {
+        DiagnosticCategory::ApplicationHang
+    } else if matches!(
+        report_type.as_str(),
+        "appcrash" | "bex" | "bex64" | "clr20r3" | "moappcrash" | "mobex" | "mobex64"
+    ) {
+        DiagnosticCategory::ApplicationCrash
+    } else {
+        DiagnosticCategory::Other
+    }
+}
+
+/// Correct labels written by the old ID-only classifier without rewriting
+/// history. AgentRuntime retains the pattern match made when it was collected.
+pub(crate) fn normalize_legacy_category(log: &mut DiagnosticLog) {
+    if matches!(
+        log.category,
+        DiagnosticCategory::ApplicationCrash
+            | DiagnosticCategory::ApplicationHang
+            | DiagnosticCategory::ResourceExhaustion
+    ) {
+        log.category = classify(
+            &log.channel,
+            &log.provider,
+            log.event_id,
+            log.related_process.as_deref(),
+            &log.fields,
+            &[],
+        );
     }
 }
 
@@ -553,6 +663,33 @@ mod tests {
     use super::*;
 
     const EVENT_XML: &str = r#"<Event xmlns="http://schemas.microsoft.com/win/2004/08/events/event"><System><Provider Name="Application Error"/><EventID Qualifiers="0">1000</EventID><Level>2</Level><TimeCreated SystemTime="2026-08-08T12:34:56.1234567Z"/><EventRecordID>42</EventRecordID><Execution ProcessID="123" ThreadID="456"/><Channel>Application</Channel></System><EventData><Data Name="AppName">codex.exe</Data><Data Name="Path">C:\Users\xavier\work\codex.exe</Data><Data Name="ApiToken">do-not-store</Data></EventData></Event>"#;
+
+    #[test]
+    fn fallback_ingestion_shares_dedupe_and_coverage_counters() {
+        let mut collector = EventLogCollector::default();
+        let mut already_seen = parse_event_xml("System", EVENT_XML, &[]).unwrap();
+        already_seen.provider = "Tcpip".into();
+        already_seen.event_id = 4231;
+        let mut recovered = already_seen.clone();
+        recovered.record_id += 1;
+        let mut general = Vec::new();
+        collector.accept_events(vec![already_seen.clone()], true, 1, &mut general);
+        let mut fallback = Vec::new();
+        collector.accept_events(
+            vec![already_seen, recovered.clone()],
+            false,
+            2,
+            &mut fallback,
+        );
+        assert_eq!(general.len(), 1);
+        assert_eq!(fallback, vec![recovered]);
+        assert_eq!(collector.status.events_seen, 3);
+        assert_eq!(collector.status.events_stored, 2);
+        assert_eq!(collector.status.duplicate_events, 1);
+        assert_eq!(collector.status.malformed_events, 3);
+        assert_eq!(collector.status.truncated_polls, 1);
+        assert_eq!(collector.recent.len(), 2);
+    }
 
     #[test]
     fn parses_classifies_and_redacts_event_xml() {
@@ -585,7 +722,7 @@ mod tests {
         );
         assert_eq!(
             classify(
-                "Application",
+                "System",
                 "Microsoft-Windows-Resource-Exhaustion-Detector",
                 2004,
                 None,
@@ -593,6 +730,193 @@ mod tests {
                 &[]
             ),
             DiagnosticCategory::ResourceExhaustion
+        );
+    }
+
+    #[test]
+    fn crash_hang_and_exhaustion_ids_are_scoped_to_their_providers() {
+        for event_id in [1000, 1001, 1002, 2004] {
+            assert_eq!(
+                classify("Application", "vmauthd", event_id, None, &[], &[]),
+                DiagnosticCategory::Other,
+                "unrelated provider event {event_id}"
+            );
+        }
+        let cases = [
+            (
+                "Application",
+                "Application Error",
+                1000,
+                DiagnosticCategory::ApplicationCrash,
+            ),
+            (
+                "application",
+                "APPLICATION HANG",
+                1002,
+                DiagnosticCategory::ApplicationHang,
+            ),
+            (
+                "Application",
+                "ApplicationHang",
+                1002,
+                DiagnosticCategory::ApplicationHang,
+            ),
+            (
+                "System",
+                "Microsoft-Windows-Resource-Exhaustion-Detector",
+                2004,
+                DiagnosticCategory::ResourceExhaustion,
+            ),
+            (
+                "System",
+                "Application Error",
+                1000,
+                DiagnosticCategory::Other,
+            ),
+            (
+                "Application",
+                "Application Error",
+                1001,
+                DiagnosticCategory::Other,
+            ),
+            (
+                "Application",
+                "Application Hang",
+                1000,
+                DiagnosticCategory::Other,
+            ),
+            (
+                "System",
+                "Microsoft-Windows-Resource-Exhaustion-Detector",
+                1000,
+                DiagnosticCategory::Other,
+            ),
+            (
+                "Application",
+                "Custom Application Error Provider",
+                1000,
+                DiagnosticCategory::Other,
+            ),
+            (
+                "Application",
+                "Custom Application Hang Provider",
+                1002,
+                DiagnosticCategory::Other,
+            ),
+        ];
+        for (channel, provider, event_id, expected) in cases {
+            assert_eq!(
+                classify(channel, provider, event_id, None, &[], &[]),
+                expected,
+                "{channel}/{provider}/{event_id}"
+            );
+        }
+    }
+
+    #[test]
+    fn wer_report_type_distinguishes_hangs_crashes_and_other_reports() {
+        for (report_type, expected) in [
+            ("AppHangB1", DiagnosticCategory::ApplicationHang),
+            ("AppHangXProcB1", DiagnosticCategory::ApplicationHang),
+            ("AppHangTransient", DiagnosticCategory::ApplicationHang),
+            ("MoAppHang", DiagnosticCategory::ApplicationHang),
+            (" apphangb1 ", DiagnosticCategory::ApplicationHang),
+            ("APPCRASH", DiagnosticCategory::ApplicationCrash),
+            ("BEX", DiagnosticCategory::ApplicationCrash),
+            ("BEX64", DiagnosticCategory::ApplicationCrash),
+            ("CLR20r3", DiagnosticCategory::ApplicationCrash),
+            ("MoAppCrash", DiagnosticCategory::ApplicationCrash),
+            ("MoBEX", DiagnosticCategory::ApplicationCrash),
+            ("MoBEX64", DiagnosticCategory::ApplicationCrash),
+            ("LiveKernelEvent", DiagnosticCategory::Other),
+            ("BlueScreen", DiagnosticCategory::Other),
+            ("RADAR_PRE_LEAK_64", DiagnosticCategory::Other),
+            ("UnknownReport", DiagnosticCategory::Other),
+            ("", DiagnosticCategory::Other),
+        ] {
+            let fields = [DiagnosticField {
+                name: "eventname".into(),
+                value: report_type.into(),
+            }];
+            assert_eq!(
+                classify(
+                    "Application",
+                    "Windows Error Reporting",
+                    1001,
+                    None,
+                    &fields,
+                    &[]
+                ),
+                expected,
+                "WER report {report_type}"
+            );
+        }
+        let app_name_only = [DiagnosticField {
+            name: "AppName".into(),
+            value: "AppHangB1.exe".into(),
+        }];
+        assert_eq!(
+            classify(
+                "Application",
+                "Windows Error Reporting",
+                1001,
+                None,
+                &app_name_only,
+                &[]
+            ),
+            DiagnosticCategory::Other
+        );
+        let fields = [DiagnosticField {
+            name: "EventName".into(),
+            value: "APPCRASH".into(),
+        }];
+        assert_eq!(
+            classify(
+                "Application",
+                "Windows Error Reporting",
+                1000,
+                None,
+                &fields,
+                &[]
+            ),
+            DiagnosticCategory::Other
+        );
+        assert_eq!(
+            classify(
+                "System",
+                "Windows Error Reporting",
+                1001,
+                None,
+                &fields,
+                &[]
+            ),
+            DiagnosticCategory::Other
+        );
+    }
+
+    #[test]
+    fn xml_classification_preserves_vmware_events_and_wer_hang_evidence() {
+        let vmware_xml = EVENT_XML.replace("Application Error", "vmauthd");
+        let vmware = parse_event_xml("Application", &vmware_xml, &[]).unwrap();
+        assert_eq!(vmware.category, DiagnosticCategory::Other);
+        assert_eq!(vmware.record_id, 42);
+        assert_eq!(vmware.fields.len(), 3);
+        let hang_xml = EVENT_XML
+            .replace("Application Error", "Windows Error Reporting")
+            .replace(">1000</EventID>", ">1001</EventID>")
+            .replace(
+                "<EventData>",
+                "<EventData><Data Name=\"EventName\">AppHangB1</Data>",
+            );
+        let hang = parse_event_xml("Application", &hang_xml, &[]).unwrap();
+        assert_eq!(hang.category, DiagnosticCategory::ApplicationHang);
+        assert_eq!(hang.related_process.as_deref(), Some("codex.exe"));
+        assert_eq!(hang.fields[0].value, "AppHangB1");
+        assert_eq!(
+            parse_event_xml("Application", &hang_xml, &["CoDeX".into()])
+                .unwrap()
+                .category,
+            DiagnosticCategory::AgentRuntime
         );
     }
 

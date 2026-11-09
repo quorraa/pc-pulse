@@ -11,6 +11,7 @@ pub mod eventlog;
 pub mod launches;
 pub mod metrics;
 pub mod models;
+pub mod network_health;
 pub mod pipe;
 pub mod quality;
 pub mod ratings;

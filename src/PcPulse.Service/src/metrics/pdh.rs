@@ -12,6 +12,43 @@ pub(super) const ERROR_SUCCESS: u32 = 0;
 /// PDH's "call again with this buffer size" status for array counters.
 const PDH_MORE_DATA: u32 = 0x8000_07D2;
 
+/// Own the query before adding counters: a missing counter must close the
+/// query and every counter already attached to it, including during startup.
+pub(super) struct PdhQuery(pub(super) PDH_HQUERY);
+
+#[cfg(test)]
+thread_local! {
+    // Observe the real close call on this test's thread without touching a
+    // freed raw handle that another concurrent query could already reuse.
+    static QUERY_CLOSE_OBSERVER: std::cell::Cell<Option<(usize, u32)>> = const {
+        std::cell::Cell::new(None)
+    };
+}
+
+impl PdhQuery {
+    pub(super) fn open() -> Result<Self> {
+        let mut query = PDH_HQUERY::default();
+        let status = unsafe { PdhOpenQueryW(PCWSTR::null(), 0, &mut query) };
+        if status != ERROR_SUCCESS {
+            bail!("PdhOpenQueryW failed with status 0x{status:08x}");
+        }
+        Ok(Self(query))
+    }
+}
+
+impl Drop for PdhQuery {
+    fn drop(&mut self) {
+        let status = unsafe { PdhCloseQuery(self.0) };
+        #[cfg(test)]
+        QUERY_CLOSE_OBSERVER.with(|observer| {
+            if let Some((calls, _)) = observer.get() {
+                observer.set(Some((calls + 1, status)));
+            }
+        });
+        let _ = status;
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct PdhSample {
     pub cpu_percent: f64,
@@ -27,7 +64,7 @@ pub struct PdhSample {
 }
 
 pub struct PdhCollector {
-    query: PDH_HQUERY,
+    query: PdhQuery,
     cpu: PDH_HCOUNTER,
     disk_latency: PDH_HCOUNTER,
     dpc_rate: PDH_HCOUNTER,
@@ -49,13 +86,10 @@ unsafe impl Send for PdhCollector {}
 impl PdhCollector {
     pub fn new() -> Result<Self> {
         unsafe {
-            let mut query = PDH_HQUERY::default();
-            let status = PdhOpenQueryW(PCWSTR::null(), 0, &mut query);
-            if status != ERROR_SUCCESS {
-                bail!("PdhOpenQueryW failed with status 0x{status:08x}");
-            }
+            let owned_query = PdhQuery::open()?;
+            let query = owned_query.0;
             let result = Self {
-                query,
+                query: owned_query,
                 cpu: add_counter(query, r"\Processor(_Total)\% Processor Time")?,
                 disk_latency: add_counter(query, r"\PhysicalDisk(_Total)\Avg. Disk sec/Transfer")?,
                 dpc_rate: add_counter(query, r"\Processor(_Total)\DPC Rate")?,
@@ -80,7 +114,7 @@ impl PdhCollector {
 
     pub fn sample(&mut self) -> PdhSample {
         unsafe {
-            if PdhCollectQueryData(self.query) != ERROR_SUCCESS {
+            if PdhCollectQueryData(self.query.0) != ERROR_SUCCESS {
                 return PdhSample::default();
             }
             PdhSample {
@@ -115,14 +149,6 @@ impl PdhCollector {
             Some(percent) => base * percent / 100.0,
             None => base,
         })
-    }
-}
-
-impl Drop for PdhCollector {
-    fn drop(&mut self) {
-        unsafe {
-            let _ = PdhCloseQuery(self.query);
-        }
     }
 }
 
@@ -171,15 +197,15 @@ pub(super) unsafe fn formatted_wildcard_sum(counter: PDH_HCOUNTER) -> f64 {
             .iter()
             .filter(|item| item.FmtValue.CStatus == ERROR_SUCCESS)
             .filter(|item| {
-                item.szName.is_null()
-                    || !item
-                        .szName
-                        .to_string()
-                        .is_ok_and(|name| name == "_Total")
+                item.szName.is_null() || !item.szName.to_string().is_ok_and(|name| name == "_Total")
             })
             .map(|item| {
                 let value = item.FmtValue.Anonymous.doubleValue;
-                if value.is_finite() { value.max(0.0) } else { 0.0 }
+                if value.is_finite() {
+                    value.max(0.0)
+                } else {
+                    0.0
+                }
             })
             .sum()
     }
@@ -193,4 +219,31 @@ pub(super) unsafe fn formatted(counter: PDH_HCOUNTER) -> f64 {
     }
     let result = unsafe { value.Anonymous.doubleValue };
     if result.is_finite() { result } else { 0.0 }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failed_counter_setup_closes_its_query() {
+        QUERY_CLOSE_OBSERVER.with(|observer| observer.set(Some((0, ERROR_SUCCESS))));
+        let result = (|| -> Result<()> {
+            let query = PdhQuery::open().expect("local PDH query must open for cleanup test");
+            unsafe {
+                add_counter(query.0, r"\PcPulseDefinitelyMissingCounter\Missing")?;
+            }
+            Ok(())
+        })();
+        assert!(
+            result.is_err(),
+            "the deliberately invalid counter must fail"
+        );
+        let closed = QUERY_CLOSE_OBSERVER.with(|observer| observer.take());
+        assert_eq!(
+            closed,
+            Some((1, ERROR_SUCCESS)),
+            "one successful close on setup failure"
+        );
+    }
 }

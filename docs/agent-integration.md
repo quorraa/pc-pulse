@@ -2,7 +2,7 @@
 
 PC Pulse separates evidence collection, reasoning, and execution:
 
-1. The LocalSystem collector reads metrics and warning/error/critical records from the local Windows Application and System event logs. It never invokes an AI and never uses the network.
+1. The LocalSystem collector reads metrics and warning/error/critical records from the local Windows Application and System event logs. It never invokes an AI. Optional [network health checks](network-health.md), off by default, use bounded probes of fixed public destinations without uploading collected history.
 2. `getAgentContext` converts recent raw history into a bounded evidence bundle: system percentiles, sustained process rollups, current high-pressure/agent processes, repeated diagnostic-event fingerprints, alerts, collector health, privacy notes, and known limitations.
 3. The per-user client invokes the dedicated `pcpulse-systems-analyzer` through Codex in an ephemeral read-only sandbox. Chat responses must match `agents/chat-response.schema.json`; one-shot plans must match `agents/optimization-plan.schema.json`.
 4. The client validates conversation identity, evidence identity, references, action safety, and size bounds before displaying the answer. Nothing in a response is automatically executed.

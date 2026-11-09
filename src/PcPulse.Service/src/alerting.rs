@@ -3,6 +3,7 @@ use crate::{
     config::Settings,
     metrics::interrupts::VerdictState,
     models::{Alert, AlertQuality, Evidence, IncidentState, ProcessMetric, Severity, SystemMetric},
+    network_health::NetworkFinding,
     quality::{Calibration, NotifyDecision, PolicyOffsets, QualityInputs, decide, score},
     stats::{TrendPoint, TrendShape, classify_trend},
 };
@@ -30,6 +31,19 @@ pub const QUIET_PERIOD_MS: i64 = 6 * 3_600_000;
 /// The engine key -- and so the fingerprint -- of the DPC/interrupt
 /// incident. Fixed by the spec: attribution changes never split it.
 const DPC_KEY: &str = "dpcInterrupt";
+/// The bounded, machine-wide incident set supplied by the network monitor.
+/// None of these keys attributes a fault to a requesting process.
+const NETWORK_KEYS: [&str; 5] = [
+    "networkDns",
+    "networkIpv6",
+    "networkConnectivity",
+    "networkPorts",
+    "networkMonitor",
+];
+
+fn is_network_key(key: &str) -> bool {
+    NETWORK_KEYS.contains(&key)
+}
 /// The trailing window the kernel rate has to spend above the machine's
 /// learned p95 before it can carry a notification on its own evidence, with
 /// no repeatable driver-family attribution behind it.
@@ -425,6 +439,15 @@ pub struct AlertEngine {
     pool_baseline: RunningStats,
     /// The latest DPC/interrupt attribution and learned kernel-rate norms.
     interrupts: InterruptContext,
+    /// A complete latest network report, latched between the monitor's
+    /// independent observations. The fixed key set bounds this map to five.
+    network_findings: HashMap<&'static str, NetworkFinding>,
+    /// Last consumed observation per kind. A report may combine a fresh port
+    /// event with cached DNS evidence; those are not two fresh observations.
+    network_observed_at: HashMap<&'static str, i64>,
+    /// A sampler tick is not another network observation. Only a new report
+    /// may update, score, persist, or resolve these incidents.
+    network_dirty: bool,
     /// The notify-floor adjustments the user's performance ratings have
     /// earned, per (kind, demand bucket). Derived by the runtime from the
     /// rating history and pushed in via
@@ -503,6 +526,26 @@ impl AlertEngine {
             }
         }
         self.interrupts = context;
+    }
+
+    /// Replace the complete network finding set after a fresh monitor report.
+    /// Call once per report, not once per sampler tick. An empty report clears
+    /// the previous findings; no report leaves them unchanged. Repeated kinds
+    /// are coalesced; only an advancing observation timestamp contributes an
+    /// occurrence. A cached finding may still veto notifications immediately.
+    pub fn observe_network(&mut self, findings: Vec<NetworkFinding>) {
+        self.network_findings.clear();
+        for finding in findings {
+            if is_network_key(finding.kind)
+                && self
+                    .network_findings
+                    .get(finding.kind)
+                    .is_none_or(|current| current.observed_at_ms <= finding.observed_at_ms)
+            {
+                self.network_findings.insert(finding.kind, finding);
+            }
+        }
+        self.network_dirty = true;
     }
 
     /// Feed the notify-floor offsets derived from the user's ratings. The
@@ -587,6 +630,7 @@ impl AlertEngine {
         calibration: Calibration<'_>,
     ) -> Evaluation {
         let mut candidates = Vec::new();
+        let network_dirty = std::mem::take(&mut self.network_dirty);
         // The pre-evaluation state of every open incident, which the
         // notification policy compares against (severity escalation, whether
         // the incident was already notifying). Bounded by the active set,
@@ -1276,15 +1320,79 @@ impl AlertEngine {
             });
         }
 
-        let present: HashSet<String> = candidates
+        let mut network_fresh = HashSet::new();
+        let mut network_vetoed = HashSet::new();
+        if network_dirty {
+            for finding in self.network_findings.values() {
+                if self
+                    .network_observed_at
+                    .get(finding.kind)
+                    .is_some_and(|seen| finding.observed_at_ms <= *seen)
+                {
+                    // Coverage loss can withdraw permission to notify using
+                    // the same cached evidence. It must not manufacture a new
+                    // occurrence, observation time, or stronger quality score.
+                    if !finding.notify {
+                        if let Some(alert) = self.active.get_mut(finding.kind)
+                            && alert.notify
+                        {
+                            alert.notify = false;
+                            network_vetoed.insert(finding.kind);
+                        }
+                        if let Some(terms) = self.calibrations.get_mut(finding.kind) {
+                            terms.quality.notify = false;
+                        }
+                    }
+                    continue;
+                }
+                self.network_observed_at
+                    .insert(finding.kind, finding.observed_at_ms);
+                network_fresh.insert(finding.kind);
+                candidates.push(Candidate {
+                    key: finding.kind.into(),
+                    kind: finding.kind,
+                    severity: finding.severity,
+                    // The monitor owns its independent-probe/event evidence
+                    // gate. Replaying the same result over sampler ticks must
+                    // never stand in for additional observations.
+                    required_samples: 1,
+                    pid: None,
+                    process_name: None,
+                    title: finding.title.clone(),
+                    explanation: finding.explanation.clone(),
+                    evidence: finding.evidence.clone(),
+                    recommendation: finding.recommendation.clone(),
+                    entry: None,
+                    exit_ratio: EXIT_RATIO,
+                    material_change: false,
+                    quality: CandidateQuality {
+                        // This describes repeated evidence for the network
+                        // condition, not attribution to a culprit or driver.
+                        attribution_stable: finding.notify.then_some(true),
+                        corroborating_signals: finding.corroborating_signals,
+                        user_impact_signals: 0,
+                        notify: finding.notify,
+                    },
+                });
+            }
+        }
+
+        let mut present: HashSet<String> = candidates
             .iter()
             .map(|candidate| candidate.key.clone())
             .collect();
+        // Holding a finding open is distinct from observing it again. This
+        // also prevents ordinary sample ticks from resolving sparse reports.
+        present.extend(self.network_findings.keys().map(|key| (*key).to_string()));
         // Keys whose alert this evaluation created or updated. Their records
         // are cloned into `changed` after scoring, so what reaches storage
         // and the snapshot carries this sample's quality and notify decision.
         let mut touched: HashSet<String> = HashSet::new();
         for candidate in candidates {
+            let observed_at_ms = self
+                .network_findings
+                .get(candidate.key.as_str())
+                .map_or(system.timestamp_ms, |finding| finding.observed_at_ms);
             // The condition is present again, so any exit clock it had
             // started is void.
             self.below_exit_since.remove(&candidate.key);
@@ -1292,7 +1400,7 @@ impl AlertEngine {
             *streak = streak.saturating_add(1);
             let terms = self.calibrations.entry(candidate.key.clone()).or_default();
             if *streak == 1 {
-                terms.breach_since_ms = Some(system.timestamp_ms);
+                terms.breach_since_ms = Some(observed_at_ms);
             }
             terms.window_ms =
                 Some(i64::from(candidate.required_samples) * settings.sample_interval_ms as i64);
@@ -1317,9 +1425,16 @@ impl AlertEngine {
                 }
             }
             if let Some(alert) = self.active.get_mut(&candidate.key) {
-                alert.last_seen_ms = system.timestamp_ms;
+                alert.last_seen_ms = observed_at_ms;
                 alert.occurrence_count = alert.occurrence_count.saturating_add(1);
                 alert.evidence = candidate.evidence;
+                if is_network_key(&candidate.key) {
+                    // A later report can refine the diagnosis while retaining
+                    // the incident, acknowledgement, and archive state.
+                    alert.title = candidate.title;
+                    alert.explanation = candidate.explanation;
+                    alert.recommendation = candidate.recommendation;
+                }
                 // The detector's current reading of how bad this is: a
                 // banded detector can move an incident between severities
                 // while it stays the same incident, and an escalation is one
@@ -1350,8 +1465,8 @@ impl AlertEngine {
                     severity: candidate.severity,
                     first_seen_ms: reopened
                         .as_ref()
-                        .map_or(system.timestamp_ms, |prior| prior.first_seen_ms),
-                    last_seen_ms: system.timestamp_ms,
+                        .map_or(observed_at_ms, |prior| prior.first_seen_ms),
+                    last_seen_ms: observed_at_ms,
                     process_id: candidate.pid,
                     process_name: candidate.process_name,
                     title: candidate.title,
@@ -1454,6 +1569,7 @@ impl AlertEngine {
             self.guards.remove(&key);
             self.below_exit_since.remove(&key);
             self.streaks.remove(&key);
+            self.network_observed_at.remove(key.as_str());
         }
         // Streaks survive for still-open incidents: a condition held open by
         // hysteresis must not have to re-earn its sustained window when its
@@ -1489,14 +1605,27 @@ impl AlertEngine {
             i64::from(settings.sustained_samples) * settings.sample_interval_ms as i64;
         let mut changed = Vec::new();
         for (key, alert) in &mut self.active {
+            if is_network_key(key) && !network_fresh.contains(key.as_str()) {
+                // Wall time and unrelated sampler observations cannot make
+                // stale network evidence more certain or newly notifiable.
+                if network_vetoed.contains(key.as_str()) {
+                    changed.push(alert.clone());
+                }
+                continue;
+            }
             let terms = self.calibrations.get(key).copied().unwrap_or_default();
             let window_ms = terms.window_ms.unwrap_or(default_window_ms);
             let breach_since_ms = terms.breach_since_ms.unwrap_or(alert.first_seen_ms);
+            let scored_at_ms = if is_network_key(key) {
+                alert.last_seen_ms
+            } else {
+                system.timestamp_ms
+            };
             let notified = self.notify_memory.get(key).copied();
             let quality = score(&QualityInputs {
                 alert,
                 sustained_window_ms: window_ms,
-                breach_duration_ms: system.timestamp_ms - breach_since_ms,
+                breach_duration_ms: scored_at_ms - breach_since_ms,
                 baseline_maturity: calibration.baseline_maturity,
                 // Detector-supplied, carried here from the candidate that
                 // last fired for this incident. A detector with nothing to
@@ -1574,7 +1703,7 @@ impl AlertEngine {
                     key.clone(),
                     NotifyMemory {
                         generation: alert.notify_generation,
-                        at_ms: system.timestamp_ms,
+                        at_ms: scored_at_ms,
                     },
                 );
             }
@@ -2048,6 +2177,273 @@ mod tests {
     use crate::baselines::BaselineStore;
     use crate::models::{DemandBucket, DemandDetail, IncidentState, Rating, RatingVerdict};
     use crate::quality::{CONFIDENCE_FLOOR, PERSISTENCE_FLOOR, derive_offsets};
+
+    fn network_finding(kind: &'static str, observed_at_ms: i64) -> NetworkFinding {
+        NetworkFinding {
+            kind,
+            observed_at_ms,
+            severity: Severity::Warning,
+            title: "Network condition observed".into(),
+            explanation: "Independent observations confirmed the condition.".into(),
+            evidence: vec![evidence("Observations", "2")],
+            recommendation: "Inspect the affected network path.".into(),
+            corroborating_signals: 1,
+            notify: true,
+        }
+    }
+
+    fn network_tick(engine: &mut AlertEngine, timestamp_ms: i64) -> Evaluation {
+        engine.evaluate(
+            &SystemMetric {
+                timestamp_ms,
+                ..SystemMetric::default()
+            },
+            &[],
+            &Settings::default(),
+            Calibration::default(),
+        )
+    }
+
+    #[test]
+    fn network_sparse_ticks_do_not_accrue_occurrences_quality_or_writes() {
+        let mut engine = AlertEngine::default();
+        engine.observe_network(vec![network_finding("networkDns", 1_000)]);
+        let first = network_tick(&mut engine, 1_000);
+        assert_eq!(first.active.len(), 1);
+        assert_eq!(first.changed.len(), 1);
+        let original = first.active[0].clone();
+        assert_eq!(original.occurrence_count, 1);
+        assert!(
+            !original.notify,
+            "the generic persistence floor still applies"
+        );
+        for index in 1..=100 {
+            let idle = network_tick(&mut engine, 1_000 + index * 2_000);
+            assert!(
+                idle.changed.is_empty(),
+                "an idle tick must not write an alert"
+            );
+            assert_eq!(idle.active, vec![original.clone()]);
+        }
+        engine.observe_network(vec![network_finding("networkDns", 205_000)]);
+        let fresh = network_tick(&mut engine, 205_000);
+        assert_eq!(fresh.changed.len(), 1);
+        assert_eq!(fresh.active[0].id, original.id);
+        assert_eq!(fresh.active[0].occurrence_count, 2);
+        assert_eq!(fresh.active[0].last_seen_ms, 205_000);
+        assert!(fresh.active[0].notify);
+    }
+
+    #[test]
+    fn network_fresh_port_observation_does_not_recount_cached_dns() {
+        let mut engine = AlertEngine::default();
+        engine.observe_network(vec![network_finding("networkDns", 1_000)]);
+        let dns = network_tick(&mut engine, 1_000).active.remove(0);
+        for observed_at_ms in [61_000, 121_000] {
+            engine.observe_network(vec![
+                network_finding("networkDns", 1_000),
+                network_finding("networkPorts", observed_at_ms),
+            ]);
+            let report = network_tick(&mut engine, observed_at_ms);
+            assert_eq!(
+                report.active.iter().find(|a| a.kind == "networkDns"),
+                Some(&dns)
+            );
+            assert_eq!(report.changed.len(), 1);
+            assert_eq!(report.changed[0].kind, "networkPorts");
+        }
+        assert_eq!(engine.network_observed_at.len(), 2);
+    }
+
+    #[test]
+    fn network_cached_veto_withdraws_notification_without_recounting() {
+        let mut engine = AlertEngine::default();
+        for observed_at_ms in [1_000, 61_000] {
+            engine.observe_network(vec![network_finding("networkDns", observed_at_ms)]);
+            network_tick(&mut engine, observed_at_ms);
+        }
+        let original = engine.active["networkDns"].clone();
+        assert!(original.notify);
+        let mut cached = network_finding("networkDns", 61_000);
+        cached.notify = false;
+        engine.observe_network(vec![cached.clone()]);
+        let vetoed = network_tick(&mut engine, 121_000);
+        assert_eq!(vetoed.changed.len(), 1);
+        let mut expected = original.clone();
+        expected.notify = false;
+        assert_eq!(vetoed.active, vec![expected.clone()]);
+        engine.observe_network(vec![cached]);
+        assert!(network_tick(&mut engine, 181_000).changed.is_empty());
+        // Removing the veto on cached evidence cannot resurrect a toast.
+        engine.observe_network(vec![network_finding("networkDns", 61_000)]);
+        let unchanged = network_tick(&mut engine, 241_000);
+        assert!(unchanged.changed.is_empty());
+        assert_eq!(unchanged.active, vec![expected]);
+        engine.observe_network(vec![network_finding("networkDns", 301_000)]);
+        let confirmed = network_tick(&mut engine, 301_000).active.remove(0);
+        assert!(confirmed.notify);
+        assert_eq!(confirmed.occurrence_count, 3);
+        assert_eq!(confirmed.notify_generation, original.notify_generation);
+    }
+
+    #[test]
+    fn network_out_of_order_observation_cannot_replace_fresh_evidence() {
+        let mut engine = AlertEngine::default();
+        engine.observe_network(vec![network_finding("networkDns", 61_000)]);
+        let original = network_tick(&mut engine, 61_000).active.remove(0);
+        let mut stale = network_finding("networkDns", 1_000);
+        stale.title = "Old diagnosis".into();
+        engine.observe_network(vec![stale]);
+        let report = network_tick(&mut engine, 121_000);
+        assert!(report.changed.is_empty());
+        assert_eq!(report.active, vec![original]);
+        assert_eq!(engine.network_observed_at["networkDns"], 61_000);
+    }
+
+    #[test]
+    fn network_acknowledgement_and_archive_survive_fresh_reports() {
+        let mut engine = AlertEngine::default();
+        engine.observe_network(vec![network_finding("networkDns", 1_000)]);
+        let first = network_tick(&mut engine, 1_000).active.remove(0);
+        engine.acknowledge(&first.id).unwrap();
+        engine.set_archived(&first.id, true).unwrap();
+        engine.observe_network(vec![network_finding("networkDns", 61_000)]);
+        let refreshed = network_tick(&mut engine, 61_000);
+        assert_eq!(refreshed.active[0].id, first.id);
+        assert!(refreshed.active[0].acknowledged);
+        assert!(refreshed.active[0].archived);
+        assert!(refreshed.changed[0].acknowledged);
+        assert!(refreshed.changed[0].archived);
+    }
+
+    #[test]
+    fn network_fresh_report_resolves_only_absent_kinds_and_empty_clears_all() {
+        let mut engine = AlertEngine::default();
+        engine.observe_network(vec![
+            network_finding("networkDns", 1_000),
+            network_finding("networkIpv6", 1_000),
+        ]);
+        assert_eq!(network_tick(&mut engine, 1_000).active.len(), 2);
+        engine.observe_network(vec![network_finding("networkDns", 61_000)]);
+        let partial = network_tick(&mut engine, 61_000);
+        assert_eq!(partial.active.len(), 1);
+        assert_eq!(partial.active[0].kind, "networkDns");
+        let resolved = partial
+            .changed
+            .iter()
+            .find(|a| a.kind == "networkIpv6")
+            .unwrap();
+        assert_eq!(resolved.state, IncidentState::Resolved);
+        assert_eq!(resolved.resolved_at_ms, Some(61_000));
+        assert_eq!(resolved.last_seen_ms, 1_000);
+        assert_eq!(resolved.occurrence_count, 1);
+        engine.observe_network(Vec::new());
+        let empty = network_tick(&mut engine, 121_000);
+        assert!(empty.active.is_empty());
+        assert_eq!(empty.changed.len(), 1);
+        assert_eq!(empty.changed[0].state, IncidentState::Resolved);
+        assert_eq!(empty.changed[0].resolved_at_ms, Some(121_000));
+        assert!(engine.network_observed_at.is_empty());
+        assert!(network_tick(&mut engine, 123_000).changed.is_empty());
+    }
+
+    #[test]
+    fn network_refined_classification_refreshes_all_explanatory_text() {
+        let mut engine = AlertEngine::default();
+        engine.observe_network(vec![network_finding("networkDns", 1_000)]);
+        let first = network_tick(&mut engine, 1_000).active.remove(0);
+        let mut refined = network_finding("networkDns", 61_000);
+        refined.title = "Configured DNS server is not responding".into();
+        refined.explanation = "Direct server checks timed out while the control succeeded.".into();
+        refined.recommendation = "Review the configured server on the affected adapter.".into();
+        refined.evidence = vec![evidence("Independent checks", "3")];
+        refined.severity = Severity::Critical;
+        engine.observe_network(vec![refined]);
+        let current = network_tick(&mut engine, 61_000).active.remove(0);
+        assert_eq!(current.id, first.id);
+        assert_eq!(current.title, "Configured DNS server is not responding");
+        assert_eq!(
+            current.explanation,
+            "Direct server checks timed out while the control succeeded."
+        );
+        assert_eq!(
+            current.recommendation,
+            "Review the configured server on the affected adapter."
+        );
+        assert_eq!(current.evidence, vec![evidence("Independent checks", "3")]);
+        assert_eq!(current.severity, Severity::Critical);
+        assert_eq!(current.process_id, None);
+        assert_eq!(current.process_name, None);
+    }
+
+    #[test]
+    fn network_reopen_uses_existing_incident_and_notification_generation() {
+        let mut engine = AlertEngine::default();
+        engine.observe_network(vec![network_finding("networkPorts", 1_000)]);
+        network_tick(&mut engine, 1_000);
+        engine.observe_network(vec![network_finding("networkPorts", 61_000)]);
+        let first = network_tick(&mut engine, 61_000).active.remove(0);
+        assert!(first.notify);
+        engine.observe_network(Vec::new());
+        assert!(network_tick(&mut engine, 121_000).active.is_empty());
+        engine.observe_network(vec![network_finding("networkPorts", 181_000)]);
+        let reopened = network_tick(&mut engine, 181_000).active.remove(0);
+        assert_eq!(reopened.id, first.id);
+        assert_eq!(reopened.first_seen_ms, first.first_seen_ms);
+        assert_eq!(reopened.occurrence_count, 3);
+        assert_eq!(reopened.state, IncidentState::Reopened);
+        assert_eq!(reopened.notify_generation, first.notify_generation);
+        assert!(!reopened.notify, "a reopen must earn persistence again");
+        engine.observe_network(vec![network_finding("networkPorts", 241_000)]);
+        let confirmed = network_tick(&mut engine, 241_000).active.remove(0);
+        assert!(confirmed.notify);
+        assert_eq!(confirmed.notify_generation, first.notify_generation);
+    }
+
+    #[test]
+    fn network_report_is_bounded_and_deduplicates_kinds() {
+        let mut engine = AlertEngine::default();
+        engine.observe_network(vec![
+            network_finding("networkDns", 1_000),
+            network_finding("networkDns", 500),
+            network_finding("cpu", 1_000),
+            network_finding("unknownNetworkCondition", 1_000),
+        ]);
+        let report = network_tick(&mut engine, 1_000);
+        assert_eq!(engine.network_findings.len(), 1);
+        assert_eq!(report.active.len(), 1);
+        assert_eq!(report.active[0].occurrence_count, 1);
+        assert_eq!(report.active[0].last_seen_ms, 1_000);
+        assert_eq!(report.active[0].kind, "networkDns");
+    }
+
+    #[test]
+    fn network_notifications_keep_learning_and_detector_gates() {
+        let mut engine = AlertEngine::default();
+        for timestamp_ms in [1_000, 61_000] {
+            engine.observe_network(vec![network_finding("networkDns", timestamp_ms)]);
+            let evaluation = engine.evaluate(
+                &SystemMetric {
+                    timestamp_ms,
+                    ..SystemMetric::default()
+                },
+                &[],
+                &Settings::default(),
+                Calibration {
+                    learning: true,
+                    baseline_maturity: 0.0,
+                    ..Calibration::default()
+                },
+            );
+            assert!(!evaluation.active[0].notify);
+        }
+        let mut unconfirmed = network_finding("networkDns", 121_000);
+        unconfirmed.notify = false;
+        engine.observe_network(vec![unconfirmed]);
+        assert!(!network_tick(&mut engine, 121_000).active[0].notify);
+        engine.observe_network(vec![network_finding("networkDns", 181_000)]);
+        assert!(network_tick(&mut engine, 181_000).active[0].notify);
+    }
 
     fn process(timestamp_ms: i64, cpu: f64, memory_mb: u64) -> ProcessMetric {
         ProcessMetric {

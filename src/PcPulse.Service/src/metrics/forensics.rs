@@ -25,8 +25,7 @@ use windows::Win32::{
     Foundation::{CloseHandle, HMODULE},
     System::{
         Diagnostics::ToolHelp::{
-            CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First,
-            Thread32Next,
+            CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
         },
         Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree},
         ProcessStatus::{
@@ -55,7 +54,10 @@ const UNATTRIBUTED: &str = "unattributed";
 pub trait ForensicsSource {
     /// One pass over the system handle table, bucketed per requested PID as
     /// `type name -> handle count`.
-    fn handle_histograms(&mut self, pids: &HashSet<u32>) -> Result<HashMap<u32, HashMap<String, u64>>>;
+    fn handle_histograms(
+        &mut self,
+        pids: &HashSet<u32>,
+    ) -> Result<HashMap<u32, HashMap<String, u64>>>;
     /// The live thread IDs owned by `pid`.
     fn thread_ids(&mut self, pid: u32) -> Result<HashSet<u32>>;
     /// The module base name owning each thread's Win32 start address, or
@@ -90,6 +92,9 @@ pub struct ForensicsEngine<S> {
     /// Rows for findings that just resolved survive exactly one extra pass so
     /// the resolution write-back keeps its final forensic state.
     stale: HashSet<String>,
+    /// Failed initial baselines are attempts too. Without this set they look
+    /// like new findings on every sample and bypass the capture cooldown.
+    attempted: HashSet<String>,
     last_capture_ms: Option<i64>,
 }
 
@@ -101,6 +106,7 @@ impl<S: ForensicsSource> ForensicsEngine<S> {
             thread_baselines: HashMap::new(),
             latest: HashMap::new(),
             stale: HashSet::new(),
+            attempted: HashSet::new(),
             last_capture_ms: None,
         }
     }
@@ -142,6 +148,7 @@ impl<S: ForensicsSource> ForensicsEngine<S> {
         // rows for the resolution write-back.
         let is_target =
             |id: &String| handle_targets.contains_key(id) || thread_targets.contains_key(id);
+        self.attempted.retain(is_target);
         let stale = &self.stale;
         self.latest
             .retain(|id, _| is_target(id) || !stale.contains(id));
@@ -161,12 +168,10 @@ impl<S: ForensicsSource> ForensicsEngine<S> {
             .is_none_or(|last| now_ms.saturating_sub(last) >= CAPTURE_INTERVAL_MS);
         let new_handle_pids: HashSet<u32> = handle_targets
             .iter()
-            .filter(|(id, _)| !self.handle_baselines.contains_key(*id))
+            .filter(|(id, _)| !self.attempted.contains(*id))
             .map(|(_, pid)| *pid)
             .collect();
-        let has_new_threads = thread_targets
-            .keys()
-            .any(|id| !self.thread_baselines.contains_key(id));
+        let has_new_threads = thread_targets.keys().any(|id| !self.attempted.contains(id));
         if !due && new_handle_pids.is_empty() && !has_new_threads {
             return;
         }
@@ -177,6 +182,12 @@ impl<S: ForensicsSource> ForensicsEngine<S> {
             new_handle_pids
         };
         if !capture_pids.is_empty() {
+            self.attempted.extend(
+                handle_targets
+                    .iter()
+                    .filter(|(_, pid)| capture_pids.contains(*pid))
+                    .map(|(id, _)| id.clone()),
+            );
             match self.source.handle_histograms(&capture_pids) {
                 Ok(histograms) => {
                     for (id, pid) in &handle_targets {
@@ -201,6 +212,7 @@ impl<S: ForensicsSource> ForensicsEngine<S> {
                                 ],
                             );
                         } else {
+                            self.latest.remove(id);
                             self.handle_baselines.insert(
                                 id.clone(),
                                 HandleBaseline {
@@ -212,8 +224,8 @@ impl<S: ForensicsSource> ForensicsEngine<S> {
                     }
                 }
                 Err(error) => {
-                    for id in handle_targets.keys() {
-                        if self.handle_baselines.contains_key(id) {
+                    for (id, pid) in &handle_targets {
+                        if capture_pids.contains(pid) {
                             self.latest.insert(
                                 id.clone(),
                                 vec![evidence(
@@ -229,15 +241,28 @@ impl<S: ForensicsSource> ForensicsEngine<S> {
 
         for (id, pid) in &thread_targets {
             match self.thread_baselines.get(id) {
-                None => {
-                    if let Ok(tids) = self.source.thread_ids(*pid) {
-                        self.thread_baselines.insert(
-                            id.clone(),
-                            ThreadBaseline {
-                                captured_at_ms: now_ms,
-                                tids,
-                            },
-                        );
+                None if due || !self.attempted.contains(id) => {
+                    self.attempted.insert(id.clone());
+                    match self.source.thread_ids(*pid) {
+                        Ok(tids) => {
+                            self.latest.remove(id);
+                            self.thread_baselines.insert(
+                                id.clone(),
+                                ThreadBaseline {
+                                    captured_at_ms: now_ms,
+                                    tids,
+                                },
+                            );
+                        }
+                        Err(error) => {
+                            self.latest.insert(
+                                id.clone(),
+                                vec![evidence(
+                                    THREAD_MODULES_LABEL,
+                                    format!("capture degraded: {error:#}"),
+                                )],
+                            );
+                        }
                     }
                 }
                 Some(baseline) if due => {
@@ -273,7 +298,7 @@ impl<S: ForensicsSource> ForensicsEngine<S> {
                         }
                     }
                 }
-                Some(_) => {}
+                _ => {}
             }
         }
         if due {
@@ -528,7 +553,13 @@ fn query_growing(
 fn load_type_names() -> Result<(HashMap<u16, String>, &'static str)> {
     let (buffer, filled) = query_growing(
         |ptr, len, ret| unsafe {
-            NtQueryObject(std::ptr::null_mut(), OBJECT_TYPES_INFORMATION, ptr, len, ret)
+            NtQueryObject(
+                std::ptr::null_mut(),
+                OBJECT_TYPES_INFORMATION,
+                ptr,
+                len,
+                ret,
+            )
         },
         64 << 10,
         TYPE_TABLE_CAP_BYTES,
@@ -543,9 +574,8 @@ fn load_type_names() -> Result<(HashMap<u16, String>, &'static str)> {
         if offset + entry_size > filled {
             break;
         }
-        let info = unsafe {
-            std::ptr::read_unaligned(base.add(offset).cast::<ObjectTypeInformation>())
-        };
+        let info =
+            unsafe { std::ptr::read_unaligned(base.add(offset).cast::<ObjectTypeInformation>()) };
         // The handle table's type indexes start at 2 on modern Windows; the
         // probe harness asserts this alignment empirically against a real
         // Event-handle burst rather than trusting either path blindly.
@@ -558,7 +588,9 @@ fn load_type_names() -> Result<(HashMap<u16, String>, &'static str)> {
         let name_offset = (info.type_name.buffer as usize).wrapping_sub(base as usize);
         let name_bytes = usize::from(info.type_name.length);
         let name = if !info.type_name.buffer.is_null()
-            && name_offset.checked_add(name_bytes).is_some_and(|end| end <= filled)
+            && name_offset
+                .checked_add(name_bytes)
+                .is_some_and(|end| end <= filled)
         {
             let chars = unsafe {
                 std::slice::from_raw_parts(base.add(name_offset).cast::<u16>(), name_bytes / 2)
@@ -644,7 +676,11 @@ impl WindowsForensicsSource {
     /// surface as `unattributed`.
     fn module_ranges(&mut self, pid: u32) -> Vec<(usize, usize, String)> {
         let Ok(process) = (unsafe {
-            OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ, false, pid)
+            OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ,
+                false,
+                pid,
+            )
         }) else {
             return Vec::new();
         };
@@ -674,7 +710,8 @@ impl WindowsForensicsSource {
                     continue;
                 }
                 let mut name = [0_u16; 260];
-                let length = unsafe { GetModuleBaseNameW(process, Some(module), &mut name) } as usize;
+                let length =
+                    unsafe { GetModuleBaseNameW(process, Some(module), &mut name) } as usize;
                 if length == 0 {
                     continue;
                 }
@@ -694,7 +731,10 @@ impl WindowsForensicsSource {
 }
 
 impl ForensicsSource for WindowsForensicsSource {
-    fn handle_histograms(&mut self, pids: &HashSet<u32>) -> Result<HashMap<u32, HashMap<String, u64>>> {
+    fn handle_histograms(
+        &mut self,
+        pids: &HashSet<u32>,
+    ) -> Result<HashMap<u32, HashMap<String, u64>>> {
         if self.type_names.is_empty() {
             let (names, source) = load_type_names()?;
             self.type_names = names;
@@ -857,6 +897,7 @@ mod tests {
         threads: HashMap<u32, HashSet<u32>>,
         module_by_tid: HashMap<u32, String>,
         fail_histograms: bool,
+        fail_threads: bool,
     }
 
     impl ForensicsSource for StubSource {
@@ -876,6 +917,9 @@ mod tests {
 
         fn thread_ids(&mut self, pid: u32) -> Result<HashSet<u32>> {
             self.thread_calls += 1;
+            if self.fail_threads {
+                bail!("thread snapshot unavailable");
+            }
             Ok(self.threads.get(&pid).cloned().unwrap_or_default())
         }
 
@@ -918,10 +962,52 @@ mod tests {
     }
 
     #[test]
+    fn failed_initial_captures_respect_cooldown_and_can_recover() {
+        let mut engine = ForensicsEngine::new(StubSource {
+            fail_histograms: true,
+            fail_threads: true,
+            ..StubSource::default()
+        });
+        let mut alerts = [alert("h", "handleGrowth", 7), alert("t", "threadGrowth", 9)];
+        engine.observe(&alerts, 0);
+        for now_ms in (2_000..CAPTURE_INTERVAL_MS).step_by(2_000) {
+            engine.observe(&alerts, now_ms);
+        }
+        assert_eq!(
+            engine.source().histogram_calls,
+            1,
+            "failed baseline must not scan every tick"
+        );
+        assert_eq!(
+            engine.source().thread_calls,
+            1,
+            "failed baseline must not scan every tick"
+        );
+        engine.decorate(&mut alerts);
+        assert!(alerts.iter().all(|alert| {
+            alert
+                .evidence
+                .iter()
+                .any(|row| row.value.contains("capture degraded"))
+        }));
+        engine.source_mut().fail_histograms = false;
+        engine.source_mut().fail_threads = false;
+        engine.observe(&alerts, CAPTURE_INTERVAL_MS);
+        assert_eq!(engine.source().histogram_calls, 2);
+        assert_eq!(engine.source().thread_calls, 2);
+        assert_eq!(engine.debug_counts().0, 1, "handle baseline can recover");
+        assert_eq!(engine.debug_counts().1, 1, "thread baseline can recover");
+        engine.observe(&[], CAPTURE_INTERVAL_MS + 2_000);
+        assert!(
+            engine.attempted.is_empty(),
+            "resolved findings release attempt state"
+        );
+    }
+
+    #[test]
     fn handle_baseline_capture_resolve_lifecycle() {
         let mut engine = ForensicsEngine::new(StubSource::default());
-        engine.source_mut().histogram =
-            [(7, histogram(&[("Event", 100), ("File", 20)]))].into();
+        engine.source_mut().histogram = [(7, histogram(&[("Event", 100), ("File", 20)]))].into();
         let mut alerts = [alert("a", "handleGrowth", 7)];
         engine.observe(&alerts, 0);
         engine.decorate(&mut alerts);
@@ -965,8 +1051,7 @@ mod tests {
         engine.source_mut().threads = [(9, HashSet::from([1, 2]))].into();
         let mut alerts = [alert("t", "threadGrowth", 9)];
         engine.observe(&alerts, 0);
-        engine.source_mut().threads =
-            [(9, HashSet::from([1, 2, 30, 31, 32, 33, 40]))].into();
+        engine.source_mut().threads = [(9, HashSet::from([1, 2, 30, 31, 32, 33, 40]))].into();
         engine.source_mut().module_by_tid = [
             (30, "xul.dll".to_string()),
             (31, "xul.dll".to_string()),
@@ -981,7 +1066,10 @@ mod tests {
             .iter()
             .find(|e| e.label == "New-thread modules")
             .expect("thread-module evidence");
-        assert_eq!(modules.value, "xul.dll x3 · nvwgf2umx.dll x1 · unattributed x1");
+        assert_eq!(
+            modules.value,
+            "xul.dll x3 · nvwgf2umx.dll x1 · unattributed x1"
+        );
     }
 
     #[test]
@@ -1060,7 +1148,10 @@ mod tests {
             format_handle_deltas(&baseline, &current),
             "Event +1870 · Section +40 · File +12"
         );
-        assert_eq!(format_handle_deltas(&current, &current), "no net growth by type");
+        assert_eq!(
+            format_handle_deltas(&current, &current),
+            "no net growth by type"
+        );
         assert_eq!(
             format_module_counts(&[
                 "xul.dll".into(),
@@ -1224,7 +1315,8 @@ mod tests {
         for round in 2..12_i64 {
             engine.observe(&alerts, round * 10 * 60_000);
         }
-        let mut counters = windows::Win32::System::ProcessStatus::PROCESS_MEMORY_COUNTERS::default();
+        let mut counters =
+            windows::Win32::System::ProcessStatus::PROCESS_MEMORY_COUNTERS::default();
         unsafe {
             windows::Win32::System::ProcessStatus::K32GetProcessMemoryInfo(
                 GetCurrentProcess(),

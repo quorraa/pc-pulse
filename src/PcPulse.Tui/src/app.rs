@@ -16,8 +16,8 @@ use pcpulse_service::{
     launches::LaunchGroup,
     models::{
         Alert, DiagnosticLogResponse, DiagnosticLogStatus, HardwareMetrics, HistoryResponse,
-        LaunchEvent, LiveSample, OptimizationPlan, ProcessMetric, ProcessNode, Rating,
-        RatingVerdict, Severity, Snapshot, SystemMetric,
+        LaunchEvent, LiveSample, ProcessMetric, ProcessNode, Rating, RatingVerdict, Severity,
+        Snapshot, SystemMetric,
     },
     quality::{PolicyOffsets, derive_offsets},
     // The engine's own bound on how much rating history the policy is
@@ -416,6 +416,7 @@ pub enum SettingField {
     SlowLaunch,
     AgentAge,
     Notifications,
+    NetworkHealth,
     AgentPatterns,
     CaptureCommandLines,
     CommandLineRetentionHours,
@@ -439,7 +440,7 @@ impl SettingField {
     ];
 
     /// Service-validated detector settings, saved through the pipe with `s`.
-    pub const SERVICE: [Self; 22] = [
+    pub const SERVICE: [Self; 23] = [
         Self::SampleInterval,
         Self::Retention,
         Self::Sustained,
@@ -458,13 +459,14 @@ impl SettingField {
         Self::SlowLaunch,
         Self::AgentAge,
         Self::Notifications,
+        Self::NetworkHealth,
         Self::AgentPatterns,
         Self::CaptureCommandLines,
         Self::CommandLineRetentionHours,
         Self::DeleteCommandLines,
     ];
 
-    pub const ALL: [Self; 32] = [
+    pub const ALL: [Self; 33] = [
         Self::ClientTheme,
         Self::ClientEffects,
         Self::ClientRefresh,
@@ -493,6 +495,7 @@ impl SettingField {
         Self::SlowLaunch,
         Self::AgentAge,
         Self::Notifications,
+        Self::NetworkHealth,
         Self::AgentPatterns,
         Self::CaptureCommandLines,
         Self::CommandLineRetentionHours,
@@ -545,6 +548,7 @@ impl SettingField {
             Self::SlowLaunch => "Slow launch",
             Self::AgentAge => "Abandoned agent age",
             Self::Notifications => "Native notifications",
+            Self::NetworkHealth => "Network health checks",
             Self::AgentPatterns => "Agent patterns",
             Self::CaptureCommandLines => "Command-line capture",
             Self::CommandLineRetentionHours => "Cmdline retention (hours)",
@@ -704,6 +708,12 @@ impl SettingField {
                 "Whether the tray helper pops a Windows notification when a new sustained \
                  finding appears. Enter on or off."
             }
+            Self::NetworkHealth => {
+                "Checks fixed public names every five minutes for slow DNS and follows up \
+                 repeated failures with small connection tests. Runs in the service even \
+                 with this window closed; never reads browsing history or changes network \
+                 settings. Enter on or off, then save with s."
+            }
             Self::AgentPatterns => {
                 "Comma-separated name or path fragments that identify AI-agent processes, \
                  used by agent focus and abandoned-agent findings."
@@ -769,6 +779,12 @@ impl SettingField {
                 "off"
             }
             .into(),
+            Self::NetworkHealth => if settings.network_health_enabled {
+                "on"
+            } else {
+                "off"
+            }
+            .into(),
             Self::AgentPatterns => settings.agent_process_patterns.join(", "),
             Self::CaptureCommandLines => if settings.capture_command_lines {
                 "on"
@@ -803,9 +819,7 @@ impl SettingField {
             Self::Sustained => settings.sustained_samples = parse_range(input, 2, 120)?,
             Self::BaselineSigma => settings.baseline_sigma = parse_float(input, 1.0, 10.0)?,
             Self::Cpu => settings.cpu_percent = parse_float(input, 1.0, 100.0)?,
-            Self::CollectorCpu => {
-                settings.collector_cpu_percent = parse_float(input, 0.05, 10.0)?
-            }
+            Self::CollectorCpu => settings.collector_cpu_percent = parse_float(input, 0.05, 10.0)?,
             Self::MemoryGrowth => settings.memory_growth_mb = parse_float(input, 16.0, 65_536.0)?,
             Self::HandleGrowth => settings.handle_growth = parse_range(input, 10, 100_000)?,
             Self::ThreadGrowth => settings.thread_growth = parse_range(input, 5, 10_000)?,
@@ -821,6 +835,13 @@ impl SettingField {
             Self::AgentAge => settings.abandoned_agent_minutes = parse_range(input, 5, 1_440)?,
             Self::Notifications => {
                 settings.notifications_enabled = match input.trim().to_ascii_lowercase().as_str() {
+                    "on" | "true" | "yes" | "1" => true,
+                    "off" | "false" | "no" | "0" => false,
+                    _ => return Err("enter on or off".into()),
+                }
+            }
+            Self::NetworkHealth => {
+                settings.network_health_enabled = match input.trim().to_ascii_lowercase().as_str() {
                     "on" | "true" | "yes" | "1" => true,
                     "off" | "false" | "no" | "0" => false,
                     _ => return Err("enter on or off".into()),
@@ -978,7 +999,6 @@ pub enum WorkerEvent {
     History(Result<HistoryResponse, String>),
     Tree(Result<Vec<ProcessNode>, String>),
     Diagnostics(Result<DiagnosticLogResponse, String>),
-    Plans(Result<Vec<OptimizationPlan>, String>),
     CodexAuth(Result<String, String>),
     Chat(Result<ChatResponse, String>),
     Settings(Result<Settings, String>),
@@ -1106,9 +1126,6 @@ fn worker_loop(commands: Receiver<WorkerCommand>, events: Sender<WorkerEvent>) {
                         let from = Utc::now().timestamp_millis() - 24 * 3_600_000;
                         let _ = events.send(WorkerEvent::Diagnostics(
                             client.diagnostic_logs(from, 250).map_err(error_text),
-                        ));
-                        let _ = events.send(WorkerEvent::Plans(
-                            client.optimization_plans(20).map_err(error_text),
                         ));
                         let _ = events.send(WorkerEvent::CodexAuth(
                             crate::analyzer::chatgpt_subscription_status().map_err(error_text),
@@ -1338,7 +1355,10 @@ pub enum UpdateState {
     Idle,
     Available(UpdateInfo),
     Downloading(UpdateInfo),
-    Verified { info: UpdateInfo, installer: PathBuf },
+    Verified {
+        info: UpdateInfo,
+        installer: PathBuf,
+    },
     Launched(UpdateInfo),
 }
 
@@ -1378,7 +1398,6 @@ pub struct App {
     pub persisted_history: HistoryResponse,
     pub alerts: Vec<Alert>,
     pub diagnostics: DiagnosticLogResponse,
-    pub plans: Vec<OptimizationPlan>,
     pub analyzer_running: bool,
     /// Wall-clock start of the in-flight analyzer submission; see `analyzer_progress`.
     pub(crate) analyzer_started_at: Option<Instant>,
@@ -1543,7 +1562,6 @@ pub struct App {
     pending_tree_pid: Option<u32>,
     /// Most recent left click on a finding row, for double-click detection.
     alert_last_click: Option<(usize, Instant)>,
-    pub plan_action_state: ListState,
     pub setting_state: TableState,
     pub worker: Worker,
     chat_store: Option<ChatHistoryStore>,
@@ -1601,7 +1619,6 @@ impl App {
                 status: DiagnosticLogStatus::default(),
                 logs: Vec::new(),
             },
-            plans: Vec::new(),
             analyzer_running: false,
             analyzer_started_at: None,
             analyzer_last_error: None,
@@ -1666,7 +1683,6 @@ impl App {
             launch_occurrence_state: TableState::default().with_selected(0),
             pending_tree_pid: None,
             alert_last_click: None,
-            plan_action_state: ListState::default().with_selected(Some(0)),
             setting_state: TableState::default().with_selected(0),
             worker,
             chat_store,
@@ -1765,7 +1781,6 @@ impl App {
                 | WorkerEvent::History(Err(error))
                 | WorkerEvent::Tree(Err(error))
                 | WorkerEvent::Diagnostics(Err(error))
-                | WorkerEvent::Plans(Err(error))
                 | WorkerEvent::Settings(Err(error)) => self.set_error(error),
                 WorkerEvent::History(Ok(history)) => self.persisted_history = history,
                 WorkerEvent::Tree(Ok(nodes)) => {
@@ -1780,10 +1795,6 @@ impl App {
                 }
                 WorkerEvent::Diagnostics(Ok(diagnostics)) => {
                     self.diagnostics = diagnostics;
-                }
-                WorkerEvent::Plans(Ok(plans)) => {
-                    self.plans = plans;
-                    self.clamp_selection();
                 }
                 WorkerEvent::CodexAuth(Ok(status)) => {
                     self.codex_auth_status = Some(status);
@@ -2208,8 +2219,7 @@ impl App {
             UpdateState::Verified { info, installer } => match (self.installer)(&installer) {
                 Ok(()) => {
                     self.status =
-                        "Installer launched — the collector service restarts during install"
-                            .into();
+                        "Installer launched — the collector service restarts during install".into();
                     self.status_is_error = false;
                     self.update = UpdateState::Launched(info);
                 }
@@ -3500,8 +3510,8 @@ impl App {
         self.smooth.set_render_now(now);
     }
 
-    /// Record one smooth frame's cost against its budget. On the third
-    /// consecutive overrun something has to give, and the cheapest thing to
+    /// Record one smooth frame's cost against its deadline and sustained
+    /// rendering allowance. When either is exceeded, the cheapest thing to
     /// give up goes first: a *shown* video background halves its playback
     /// rate, and only once it is at its 2 fps floor — or absent, or hidden,
     /// in which case it costs nothing to draw and slowing it would relieve
@@ -3528,7 +3538,7 @@ impl App {
         let next = self.smooth.drop_tier(current);
         self.sync_live_polling();
         self.status = format!(
-            "Refresh reduced to {} — frame budget exceeded",
+            "Refresh reduced to {} — rendering workload",
             refresh_label(next)
         );
         self.status_is_error = false;
@@ -3749,8 +3759,6 @@ impl App {
             self.launch_occurrences.len(),
         );
         clamp_list(&mut self.chat_session_state, self.chat_sessions.len() + 1);
-        let action_count = self.plans.first().map_or(0, |plan| plan.actions.len());
-        clamp_list(&mut self.plan_action_state, action_count);
     }
 
     fn set_error(&mut self, error: String) {
@@ -3801,11 +3809,7 @@ impl App {
     /// for every pid in the union of the top-CPU and top-memory processes,
     /// evict pids that left the process table, and hold the tracked set to
     /// [`PROCESS_TREND_PIDS`] by dropping the stalest untracked rings.
-    pub(crate) fn record_process_trends(
-        &mut self,
-        timestamp_ms: i64,
-        processes: &[ProcessMetric],
-    ) {
+    pub(crate) fn record_process_trends(&mut self, timestamp_ms: i64, processes: &[ProcessMetric]) {
         let half = PROCESS_TREND_PIDS / 2;
         let mut by_cpu = processes
             .iter()
@@ -3853,7 +3857,11 @@ impl App {
                 .map(|(pid, trend)| {
                     (
                         *pid,
-                        trend.points.back().map(|point| point.timestamp_ms).unwrap_or(0),
+                        trend
+                            .points
+                            .back()
+                            .map(|point| point.timestamp_ms)
+                            .unwrap_or(0),
                     )
                 })
                 .collect::<Vec<_>>();
@@ -3890,8 +3898,7 @@ impl App {
                 continue;
             }
             let cpu_delta = latest.cpu_percent - reference.cpu_percent;
-            let memory_delta =
-                latest.working_set_bytes as f64 - reference.working_set_bytes as f64;
+            let memory_delta = latest.working_set_bytes as f64 - reference.working_set_bytes as f64;
             let cpu_weight = cpu_delta.abs() / MOVER_CPU_FLOOR;
             let memory_weight = memory_delta.abs() / MOVER_MEMORY_FLOOR;
             let weight = cpu_weight.max(memory_weight);
@@ -4317,12 +4324,6 @@ impl App {
             .and_then(|index| self.visible_alerts().get(index).copied())
     }
 
-    pub fn selected_plan_action(&self) -> Option<&pcpulse_service::models::PlanAction> {
-        self.plan_action_state
-            .selected()
-            .and_then(|index| self.plans.first()?.actions.get(index))
-    }
-
     fn process_count(&self) -> usize {
         self.visible_processes().len()
     }
@@ -4661,6 +4662,26 @@ mod tests {
                 .assign(&mut settings, "999")
                 .is_err()
         );
+    }
+
+    #[test]
+    fn network_health_setting_is_saved_with_service_settings() {
+        let mut settings = Settings::default();
+        let field = SettingField::NetworkHealth;
+        assert!(!field.is_client());
+        assert!(SettingField::SERVICE.contains(&field));
+        assert!(SettingField::ALL.contains(&field));
+        assert_eq!(field.value(&settings), "off");
+        field.assign(&mut settings, "on").unwrap();
+        assert!(settings.network_health_enabled);
+        assert_eq!(field.value(&settings), "on");
+        assert!(field.assign(&mut settings, "sometimes").is_err());
+        assert!(settings.network_health_enabled);
+        let encoded = serde_json::to_string(&settings).unwrap();
+        let restored: Settings = serde_json::from_str(&encoded).unwrap();
+        assert!(restored.network_health_enabled);
+        field.assign(&mut settings, "off").unwrap();
+        assert!(!settings.network_health_enabled);
     }
 
     #[test]
@@ -5564,7 +5585,10 @@ mod tests {
         // tapes, notices, counts, and motion cues all read active_alerts.
         let active = &app.snapshot.as_ref().unwrap().active_alerts;
         assert_eq!(
-            active.iter().map(|alert| alert.id.as_str()).collect::<Vec<_>>(),
+            active
+                .iter()
+                .map(|alert| alert.id.as_str())
+                .collect::<Vec<_>>(),
             vec!["finding-77"]
         );
     }
@@ -5960,7 +5984,7 @@ mod tests {
             assert!(position < SettingField::CLIENT.len(), "{field:?} unpinned");
         }
         assert_eq!(SettingField::CLIENT.len(), 10);
-        assert_eq!(SettingField::ALL.len(), 32);
+        assert_eq!(SettingField::ALL.len(), 33);
         // The quality row sits between the path and the on/off switch, so
         // the three rows that describe *the clip* read top to bottom.
         let row = |field| fields.iter().position(|other| *other == field).unwrap();
@@ -6951,7 +6975,7 @@ mod tests {
         assert_eq!(app.background.as_ref().unwrap().effective_fps(), 2);
         assert_eq!(
             app.status,
-            "Refresh reduced to 30 fps — frame budget exceeded"
+            "Refresh reduced to 30 fps — rendering workload"
         );
     }
 
@@ -6991,7 +7015,7 @@ mod tests {
         assert_eq!(app.effective_refresh_fps(), 30);
         assert_eq!(
             app.status,
-            "Refresh reduced to 30 fps — frame budget exceeded"
+            "Refresh reduced to 30 fps — rendering workload"
         );
         assert!(!app.status_is_error);
 
@@ -7549,10 +7573,7 @@ mod tests {
 
         let before_apply = Instant::now();
         events
-            .send(WorkerEvent::Live(Ok(live_sample(
-                1_800_000_001_000,
-                80.0,
-            ))))
+            .send(WorkerEvent::Live(Ok(live_sample(1_800_000_001_000, 80.0))))
             .unwrap();
         assert!(app.drain_events());
 
@@ -7576,10 +7597,7 @@ mod tests {
 
         // A duplicate delivery of the same collection is ignored.
         events
-            .send(WorkerEvent::Live(Ok(live_sample(
-                1_800_000_001_000,
-                80.0,
-            ))))
+            .send(WorkerEvent::Live(Ok(live_sample(1_800_000_001_000, 80.0))))
             .unwrap();
         app.drain_events();
         assert_eq!(app.live_tail.len(), 1);
@@ -7708,14 +7726,17 @@ mod tests {
         app.set_render_now(Instant::now() + crate::tween::TWEEN);
         assert_eq!(app.display_system(&target).cpu_percent, 20.0);
         // The poller was told to stop.
-        assert!(commands.try_iter().any(|command| matches!(
-            command,
-            WorkerCommand::ConfigureLive { fps: 0 }
-        )));
+        assert!(
+            commands
+                .try_iter()
+                .any(|command| matches!(command, WorkerCommand::ConfigureLive { fps: 0 }))
+        );
 
         // Note exactly once: a second error changes nothing user-visible.
         app.status = "Connected".into();
-        events.send(WorkerEvent::Live(Err("again (invalidRequest)".into()))).unwrap();
+        events
+            .send(WorkerEvent::Live(Err("again (invalidRequest)".into())))
+            .unwrap();
         app.drain_events();
         assert_eq!(app.status, "Connected");
         // And later live samples are refused for the session.

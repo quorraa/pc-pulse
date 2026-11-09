@@ -323,9 +323,9 @@ fn run_loop(
                 dirty = true;
             }
             if fps > 0 {
-                // Guardrail: three consecutive budget overruns cost the
-                // session either half the background's playback rate or a
-                // refresh tier, so the TUI never consumes a core silently.
+                // Guardrail: missed deadlines or sustained rendering above
+                // a quarter of the frame interval reduce the background's
+                // playback rate or the UI refresh tier.
                 if app.note_smooth_frame(frame_started.elapsed(), frame_budget) {
                     dirty = true;
                     motion.observe(&app);
@@ -475,12 +475,8 @@ mod cadence_tests {
         let t0 = Instant::now();
         let prev = t0 + BUDGET;
         // Drawn right at the deadline; "now" is a hair later.
-        let next = next_smooth_deadline(
-            Some(prev),
-            prev,
-            prev + Duration::from_micros(200),
-            BUDGET,
-        );
+        let next =
+            next_smooth_deadline(Some(prev), prev, prev + Duration::from_micros(200), BUDGET);
         assert_eq!(next, prev + BUDGET);
     }
 

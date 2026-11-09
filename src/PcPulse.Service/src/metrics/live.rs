@@ -26,9 +26,9 @@
 //! measured well under 0.01 % normalized CPU — and one extra PDH query
 //! handle set, which exists only while a subscriber is active.
 
-use super::pdh::{ERROR_SUCCESS, add_counter, formatted, formatted_wildcard_sum};
+use super::pdh::{ERROR_SUCCESS, PdhQuery, add_counter, formatted, formatted_wildcard_sum};
 use crate::models::LiveSample;
-use anyhow::{Result, bail};
+use anyhow::Result;
 use chrono::Utc;
 use std::{
     sync::{
@@ -38,12 +38,7 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-use windows::{
-    Win32::System::Performance::{
-        PDH_HCOUNTER, PDH_HQUERY, PdhCloseQuery, PdhCollectQueryData, PdhOpenQueryW,
-    },
-    core::PCWSTR,
-};
+use windows::Win32::System::Performance::{PDH_HCOUNTER, PdhCollectQueryData};
 
 /// Spacing between live collections. Must stay ≥ 100 ms: a shorter window
 /// makes PDH rate counters (CPU %, interrupts/sec, DPC rate) noisy.
@@ -52,6 +47,9 @@ pub const LIVE_INTERVAL: Duration = Duration::from_millis(125);
 /// The live loop stops — releasing its thread and PDH handles — after this
 /// long without a `live` request.
 pub const LIVE_IDLE_STOP: Duration = Duration::from_secs(10);
+
+/// Counter failures must not launch another thread/query on every client poll.
+const LIVE_RETRY_INTERVAL: Duration = Duration::from_secs(60);
 
 /// One live sampling pass; boxed so tests can substitute a scripted source.
 type Sampler = Box<dyn FnMut() -> LiveSample + Send>;
@@ -65,6 +63,7 @@ struct LiveShared {
     latest: Mutex<Option<LiveSample>>,
     last_request: Mutex<Instant>,
     running: AtomicBool,
+    retry_after: Mutex<Option<Instant>>,
 }
 
 /// Poison-tolerant lock: a panicked sampler thread must not wedge the pipe.
@@ -106,6 +105,7 @@ impl LiveEngine {
                 latest: Mutex::new(None),
                 last_request: Mutex::new(Instant::now()),
                 running: AtomicBool::new(false),
+                retry_after: Mutex::new(None),
             }),
             factory,
             interval,
@@ -118,11 +118,13 @@ impl LiveEngine {
     /// the loop has a rate-valid collection.
     pub fn request(&self) -> LiveSample {
         *locked(&self.shared.last_request) = Instant::now();
-        if self
-            .shared
-            .running
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
+        let retry_due = locked(&self.shared.retry_after).is_none_or(|when| Instant::now() >= when);
+        if retry_due
+            && self
+                .shared
+                .running
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
         {
             let shared = Arc::clone(&self.shared);
             let factory = Arc::clone(&self.factory);
@@ -133,6 +135,7 @@ impl LiveEngine {
                 .spawn(move || live_loop(&shared, &factory, interval, idle_stop));
             if let Err(error) = spawned {
                 eprintln!("live telemetry thread failed to start: {error:#}");
+                *locked(&self.shared.retry_after) = Some(Instant::now() + LIVE_RETRY_INTERVAL);
                 self.shared.running.store(false, Ordering::Release);
             }
         }
@@ -157,10 +160,12 @@ fn live_loop(
         Ok(sampler) => sampler,
         Err(error) => {
             eprintln!("live telemetry sampler unavailable: {error:#}");
+            *locked(&shared.retry_after) = Some(Instant::now() + LIVE_RETRY_INTERVAL);
             shared.running.store(false, Ordering::Release);
             return;
         }
     };
+    *locked(&shared.retry_after) = None;
     loop {
         // Sleep first: the factory primed the query, and rates need this
         // spacing before their first read is trustworthy.
@@ -180,7 +185,7 @@ fn live_loop(
 /// The dedicated live PDH query: system-level counters only, no process
 /// enumeration, opened and collected exclusively on the live thread.
 struct LivePdhCollector {
-    query: PDH_HQUERY,
+    query: PdhQuery,
     cpu: PDH_HCOUNTER,
     disk_latency: PDH_HCOUNTER,
     disk_read: PDH_HCOUNTER,
@@ -200,13 +205,10 @@ unsafe impl Send for LivePdhCollector {}
 impl LivePdhCollector {
     fn new() -> Result<Self> {
         unsafe {
-            let mut query = PDH_HQUERY::default();
-            let status = PdhOpenQueryW(PCWSTR::null(), 0, &mut query);
-            if status != ERROR_SUCCESS {
-                bail!("PdhOpenQueryW (live) failed with status 0x{status:08x}");
-            }
+            let owned_query = PdhQuery::open()?;
+            let query = owned_query.0;
             let result = Self {
-                query,
+                query: owned_query,
                 cpu: add_counter(query, r"\Processor(_Total)\% Processor Time")?,
                 disk_latency: add_counter(query, r"\PhysicalDisk(_Total)\Avg. Disk sec/Transfer")?,
                 disk_read: add_counter(query, r"\PhysicalDisk(_Total)\Disk Read Bytes/sec")?,
@@ -227,7 +229,7 @@ impl LivePdhCollector {
         let (memory_total_bytes, memory_used_bytes) =
             super::win32::physical_memory().unwrap_or((0, 0));
         unsafe {
-            if PdhCollectQueryData(self.query) != ERROR_SUCCESS {
+            if PdhCollectQueryData(self.query.0) != ERROR_SUCCESS {
                 return LiveSample::unavailable(timestamp_ms);
             }
             LiveSample {
@@ -249,17 +251,10 @@ impl LivePdhCollector {
     }
 }
 
-impl Drop for LivePdhCollector {
-    fn drop(&mut self) {
-        unsafe {
-            let _ = PdhCloseQuery(self.query);
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::bail;
     use std::sync::atomic::AtomicU32;
 
     fn scripted_engine(interval: Duration, idle_stop: Duration) -> (LiveEngine, Arc<AtomicU32>) {
@@ -345,8 +340,13 @@ mod tests {
 
     #[test]
     fn failed_sampler_startup_releases_the_gate_for_a_retry() {
+        let attempts = Arc::new(AtomicU32::new(0));
+        let count = Arc::clone(&attempts);
         let engine = LiveEngine::with_source(
-            Arc::new(|| bail!("no counters on this machine")),
+            Arc::new(move || {
+                count.fetch_add(1, Ordering::SeqCst);
+                bail!("no counters on this machine")
+            }),
             Duration::from_millis(3),
             Duration::from_millis(50),
         );
@@ -356,9 +356,20 @@ mod tests {
             wait_until(Duration::from_secs(2), || !engine.is_running()),
             "a failed factory must not leave the running latch stuck"
         );
-        // The next request may try again rather than being wedged forever.
+        for _ in 0..100 {
+            assert!(!engine.request().available);
+        }
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            1,
+            "polls must respect failure backoff"
+        );
+        // Once the cooldown expires a request may retry rather than wedging.
+        *locked(&engine.shared.retry_after) = Some(Instant::now());
         engine.request();
-        assert!(engine.is_running());
+        assert!(wait_until(Duration::from_secs(2), || attempts
+            .load(Ordering::SeqCst)
+            == 2));
     }
 
     #[test]
@@ -401,6 +412,9 @@ mod tests {
         let engine = LiveEngine::windows();
         assert_eq!(engine.interval, LIVE_INTERVAL);
         assert_eq!(engine.idle_stop, LIVE_IDLE_STOP);
-        assert!(!engine.is_running(), "constructing the engine starts nothing");
+        assert!(
+            !engine.is_running(),
+            "constructing the engine starts nothing"
+        );
     }
 }

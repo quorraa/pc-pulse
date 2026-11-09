@@ -149,10 +149,10 @@ impl Background {
     /// when already at the floor, so the caller can fall through to
     /// dropping a UI tier instead.
     pub fn downshift(&mut self) -> bool {
-        let halved = (self.effective_fps / 2).max(2);
-        if halved == self.effective_fps {
+        if self.effective_fps <= 2 {
             return false;
         }
+        let halved = (self.effective_fps / 2).max(2);
         self.effective_fps = halved;
         self.downshifted = true;
         true
@@ -199,10 +199,11 @@ impl Background {
         // Catch the tick schedule up to `now` rather than leaving
         // `last_tick` stuck in the past, which would make every future call
         // immediately "due" regardless of the configured fps.
+        // Skip missed ticks in constant time, including after days paused or
+        // asleep. Iterating through every missed frame could stall the UI.
         let interval = self.tick_interval();
-        while self.last_tick + interval <= now {
-            self.last_tick += interval;
-        }
+        let remainder = now.duration_since(self.last_tick).as_nanos() % interval.as_nanos();
+        self.last_tick = now - Duration::from_nanos(remainder as u64);
 
         let index = self.index_for(now);
         if index == self.current_index {
@@ -349,6 +350,25 @@ mod tests {
         assert!(d1 - t0 >= Duration::from_millis(99) && d1 - t0 <= Duration::from_millis(101));
         bg.advance_if_due(t0 + Duration::from_millis(100));
         assert_eq!(bg.current_pixels()[0], expected_marker(3)); // wall time drives index: frame 3, not 1
+    }
+
+    #[test]
+    fn resuming_after_days_skips_missed_ticks_and_keeps_the_schedule() {
+        let mut bg = Background::load(&test_clip(30, 30.0)).unwrap();
+        bg.set_playback_fps(10);
+        let resumed =
+            bg.started_for_test() + Duration::from_secs(7 * 86_400) + Duration::from_millis(250);
+        bg.advance_if_due(resumed);
+        assert_eq!(bg.next_deadline() - resumed, Duration::from_millis(50));
+        assert!(!bg.advance_if_due(resumed + Duration::from_millis(49)));
+    }
+
+    #[test]
+    fn downshift_never_increases_a_one_fps_preference() {
+        let mut bg = Background::load(&test_clip(30, 30.0)).unwrap();
+        bg.set_playback_fps(1);
+        assert!(!bg.downshift());
+        assert_eq!(bg.effective_fps(), 1);
     }
 
     #[test]

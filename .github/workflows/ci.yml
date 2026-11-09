@@ -15,8 +15,10 @@ jobs:
       - name: Rust tests and lint
         shell: pwsh
         run: |
-          cargo test --workspace
-          cargo clippy --workspace --all-targets -- -D warnings
+          cargo test --workspace --locked
+          if ($LASTEXITCODE) { throw 'Rust tests failed.' }
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+          if ($LASTEXITCODE) { throw 'Rust clippy failed.' }
       - uses: actions/setup-dotnet@v5
         with:
           dotnet-version: '10.0.x'
