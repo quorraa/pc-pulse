@@ -37,12 +37,42 @@ use windows::{
 
 const FILETIME_UNIX_EPOCH_100NS: u64 = 116_444_736_000_000_000;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct PreviousProcess {
     cpu_ticks: u64,
     read_bytes: u64,
     write_bytes: u64,
     started_at_ms: i64,
+    metadata: Option<ProcessMetadata>,
+}
+
+#[derive(Debug, Clone)]
+struct ProcessMetadata {
+    identity_start_time_ms: i64,
+    path: String,
+    session_id: u32,
+}
+
+impl ProcessMetadata {
+    fn from_query(
+        identity_start_time_ms: Option<i64>,
+        path: &str,
+        session_id: Option<u32>,
+    ) -> Option<Self> {
+        if path.is_empty() {
+            return None;
+        }
+        Some(Self {
+            identity_start_time_ms: identity_start_time_ms?,
+            path: path.to_owned(),
+            session_id: session_id?,
+        })
+    }
+
+    fn matches(&self, identity_start_time_ms: Option<i64>) -> bool {
+        // A reused PID or unavailable identity must never inherit old data.
+        identity_start_time_ms == Some(self.identity_start_time_ms) && !self.path.is_empty()
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -66,6 +96,14 @@ impl ProcessCollector {
         etw: &EtwSnapshot,
     ) -> Result<Vec<ProcessMetric>> {
         let windows = enumerate_windows();
+        let logical_processors =
+            std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get) as f64;
+        let agent_patterns: Vec<String> = settings
+            .agent_process_patterns
+            .iter()
+            .map(|pattern| pattern.trim().to_ascii_lowercase())
+            .filter(|pattern| !pattern.is_empty())
+            .collect();
         let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)? };
         let mut entry = PROCESSENTRY32W {
             dwSize: size_of::<PROCESSENTRY32W>() as u32,
@@ -78,7 +116,8 @@ impl ProcessCollector {
                     &entry,
                     timestamp_ms,
                     elapsed_seconds,
-                    settings,
+                    &agent_patterns,
+                    logical_processors,
                     etw,
                     &windows,
                 ) {
@@ -92,9 +131,13 @@ impl ProcessCollector {
         unsafe {
             let _ = CloseHandle(snapshot);
         }
-        let live: HashSet<u32> = result.iter().map(|process| process.pid).collect();
-        self.previous.retain(|pid, _| live.contains(pid));
-        self.ready_at.retain(|(pid, _), _| live.contains(pid));
+        let live: HashSet<(u32, i64)> = result
+            .iter()
+            .map(|process| (process.pid, process.started_at_ms))
+            .collect();
+        self.previous
+            .retain(|pid, previous| live.contains(&(*pid, previous.started_at_ms)));
+        self.ready_at.retain(|identity, _| live.contains(identity));
         Ok(result)
     }
 
@@ -104,7 +147,8 @@ impl ProcessCollector {
         entry: &PROCESSENTRY32W,
         timestamp_ms: i64,
         elapsed_seconds: f64,
-        settings: &Settings,
+        agent_patterns: &[String],
+        logical_processors: f64,
         etw: &EtwSnapshot,
         windows: &HashMap<u32, WindowState>,
     ) -> Option<ProcessMetric> {
@@ -129,6 +173,8 @@ impl ProcessCollector {
                 .copied()
                 .unwrap_or(timestamp_ms)
         };
+        // Cache metadata only when Windows verified this exact process instance.
+        let identity_start_time_ms = times_ok.then_some(started_at_ms);
         let cpu_ticks = filetime_ticks(kernel).saturating_add(filetime_ticks(user));
         let mut memory = PROCESS_MEMORY_COUNTERS_EX {
             cb: size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32,
@@ -145,24 +191,38 @@ impl ProcessCollector {
         let _ = unsafe { GetProcessIoCounters(handle, &mut io) };
         let mut handles = 0;
         let _ = unsafe { GetProcessHandleCount(handle, &mut handles) };
-        let mut path_buffer = vec![0u16; 1024];
-        let mut path_len = path_buffer.len() as u32;
-        let path = if unsafe {
-            QueryFullProcessImageNameW(
-                handle,
-                PROCESS_NAME_WIN32,
-                PWSTR(path_buffer.as_mut_ptr()),
-                &mut path_len,
-            )
-        }
-        .is_ok()
-        {
-            String::from_utf16_lossy(&path_buffer[..path_len as usize])
+        // These values are immutable for a process instance. Avoid repeated
+        // path/session syscalls for every live process on every sample.
+        let cached = self
+            .previous
+            .get(&pid)
+            .and_then(|previous| previous.metadata.as_ref())
+            .filter(|metadata| metadata.matches(identity_start_time_ms));
+        let (path, session_id) = if let Some(metadata) = cached {
+            (metadata.path.clone(), Some(metadata.session_id))
         } else {
-            String::new()
+            let mut path_buffer = [0u16; 1024];
+            let mut path_len = path_buffer.len() as u32;
+            let path = if unsafe {
+                QueryFullProcessImageNameW(
+                    handle,
+                    PROCESS_NAME_WIN32,
+                    PWSTR(path_buffer.as_mut_ptr()),
+                    &mut path_len,
+                )
+            }
+            .is_ok()
+            {
+                String::from_utf16_lossy(&path_buffer[..path_len as usize])
+            } else {
+                String::new()
+            };
+            let mut session_id = 0;
+            let session_id = unsafe { ProcessIdToSessionId(pid, &mut session_id) }
+                .ok()
+                .map(|()| session_id);
+            (path, session_id)
         };
-        let mut session_id = 0;
-        let _ = unsafe { ProcessIdToSessionId(pid, &mut session_id) };
         unsafe {
             let _ = CloseHandle(handle);
         }
@@ -172,21 +232,20 @@ impl ProcessCollector {
             read_bytes: io.ReadTransferCount,
             write_bytes: io.WriteTransferCount,
             started_at_ms,
+            metadata: ProcessMetadata::from_query(identity_start_time_ms, &path, session_id),
         };
         let previous = self
             .previous
             .insert(pid, current)
             .filter(|old| old.started_at_ms == started_at_ms);
-        let logical_processors =
-            std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get) as f64;
-        let cpu_percent = previous.map_or(0.0, |old| {
+        let cpu_percent = previous.as_ref().map_or(0.0, |old| {
             let cpu_seconds = cpu_ticks.saturating_sub(old.cpu_ticks) as f64 / 10_000_000.0;
             (cpu_seconds / elapsed_seconds / logical_processors * 100.0).clamp(0.0, 100.0)
         });
-        let read_rate = previous.map_or(0.0, |old| {
+        let read_rate = previous.as_ref().map_or(0.0, |old| {
             io.ReadTransferCount.saturating_sub(old.read_bytes) as f64 / elapsed_seconds
         });
-        let write_rate = previous.map_or(0.0, |old| {
+        let write_rate = previous.as_ref().map_or(0.0, |old| {
             io.WriteTransferCount.saturating_sub(old.write_bytes) as f64 / elapsed_seconds
         });
         let window = windows.get(&pid).copied().unwrap_or_default();
@@ -209,10 +268,9 @@ impl ProcessCollector {
             name.to_ascii_lowercase(),
             path.to_ascii_lowercase()
         );
-        let is_agent_candidate = settings.agent_process_patterns.iter().any(|pattern| {
-            let pattern = pattern.trim().to_ascii_lowercase();
-            !pattern.is_empty() && lowered.contains(&pattern)
-        });
+        let is_agent_candidate = agent_patterns
+            .iter()
+            .any(|pattern| lowered.contains(pattern));
         Some(ProcessMetric {
             timestamp_ms,
             pid,
@@ -229,7 +287,7 @@ impl ProcessCollector {
             total_read_bytes: io.ReadTransferCount,
             total_write_bytes: io.WriteTransferCount,
             started_at_ms,
-            session_id,
+            session_id: session_id.unwrap_or(0),
             responsive: !window.visible || window.responsive,
             has_visible_window: window.visible,
             launch_duration_ms,
@@ -346,6 +404,38 @@ fn wide_z_to_string(value: &[u16]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn metadata_cache_requires_verified_same_instance_and_retries_missing_paths() {
+        let mut metadata = ProcessMetadata {
+            identity_start_time_ms: 100,
+            path: r"C:\Windows\test.exe".into(),
+            session_id: 1,
+        };
+        assert!(metadata.matches(Some(100)));
+        assert!(
+            !metadata.matches(Some(101)),
+            "reused PID must be queried again"
+        );
+        assert!(
+            !metadata.matches(None),
+            "unverified identity cannot reuse metadata"
+        );
+        metadata.path.clear();
+        assert!(!metadata.matches(Some(100)), "failed paths must be retried");
+    }
+
+    #[test]
+    fn metadata_cache_retries_failed_session_lookup_but_accepts_session_zero() {
+        let path = r"C:\Windows\test.exe";
+        assert!(ProcessMetadata::from_query(Some(100), path, None).is_none());
+        let recovered = ProcessMetadata::from_query(Some(100), path, Some(0))
+            .expect("session zero is valid when the lookup succeeded");
+        assert!(recovered.matches(Some(100)));
+        assert_eq!(recovered.session_id, 0);
+        assert!(ProcessMetadata::from_query(Some(100), "", Some(0)).is_none());
+        assert!(ProcessMetadata::from_query(None, path, Some(0)).is_none());
+    }
 
     #[test]
     fn filetime_epoch_is_zero() {

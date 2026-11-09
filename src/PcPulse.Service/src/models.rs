@@ -427,6 +427,14 @@ impl HardwareInventory {
     }
 }
 
+/// Minimal in-memory feed for the tray; no process inventory or history reads.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct NotificationState {
+    pub active_alerts: Vec<Alert>,
+    pub notifications_enabled: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Snapshot {
@@ -481,6 +489,10 @@ pub struct Snapshot {
     /// reports.
     #[serde(default)]
     pub launch_capture: LaunchCaptureStatus,
+    /// Compact latest service-owned network check; no per-process network
+    /// capture or browsing history. Additive for older clients.
+    #[serde(default)]
+    pub network_health: crate::network_health::NetworkHealthStatus,
 }
 
 impl Default for Snapshot {
@@ -498,6 +510,7 @@ impl Default for Snapshot {
             demand: None,
             heavy_minutes_trailing_hour: None,
             launch_capture: LaunchCaptureStatus::default(),
+            network_health: crate::network_health::NetworkHealthStatus::default(),
         }
     }
 }
@@ -941,6 +954,7 @@ pub struct RatingOffset {
 pub enum PipeRequest {
     Ping,
     GetSnapshot,
+    GetNotificationState,
     /// Most recent high-rate system sample. Also marks live-channel
     /// liveness: the sampler starts on the first request and stops after
     /// ten seconds without one.

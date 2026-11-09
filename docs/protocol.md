@@ -16,10 +16,22 @@ Errors do not disclose stack traces:
 
 ## Commands
 
+Since 1.21, `getSnapshot` also contains an additive `networkHealth` object:
+`enabled`, `state`, `lastProbeMs`, `nextProbeMs`, `completedProbes`,
+`lastDurationMs`, `consecutiveFailures`, `topologyChanges`, `recoveredAtMs`,
+`workerStalled`, `latest`, `lastPortEventMs`, and `portSnapshot`.
+`latest` is a bounded report of fixed public probes and aggregate route state;
+it contains no IP addresses or application traffic. The status is volatile;
+findings continue to use existing retained alert history. A missing status in
+an older service defaults to disabled. `getNotificationState` remains compact
+and does not include this report. `networkHealthEnabled` in `settings` defaults
+to false and controls the service worker without requiring an open client.
+
 | Command | Additional fields | Result |
 |---|---|---|
 | `ping` | — | Protocol and service versions |
 | `getSnapshot` | — | Latest system sample, all live processes, active alerts |
+| `getNotificationState` | — | In-memory `{activeAlerts, notificationsEnabled}` for the tray; excludes process/hardware telemetry and history |
 | `live` | — | Most recent high-rate system-only sample; also marks live-channel liveness (see below) |
 | `getHistory` | `from_ms`, `to_ms`, `limit` | System and process samples; transport-safe limit is clamped to 750 |
 | `getSystemHistory` | `from_ms`, `to_ms`, `limit` | System-only history downsampled evenly across the requested window; limit is clamped to 800 |

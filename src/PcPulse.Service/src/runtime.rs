@@ -19,6 +19,7 @@ use crate::{
         OpenIncidentRef, PipeRequest, PipeResponse, ProcessMetric, ProcessNode, Rating,
         RatingVerdict, Snapshot, SystemMetric,
     },
+    network_health::NetworkMonitor,
     pipe,
     quality::{Calibration, derive_offsets},
     ratings,
@@ -102,6 +103,23 @@ impl AppState {
                 "serviceVersion": env!("CARGO_PKG_VERSION")
             })),
             PipeRequest::Live => Ok(serde_json::to_value(self.live.request())?),
+            PipeRequest::GetNotificationState => {
+                let notifications_enabled = self
+                    .settings
+                    .read()
+                    .map_err(|_| anyhow!("settings lock poisoned"))?
+                    .notifications_enabled;
+                let active_alerts = self
+                    .snapshot
+                    .read()
+                    .map_err(|_| anyhow!("snapshot lock poisoned"))?
+                    .active_alerts
+                    .clone();
+                Ok(serde_json::to_value(crate::models::NotificationState {
+                    active_alerts,
+                    notifications_enabled,
+                })?)
+            }
             PipeRequest::GetSnapshot => Ok(serde_json::to_value(
                 self.snapshot
                     .read()
@@ -749,7 +767,7 @@ fn observe_heavy_minute(
 
 /// How often the command-line retention clock runs. Command lines have their
 /// own (`commandLineRetentionHours`) window, deliberately shorter and
-/// separate from the daily prune everything else rides on.
+/// separate from the bounded general-history cleanup passes.
 const CMDLINE_PRUNE_INTERVAL: Duration = Duration::from_secs(3_600);
 /// How long the loop waits before retrying a command-line session that
 /// failed to start (typically the machine's eight system-logger slots being
@@ -920,6 +938,10 @@ fn sampling_loop(
     // timestamp comparison, and triage headers are read once per new dump.
     let mut dumps = DumpEngine::new(WindowsDumpSource);
     let mut event_logs = EventLogCollector::default();
+    // A single service-owned worker, bounded queues and five-minute healthy
+    // cadence. tick only moves small messages; all network APIs stay off this
+    // sampling thread and no client has to remain open.
+    let mut network = NetworkMonitor::default();
     let mut next_system_write = Instant::now();
     let mut next_process_write = Instant::now();
     let mut next_prune = Instant::now();
@@ -990,6 +1012,13 @@ fn sampling_loop(
             .map_or_else(crate::etw::EtwSnapshot::default, EtwCollector::snapshot);
         let (system, processes, hardware) =
             collector.collect(timestamp_ms, &settings, &etw_snapshot)?;
+        let network_update = network.tick(
+            timestamp_ms,
+            Instant::now(),
+            settings.network_health_enabled,
+            system.cpu_percent >= 85.0
+                || system.collector_cpu_percent > settings.collector_cpu_percent * 1.15,
+        );
         // Slide the trailing demand window: add this sample, then drop
         // whatever has aged out of the last ten minutes.
         recent_samples.push_back(system.clone());
@@ -1033,6 +1062,9 @@ fn sampling_loop(
                 dpc_p95: baselines.machine.dpc_rate.quantile(0.95),
                 interrupt_p95: baselines.machine.interrupt_rate.quantile(0.95),
             });
+            if let Some(findings) = network_update {
+                engine.observe_network(findings);
+            }
             let evaluation = engine.evaluate(&system, &processes, &settings, calibration);
             // Which instances must not be folded into their own name's norm
             // this sample. Read under the same lock as the evaluation that
@@ -1379,6 +1411,7 @@ fn sampling_loop(
             // Launch-capture health, with this tick's ETW loss counters
             // already merged in (see `EtwCounterTotals`).
             snapshot.launch_capture = launch_capture;
+            snapshot.network_health = network.status();
         }
         if Instant::now() >= next_system_write {
             state.storage.insert_system(&system)?;
@@ -1389,7 +1422,17 @@ fn sampling_loop(
             next_process_write = Instant::now() + Duration::from_secs(30);
         }
         if Instant::now() >= next_event_log_poll {
-            let logs = event_logs.poll(timestamp_ms, &settings.agent_process_patterns);
+            let before_truncation = event_logs.status().truncated_polls;
+            let mut logs = event_logs.poll(timestamp_ms, &settings.agent_process_patterns);
+            if settings.network_health_enabled
+                && event_logs.status().truncated_polls > before_truncation
+            {
+                // Only when a noisy log crowded out the general bounded poll.
+                logs.extend(
+                    event_logs.poll_network_signals(timestamp_ms, &settings.agent_process_patterns),
+                );
+            }
+            network.observe_logs(&logs, timestamp_ms, Instant::now());
             if let Err(error) = state.storage.insert_diagnostic_logs(&logs) {
                 let message = format!("failed to persist Windows diagnostic logs: {error:#}");
                 eprintln!("{message}");
@@ -1402,12 +1445,17 @@ fn sampling_loop(
             next_event_log_poll = Instant::now() + Duration::from_secs(30);
         }
         if Instant::now() >= next_prune {
-            state.storage.prune(&settings, timestamp_ms)?;
-            next_prune = Instant::now() + Duration::from_secs(24 * 60 * 60);
+            let retention_backlog = state.storage.prune(&settings, timestamp_ms)?;
+            // Storage limits each pass to a small batch. Frequent bounded
+            // passes keep up with ingestion without a large daily I/O burst.
+            // Catch up after a long shutdown or a reduced retention setting
+            // without blocking this tick in an unbounded cleanup loop.
+            next_prune =
+                Instant::now() + Duration::from_secs(if retention_backlog { 30 } else { 5 * 60 });
         }
         if Instant::now() >= next_cmdline_prune {
             // Command lines run on their own, much shorter clock than the
-            // daily prune everything else uses. Runs whether or not capture
+            // general-history prune. Runs whether or not capture
             // is currently on: turning the setting off must not leave
             // already-captured lines sitting past their retention.
             let cutoff_ms =
@@ -1820,6 +1868,27 @@ mod tests {
         let tree = build_process_tree(&[process(10, 0), process(11, 10), process(12, 11)]);
         assert_eq!(tree.len(), 1);
         assert_eq!(tree[0].children[0].children[0].process.pid, 12);
+    }
+
+    #[test]
+    fn tray_feed_uses_only_current_alerts_and_settings() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = test_state(&directory);
+        let alert = active_alert("handleGrowth", true, false);
+        state.snapshot.write().unwrap().active_alerts.push(alert.clone());
+        state.settings.write().unwrap().notifications_enabled = false;
+        // The tray feed must exclude the full process and hardware snapshot.
+        let request: PipeRequest = serde_json::from_str(r#"{"command":"getNotificationState"}"#).unwrap();
+        match state.handle(request) {
+            PipeResponse::Ok { data } => {
+                assert_eq!(data.as_object().unwrap().len(), 2);
+                assert!(data.get("processes").is_none());
+                let feed: crate::models::NotificationState = serde_json::from_value(data).unwrap();
+                assert!(!feed.notifications_enabled);
+                assert_eq!(feed.active_alerts, vec![alert]);
+            }
+            response => panic!("unexpected response: {response:?}"),
+        }
     }
 
     fn test_state(directory: &tempfile::TempDir) -> AppState {

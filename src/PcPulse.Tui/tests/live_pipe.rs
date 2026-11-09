@@ -39,3 +39,21 @@ fn live_against_the_installed_service_serves_or_degrades_cleanly() {
         }
     }
 }
+
+#[test]
+#[ignore = "requires the updated installed PC Pulse collector service"]
+fn notification_state_uses_a_compact_payload_without_process_telemetry() {
+    let state = PipeClient
+        .notification_state()
+        .expect("compact tray endpoint");
+    let settings = PipeClient.settings().expect("settings");
+    assert_eq!(state.notifications_enabled, settings.notifications_enabled);
+    let compact = serde_json::to_value(&state).unwrap();
+    assert!(compact.get("processes").is_none());
+    assert!(compact.get("hardware").is_none());
+    let snapshot = PipeClient.snapshot().expect("snapshot");
+    let compact_bytes = serde_json::to_vec(&state).unwrap().len();
+    let snapshot_bytes = serde_json::to_vec(&snapshot).unwrap().len();
+    println!("Tray payload: {compact_bytes} bytes; full snapshot: {snapshot_bytes} bytes");
+    assert!(compact_bytes < snapshot_bytes);
+}

@@ -1,5 +1,6 @@
 use crate::{
     config::Settings,
+    eventlog::normalize_legacy_category,
     models::{
         Alert, DiagnosticLog, Evidence, HistoryResponse, IncidentState, LaunchEvent,
         OptimizationPlan, ProcessMetric, Rating, SystemMetric,
@@ -23,6 +24,11 @@ pub const LAUNCH_RETENTION_MS: i64 = 7 * 24 * 3600 * 1000;
 /// evicting the oldest rows (by `start_time_ms`) beyond this count.
 pub const LAUNCH_ROW_CAP: usize = 100_000;
 
+/// Runtime runs retention every five minutes. At the normal 64 process rows
+/// per 30 seconds this budget exceeds incoming rows while avoiding a whole
+/// day's deletion in one collector tick (and one database lock).
+const PRUNE_BATCH_ROWS: i64 = 2_048;
+
 impl Storage {
     pub fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
@@ -30,12 +36,16 @@ impl Storage {
         }
         let connection = Connection::open(path)
             .with_context(|| format!("failed to open history database {}", path.display()))?;
+        // WAL initializes an empty database's header. Enable pointer-map pages
+        // first, otherwise incremental_vacuum silently stays disabled even for
+        // a brand-new database. Existing non-vacuum databases are left intact;
+        // rebuilding a multi-GB history file does not belong on the startup path.
         connection.execute_batch(
-            "PRAGMA journal_mode=WAL;
+            "PRAGMA auto_vacuum=INCREMENTAL;
+             PRAGMA journal_mode=WAL;
              PRAGMA synchronous=NORMAL;
              PRAGMA temp_store=MEMORY;
              PRAGMA busy_timeout=3000;
-             PRAGMA auto_vacuum=INCREMENTAL;
              CREATE TABLE IF NOT EXISTS system_samples (
                timestamp_ms INTEGER PRIMARY KEY,
                payload TEXT NOT NULL
@@ -57,6 +67,7 @@ impl Storage {
                payload TEXT NOT NULL
              ) WITHOUT ROWID;
              CREATE INDEX IF NOT EXISTS idx_alert_time ON alerts(first_seen_ms DESC);
+             CREATE INDEX IF NOT EXISTS idx_alert_last_seen ON alerts(last_seen_ms);
              CREATE TABLE IF NOT EXISTS diagnostic_logs (
                timestamp_ms INTEGER NOT NULL,
                channel TEXT NOT NULL,
@@ -67,8 +78,7 @@ impl Storage {
              ) WITHOUT ROWID;
              CREATE INDEX IF NOT EXISTS idx_diagnostic_time
                ON diagnostic_logs(timestamp_ms DESC);
-             CREATE INDEX IF NOT EXISTS idx_diagnostic_fingerprint
-               ON diagnostic_logs(fingerprint, timestamp_ms DESC);
+             DROP INDEX IF EXISTS idx_diagnostic_fingerprint;
              CREATE TABLE IF NOT EXISTS optimization_plans (
                plan_id TEXT PRIMARY KEY,
                generated_at_ms INTEGER NOT NULL,
@@ -134,17 +144,24 @@ impl Storage {
     /// `baselines::BaselineStore::to_rows`) at the given persist timestamp.
     /// Called on the baseline persist cadence and on clean shutdown.
     pub fn save_baselines(&self, rows: &[(String, String)], now_ms: i64) -> Result<()> {
-        let connection = self
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let mut connection = self
             .connection
             .lock()
             .map_err(|_| anyhow::anyhow!("database lock poisoned"))?;
-        for (scope, payload) in rows {
-            connection.execute(
+        let transaction = connection.transaction()?;
+        {
+            let mut statement = transaction.prepare_cached(
                 "INSERT INTO baselines(scope, payload, updated_ms) VALUES (?1, ?2, ?3)
                  ON CONFLICT(scope) DO UPDATE SET payload = excluded.payload, updated_ms = excluded.updated_ms",
-                params![scope, payload, now_ms],
             )?;
+            for (scope, payload) in rows {
+                statement.execute(params![scope, payload, now_ms])?;
+            }
         }
+        transaction.commit()?;
         Ok(())
     }
 
@@ -379,19 +396,26 @@ impl Storage {
             .connection
             .lock()
             .map_err(|_| anyhow::anyhow!("database lock poisoned"))?;
+        // Rank only integer keys. Ranking full JSON payloads materializes the
+        // entire requested history in SQLite's in-memory temporary tables.
+        // Fetch payloads only after the result has been reduced to its limit.
         query_json_rows::<SystemMetric>(
             &connection,
             "WITH ranked AS (
-               SELECT timestamp_ms, payload,
+               SELECT timestamp_ms,
                  ROW_NUMBER() OVER (ORDER BY timestamp_ms) AS row_number,
                  COUNT(*) OVER () AS total_count
                FROM system_samples
                WHERE timestamp_ms BETWEEN ?1 AND ?2
+             ), selected AS MATERIALIZED (
+               SELECT timestamp_ms FROM ranked
+               WHERE (row_number - 1) % MAX(1, (total_count + ?3 - 1) / ?3) = 0
+               ORDER BY timestamp_ms
+               LIMIT ?3
              )
-             SELECT payload FROM ranked
-             WHERE (row_number - 1) % MAX(1, (total_count + ?3 - 1) / ?3) = 0
-             ORDER BY timestamp_ms
-             LIMIT ?3",
+             SELECT samples.payload FROM selected
+             JOIN system_samples AS samples USING (timestamp_ms)
+             ORDER BY selected.timestamp_ms",
             params![from_ms, to_ms, limit],
         )
     }
@@ -445,12 +469,19 @@ impl Storage {
             .connection
             .lock()
             .map_err(|_| anyhow::anyhow!("database lock poisoned"))?;
-        query_json_rows::<DiagnosticLog>(
+        let mut logs = query_json_rows::<DiagnosticLog>(
             &connection,
             "SELECT payload FROM diagnostic_logs WHERE timestamp_ms>=?1
              ORDER BY timestamp_ms DESC LIMIT ?2",
             params![from_ms, i64::from(limit.clamp(1, 5_000))],
-        )
+        )?;
+        drop(connection);
+        // Only the requested, bounded history is normalized; raw evidence stays
+        // intact and old databases need no scan or write migration.
+        for log in &mut logs {
+            normalize_legacy_category(log);
+        }
+        Ok(logs)
     }
 
     pub fn save_optimization_plan(&self, plan: &OptimizationPlan) -> Result<()> {
@@ -558,32 +589,59 @@ impl Storage {
         Ok(HistoryResponse { system, processes })
     }
 
-    pub fn prune(&self, settings: &Settings, now_ms: i64) -> Result<()> {
+    /// Run one bounded retention pass. `true` means at least one table filled
+    /// its deletion budget, so expired rows may remain and runtime should
+    /// schedule another pass sooner. An exact-size final batch can cause one
+    /// harmless extra pass; no full-history count is needed to detect backlog.
+    pub fn prune(&self, settings: &Settings, now_ms: i64) -> Result<bool> {
         let cutoff = now_ms - i64::from(settings.retention_days) * 86_400_000;
-        let connection = self
+        let mut connection = self
             .connection
             .lock()
             .map_err(|_| anyhow::anyhow!("database lock poisoned"))?;
-        connection.execute(
-            "DELETE FROM system_samples WHERE timestamp_ms < ?1",
-            [cutoff],
-        )?;
-        connection.execute(
-            "DELETE FROM process_samples WHERE timestamp_ms < ?1",
-            [cutoff],
-        )?;
-        connection.execute("DELETE FROM alerts WHERE last_seen_ms < ?1", [cutoff])?;
-        connection.execute(
-            "DELETE FROM diagnostic_logs WHERE timestamp_ms < ?1",
-            [cutoff],
-        )?;
-        connection.execute(
-            "DELETE FROM optimization_plans WHERE generated_at_ms < ?1",
-            [cutoff],
-        )?;
-        prune_launch_events(&connection, now_ms)?;
+        let transaction = connection.transaction()?;
+        let mut saturated = transaction.execute(
+            "DELETE FROM system_samples WHERE timestamp_ms IN (
+               SELECT timestamp_ms FROM system_samples WHERE timestamp_ms < ?1
+               ORDER BY timestamp_ms LIMIT ?2
+             )",
+            params![cutoff, PRUNE_BATCH_ROWS],
+        )? == PRUNE_BATCH_ROWS as usize;
+        saturated |= transaction.execute(
+            "DELETE FROM process_samples WHERE (timestamp_ms, pid, started_at_ms) IN (
+               SELECT timestamp_ms, pid, started_at_ms FROM process_samples
+               WHERE timestamp_ms < ?1 ORDER BY timestamp_ms LIMIT ?2
+             )",
+            params![cutoff, PRUNE_BATCH_ROWS],
+        )? == PRUNE_BATCH_ROWS as usize;
+        saturated |= transaction.execute(
+            "DELETE FROM alerts WHERE id IN (
+               SELECT id FROM alerts WHERE last_seen_ms < ?1
+               ORDER BY last_seen_ms LIMIT ?2
+             )",
+            params![cutoff, PRUNE_BATCH_ROWS],
+        )? == PRUNE_BATCH_ROWS as usize;
+        saturated |= transaction.execute(
+            "DELETE FROM diagnostic_logs WHERE (channel, record_id, timestamp_ms) IN (
+               SELECT channel, record_id, timestamp_ms FROM diagnostic_logs
+               WHERE timestamp_ms < ?1 ORDER BY timestamp_ms LIMIT ?2
+             )",
+            // The two channels can each add 128 events per 30-second poll:
+            // reserve twice the ordinary budget so retention keeps up even
+            // when both channels continually fill their poll limits.
+            params![cutoff, PRUNE_BATCH_ROWS * 2],
+        )? == (PRUNE_BATCH_ROWS * 2) as usize;
+        saturated |= transaction.execute(
+            "DELETE FROM optimization_plans WHERE plan_id IN (
+               SELECT plan_id FROM optimization_plans WHERE generated_at_ms < ?1
+               ORDER BY generated_at_ms LIMIT ?2
+             )",
+            params![cutoff, PRUNE_BATCH_ROWS],
+        )? == PRUNE_BATCH_ROWS as usize;
+        saturated |= prune_launch_events(&transaction, now_ms)? == PRUNE_BATCH_ROWS as usize;
+        transaction.commit()?;
         connection.execute_batch("PRAGMA incremental_vacuum(256);")?;
-        Ok(())
+        Ok(saturated)
     }
 
     /// Locked wrapper over [`save_launch_events`] for the sampling loop.
@@ -714,13 +772,16 @@ pub fn load_launch_events(conn: &Connection, from_ms: i64) -> Result<Vec<LaunchE
     )
 }
 
-/// Delete launch events older than the [`LAUNCH_RETENTION_MS`] window,
-/// returning the count removed.
+/// Delete a bounded batch of launch events older than the
+/// [`LAUNCH_RETENTION_MS`] window, returning the count removed.
 pub fn prune_launch_events(conn: &Connection, now_ms: i64) -> Result<usize> {
     let cutoff = now_ms - LAUNCH_RETENTION_MS;
     Ok(conn.execute(
-        "DELETE FROM launch_events WHERE start_time_ms < ?1",
-        [cutoff],
+        "DELETE FROM launch_events WHERE (pid, start_time_ms) IN (
+           SELECT pid, start_time_ms FROM launch_events WHERE start_time_ms < ?1
+           ORDER BY start_time_ms LIMIT ?2
+         )",
+        params![cutoff, PRUNE_BATCH_ROWS],
     )?)
 }
 
@@ -795,6 +856,166 @@ fn query_json_rows<T: serde::de::DeserializeOwned>(
 mod tests {
     use super::*;
     use crate::models::{DiagnosticCategory, DiagnosticField, DiagnosticLevel};
+
+    #[test]
+    fn new_database_enables_incremental_vacuum_before_wal_initialization() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = Storage::open(&directory.path().join("history.db")).unwrap();
+        let connection = storage.connection.lock().unwrap();
+        let mode: i64 = connection
+            .query_row("PRAGMA auto_vacuum", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(mode, 2, "incremental vacuum must be enabled on new files");
+    }
+
+    #[test]
+    fn existing_database_without_vacuum_is_not_rebuilt() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("history.db");
+        {
+            let connection = Connection::open(&path).unwrap();
+            connection
+                .execute_batch(
+                    "CREATE TABLE retained(value TEXT); INSERT INTO retained VALUES ('evidence');",
+                )
+                .unwrap();
+        }
+        let storage = Storage::open(&path).unwrap();
+        let connection = storage.connection.lock().unwrap();
+        let mode: i64 = connection
+            .query_row("PRAGMA auto_vacuum", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(mode, 0, "opening old history must not run a full VACUUM");
+        let value: String = connection
+            .query_row("SELECT value FROM retained", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(value, "evidence");
+    }
+
+    #[test]
+    fn baseline_batch_rolls_back_if_a_later_scope_fails() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = Storage::open(&directory.path().join("history.db")).unwrap();
+        storage
+            .save_baselines(&[("machine".into(), "old".into())], 1)
+            .unwrap();
+        storage
+            .connection
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER fail_baseline BEFORE INSERT ON baselines
+                WHEN NEW.scope = 'broken' BEGIN SELECT RAISE(ABORT, 'test failure'); END;",
+            )
+            .unwrap();
+        assert!(
+            storage
+                .save_baselines(
+                    &[
+                        ("machine".into(), "new".into()),
+                        ("broken".into(), "bad".into())
+                    ],
+                    2,
+                )
+                .is_err()
+        );
+        assert_eq!(
+            storage.load_baselines().unwrap(),
+            vec![("machine".into(), "old".into())]
+        );
+    }
+
+    #[test]
+    fn retention_runs_in_bounded_batches_and_keeps_cutoff_rows() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = Storage::open(&directory.path().join("history.db")).unwrap();
+        let now_ms = 1_000_000_000_000_i64;
+        let settings = Settings::default();
+        let cutoff = now_ms - i64::from(settings.retention_days) * 86_400_000;
+        {
+            let mut connection = storage.connection.lock().unwrap();
+            let transaction = connection.transaction().unwrap();
+            for index in 0..PRUNE_BATCH_ROWS + 2 {
+                transaction
+                    .execute(
+                        "INSERT INTO process_samples(timestamp_ms, pid, started_at_ms, payload)
+                     VALUES (?1, ?2, 0, '{}')",
+                        params![cutoff - 1, index],
+                    )
+                    .unwrap();
+            }
+            transaction
+                .execute(
+                    "INSERT INTO process_samples(timestamp_ms, pid, started_at_ms, payload)
+                 VALUES (?1, 0, 0, '{}')",
+                    [cutoff],
+                )
+                .unwrap();
+            transaction.commit().unwrap();
+        }
+        assert!(storage.prune(&settings, now_ms).unwrap());
+        let count = || {
+            storage
+                .connection
+                .lock()
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM process_samples", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap()
+        };
+        assert_eq!(count(), 3, "one pass must not delete more than its budget");
+        assert!(!storage.prune(&settings, now_ms).unwrap());
+        assert_eq!(count(), 1);
+        let remaining: i64 = storage
+            .connection
+            .lock()
+            .unwrap()
+            .query_row("SELECT timestamp_ms FROM process_samples", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(remaining, cutoff, "retention cutoff is exclusive");
+    }
+
+    #[test]
+    fn auxiliary_retention_backlogs_also_request_another_pass() {
+        for (table, budget, insert) in [
+            (
+                "diagnostic_logs",
+                PRUNE_BATCH_ROWS * 2,
+                "INSERT INTO diagnostic_logs(timestamp_ms, channel, record_id, fingerprint, payload)
+                 SELECT 0, 'System', n, '', '{}' FROM numbers",
+            ),
+            (
+                "launch_events",
+                PRUNE_BATCH_ROWS,
+                "INSERT INTO launch_events(pid, start_time_ms, payload)
+                 SELECT n, 0, '{}' FROM numbers",
+            ),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let storage = Storage::open(&directory.path().join("history.db")).unwrap();
+            storage.connection.lock().unwrap().execute(
+                &format!(
+                    "WITH RECURSIVE numbers(n) AS (
+                       SELECT 0 UNION ALL SELECT n + 1 FROM numbers WHERE n < ?1
+                     ) {insert}"
+                ),
+                [budget],
+            ).unwrap();
+            let now_ms = 1_000_000_000_000;
+            assert!(
+                storage.prune(&Settings::default(), now_ms).unwrap(),
+                "{table} alone must signal its remaining backlog"
+            );
+            let remaining: i64 = storage.connection.lock().unwrap().query_row(
+                &format!("SELECT COUNT(*) FROM {table}"), [], |row| row.get(0),
+            ).unwrap();
+            assert_eq!(remaining, 1, "{table} must respect its own budget");
+            assert!(!storage.prune(&Settings::default(), now_ms).unwrap());
+        }
+    }
 
     #[test]
     fn persists_and_queries_system_history() {
@@ -1010,6 +1231,101 @@ mod tests {
         let logs = storage.diagnostic_logs(0, 10).unwrap();
         assert_eq!(logs.len(), 2);
         assert_eq!(logs[0].timestamp_ms, 200);
+    }
+
+    #[test]
+    fn diagnostic_history_repairs_legacy_labels_without_rewriting_evidence() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = Storage::open(&directory.path().join("history.db")).unwrap();
+        use DiagnosticCategory::{
+            AgentRuntime, ApplicationCrash, ApplicationHang, Other, ResourceExhaustion,
+        };
+        let cases = [
+            ("Application", "vmauthd", 1000, ApplicationCrash, Other, ""),
+            ("Application", "unrelated", 1002, ApplicationHang, Other, ""),
+            ("System", "unrelated", 2004, ResourceExhaustion, Other, ""),
+            (
+                "Application",
+                "Windows Error Reporting",
+                1001,
+                ApplicationCrash,
+                ApplicationHang,
+                "AppHangB1",
+            ),
+            (
+                "Application",
+                "Application Error",
+                1000,
+                ApplicationCrash,
+                ApplicationCrash,
+                "",
+            ),
+            (
+                "Application",
+                "vmauthd",
+                1000,
+                AgentRuntime,
+                AgentRuntime,
+                "",
+            ),
+            (
+                "System",
+                "Microsoft-Windows-Resource-Exhaustion-Detector",
+                2004,
+                ResourceExhaustion,
+                ResourceExhaustion,
+                "",
+            ),
+            (
+                "Application",
+                "Windows Error Reporting",
+                1001,
+                ApplicationCrash,
+                Other,
+                "LiveKernelEvent",
+            ),
+        ];
+        let mut expected = Vec::new();
+        let mut original_payloads = Vec::new();
+        for (index, (channel, provider, event_id, old_category, category, report_type)) in
+            cases.into_iter().enumerate()
+        {
+            let mut log = DiagnosticLog {
+                timestamp_ms: (index as i64 + 1) * 100,
+                channel: channel.into(),
+                provider: provider.into(),
+                event_id,
+                record_id: index as u64 + 1,
+                level: DiagnosticLevel::Error,
+                category: old_category,
+                process_id: Some(123),
+                thread_id: Some(456),
+                related_process: Some("example.exe".into()),
+                fingerprint: format!("{provider}:{event_id}:example.exe"),
+                fields: vec![DiagnosticField {
+                    name: "EventName".into(),
+                    value: report_type.into(),
+                }],
+            };
+            original_payloads.push(serde_json::to_string(&log).unwrap());
+            storage.insert_diagnostic_logs(&[log.clone()]).unwrap();
+            log.category = category;
+            expected.push(log);
+        }
+        expected.reverse();
+        assert_eq!(storage.diagnostic_logs(0, 100).unwrap(), expected);
+        assert_eq!(storage.diagnostic_logs(0, 3).unwrap(), expected[..3]);
+        assert_eq!(storage.diagnostic_logs(700, 100).unwrap(), expected[..2]);
+        let connection = storage.connection.lock().unwrap();
+        let mut statement = connection
+            .prepare("SELECT payload FROM diagnostic_logs ORDER BY timestamp_ms")
+            .unwrap();
+        let raw_payloads = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(raw_payloads, original_payloads);
     }
 
     fn sample_rating(id: &str, at_ms: i64) -> crate::models::Rating {

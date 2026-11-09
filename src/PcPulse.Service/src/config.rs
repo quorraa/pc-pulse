@@ -22,6 +22,10 @@ pub struct Settings {
     pub slow_launch_ms: u64,
     pub abandoned_agent_minutes: u32,
     pub notifications_enabled: bool,
+    /// Active public network probes are opt-in. All work runs in the service;
+    /// old settings files and older clients cannot silently enable traffic.
+    #[serde(default)]
+    pub network_health_enabled: bool,
     /// Absolute CPU budget for the collector's own self-monitoring, as a
     /// normalized percentage. Serde-defaulted so pre-1.15 settings files
     /// load unchanged.
@@ -70,6 +74,7 @@ impl Default for Settings {
             slow_launch_ms: 8_000,
             abandoned_agent_minutes: 30,
             notifications_enabled: true,
+            network_health_enabled: false,
             collector_cpu_percent: default_collector_cpu_percent(),
             capture_command_lines: false,
             command_line_retention_hours: default_command_line_retention_hours(),

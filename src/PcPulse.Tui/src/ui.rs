@@ -9,8 +9,8 @@ use crate::{
 };
 use pcpulse_service::launches::LaunchGroup;
 use pcpulse_service::models::{
-    Alert, DemandBucket, HardwareMetrics, IncidentState, LaunchCaptureStatus, OptimizationPlan,
-    PlanAction, PlanRisk, ProcessMetric, RatingVerdict, Severity, SystemMetric, WindowState,
+    Alert, DemandBucket, HardwareMetrics, IncidentState, LaunchCaptureStatus, PlanRisk,
+    ProcessMetric, RatingVerdict, Severity, SystemMetric, WindowState,
 };
 use ratatui::{
     Frame,
@@ -1367,7 +1367,11 @@ fn render_rail_keys(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let lines = Page::ALL
         .iter()
         .map(|page| {
-            let label = format!(" [{}] {:<width$}", page_key_label(*page), route_short(*page));
+            let label = format!(
+                " [{}] {:<width$}",
+                page_key_label(*page),
+                route_short(*page)
+            );
             if *page == app.page {
                 Line::styled(
                     label,
@@ -1593,12 +1597,18 @@ fn rail_status_line(app: &App) -> Line<'static> {
 fn update_badge_text(app: &App, compact: bool) -> Option<String> {
     let (version, suffix) = match &app.update {
         UpdateState::Idle => return None,
-        UpdateState::Available(info) => {
-            (&info.version, if compact { " · u" } else { " available · u" })
-        }
-        UpdateState::Downloading(info) => {
-            (&info.version, if compact { " ↓…" } else { " downloading…" })
-        }
+        UpdateState::Available(info) => (
+            &info.version,
+            if compact { " · u" } else { " available · u" },
+        ),
+        UpdateState::Downloading(info) => (
+            &info.version,
+            if compact {
+                " ↓…"
+            } else {
+                " downloading…"
+            },
+        ),
         UpdateState::Verified { info, .. } => (
             &info.version,
             if compact {
@@ -1607,9 +1617,7 @@ fn update_badge_text(app: &App, compact: bool) -> Option<String> {
                 " verified — press u to install"
             },
         ),
-        UpdateState::Launched(info) => {
-            (&info.version, if compact { " …" } else { " installing" })
-        }
+        UpdateState::Launched(info) => (&info.version, if compact { " …" } else { " installing" }),
     };
     Some(format!("⇡ v{version}{suffix}"))
 }
@@ -2577,7 +2585,11 @@ fn market_delta_color(resource: &MarketResource, delta: f64) -> Option<Color> {
         return None;
     }
     let pressure = (delta > 0.0) == resource.rising_is_pressure;
-    Some(if pressure { palette().warn } else { palette().ok })
+    Some(if pressure {
+        palette().warn
+    } else {
+        palette().ok
+    })
 }
 
 /// Dot bits of one braille cell, by (dot row 0..4 top→bottom, column 0..2).
@@ -2708,10 +2720,7 @@ fn render_market(frame: &mut Frame<'_>, app: &App, area: Rect) {
                 format!("{:<9}", resource.label),
                 Style::default().fg(palette().muted).bold(),
             ),
-            Span::styled(
-                trace[band_rows - 1].clone(),
-                Style::default().fg(accent),
-            ),
+            Span::styled(trace[band_rows - 1].clone(), Style::default().fg(accent)),
             Span::styled(
                 format!("  {:>11}", market_format(row, market_value(row, &shown))),
                 Style::default().fg(palette().text).bold(),
@@ -2748,7 +2757,9 @@ const MOVER_RESERVED: usize = 19 + 12 + 6 + 10;
 
 /// The braille trace width for a mover-format row inside `width` cells.
 fn mover_spark_width(width: u16) -> usize {
-    usize::from(width).saturating_sub(MOVER_RESERVED).clamp(4, 60)
+    usize::from(width)
+        .saturating_sub(MOVER_RESERVED)
+        .clamp(4, 60)
 }
 
 /// The dominant signal's series out of a pid's trend ring: CPU percent for
@@ -2803,7 +2814,10 @@ fn mover_line(app: &App, mover: &crate::app::Mover, spark_width: usize) -> Line<
         Span::styled(trace, Style::default().fg(color)),
         Span::styled(format!("{delta:>12}"), Style::default().fg(color).bold()),
         Span::styled(format!("  {bar:<4}"), Style::default().fg(color)),
-        Span::styled(format!(" {current:>9}"), Style::default().fg(palette().muted)),
+        Span::styled(
+            format!(" {current:>9}"),
+            Style::default().fg(palette().muted),
+        ),
     ])
 }
 
@@ -2851,7 +2865,12 @@ fn watchlist(app: &App, exclude: &std::collections::HashSet<u32>) -> Vec<(u32, S
             )
         })
         .collect::<Vec<_>>();
-    entries.sort_by(|left, right| right.2.total_cmp(&left.2).then_with(|| left.1.cmp(&right.1)));
+    entries.sort_by(|left, right| {
+        right
+            .2
+            .total_cmp(&left.2)
+            .then_with(|| left.1.cmp(&right.1))
+    });
     entries
         .into_iter()
         .map(|(pid, name, _)| (pid, name))
@@ -4607,9 +4626,7 @@ fn render_alerts(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                 AlertView::Current => {
                     " ⚑ FINDING ARCHIVE · click headers to sort · a acknowledge · z archive "
                 }
-                AlertView::Archived => {
-                    " ⚑ FINDING ARCHIVE · z recover · v back · archived "
-                }
+                AlertView::Archived => " ⚑ FINDING ARCHIVE · z recover · v back · archived ",
             },
             palette().warn,
         ))
@@ -5522,131 +5539,6 @@ fn wrap_words(text: &str, width: usize) -> Vec<String> {
     rows
 }
 
-#[allow(dead_code)]
-fn render_analyzer_legacy(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
-    let rows = Layout::vertical([Constraint::Length(6), Constraint::Min(12)]).split(area);
-    render_analyzer_status(frame, app, inset(rows[0]));
-    let columns =
-        Layout::horizontal([Constraint::Percentage(43), Constraint::Percentage(57)]).split(rows[1]);
-    let Some(plan) = app.plans.first().cloned() else {
-        render_diagnostic_feed(frame, app, inset(columns[0]));
-        let lines = vec![
-            Line::styled(
-                "NO SYNTHESIS HAS BEEN COMMITTED",
-                Style::default().fg(palette().alt).bold(),
-            ),
-            Line::raw(""),
-            Line::raw(
-                "Press a to launch the dedicated PC Pulse systems analyzer. It receives a bounded, redacted evidence bundle and runs as the interactive user—not as LocalSystem.",
-            ),
-            Line::raw(""),
-            Line::styled("SAFETY ENVELOPE", Style::default().fg(palette().ok).bold()),
-            Line::raw("  • Codex runs in a read-only sandbox"),
-            Line::raw("  • no recommendation is executed"),
-            Line::raw("  • direct termination commands are rejected"),
-            Line::raw("  • mutations require confirmation + rollback"),
-            Line::raw("  • every claim must cite collected evidence"),
-            Line::raw(""),
-            Line::styled(
-                "CLI  PcPulse.exe analyze 1",
-                Style::default().fg(palette().info).bold(),
-            ),
-            Line::styled(
-                "API  PcPulse.exe agent-context 1",
-                Style::default().fg(palette().muted),
-            ),
-        ];
-        frame.render_widget(
-            Paragraph::new(lines)
-                .wrap(Wrap { trim: false })
-                .style(Style::default().fg(palette().text).bg(palette().surface))
-                .block(accent_panel(" ◈ AGENT CONTRACT ", palette().alt)),
-            inset(columns[1]),
-        );
-        return;
-    };
-    render_plan_index(frame, app, &plan, inset(columns[0]));
-    let selected = app
-        .plan_action_state
-        .selected()
-        .and_then(|index| plan.actions.get(index));
-    render_plan_action(frame, &plan, selected, inset(columns[1]));
-}
-
-fn render_analyzer_status(frame: &mut Frame<'_>, app: &App, area: Rect) {
-    let status = &app.diagnostics.status;
-    let ingest_color = if status.last_error.is_some() {
-        palette().crit
-    } else if status.last_success_ms.is_some() {
-        palette().ok
-    } else {
-        palette().warn
-    };
-    let last_poll = status
-        .last_success_ms
-        .map(format::timestamp)
-        .unwrap_or_else(|| "awaiting first poll".into());
-    let latest_plan = app.plans.first();
-    let plan_state = if app.analyzer_running {
-        "ANALYZING / READ-ONLY".to_string()
-    } else if let Some(plan) = latest_plan {
-        format!(
-            "PLAN {} · {} CONFIDENCE",
-            format::truncate(&plan.plan_id, 8),
-            plan.confidence.to_ascii_uppercase()
-        )
-    } else {
-        "READY / NO PLAN".into()
-    };
-    let sections =
-        Layout::horizontal([Constraint::Percentage(57), Constraint::Percentage(43)]).split(area);
-    frame.render_widget(
-        Paragraph::new(vec![
-            Line::from(vec![
-                Span::styled("● EVENT INGEST  ", Style::default().fg(ingest_color).bold()),
-                Span::styled(last_poll, Style::default().fg(palette().text)),
-            ]),
-            Line::styled(
-                format!(
-                    "{} STORED  ·  {} DUP  ·  {} MALFORMED  ·  {} VISIBLE",
-                    status.events_stored,
-                    status.duplicate_events,
-                    status.malformed_events,
-                    app.diagnostics.logs.len()
-                ),
-                Style::default().fg(palette().muted),
-            ),
-        ])
-        .style(Style::default().bg(palette().surface))
-        .block(accent_panel(" ⌁ WINDOWS DIAGNOSTIC SIGNAL ", ingest_color)),
-        sections[0],
-    );
-    frame.render_widget(
-        Paragraph::new(vec![
-            Line::styled(
-                plan_state,
-                Style::default()
-                    .fg(if app.analyzer_running {
-                        palette().warn
-                    } else {
-                        palette().alt
-                    })
-                    .bold(),
-            ),
-            Line::styled(
-                format!(
-                    "a synthesize  ·  [ ] evidence window: {}h  ·  r reload",
-                    app.analyzer_window_hours
-                ),
-                Style::default().fg(palette().muted),
-            ),
-        ])
-        .style(Style::default().bg(palette().surface))
-        .block(accent_panel(" ◇ SYSTEMS ANALYZER ", palette().alt)),
-        sections[1],
-    );
-}
-
 fn render_diagnostic_feed(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let lines = app
         .diagnostics
@@ -5701,200 +5593,6 @@ fn render_diagnostic_feed(frame: &mut Frame<'_>, app: &App, area: Rect) {
         .wrap(Wrap { trim: true })
         .style(Style::default().fg(palette().text).bg(palette().surface))
         .block(accent_panel(" ⌁ RAW SIGNAL FEED ", palette().info)),
-        area,
-    );
-}
-
-fn render_plan_index(frame: &mut Frame<'_>, app: &mut App, plan: &OptimizationPlan, area: Rect) {
-    let sections =
-        Layout::vertical([Constraint::Percentage(44), Constraint::Percentage(56)]).split(area);
-    let mut diagnosis_lines = vec![
-        Line::styled(
-            plan.summary.clone(),
-            Style::default().fg(palette().text).bold(),
-        ),
-        Line::raw(""),
-    ];
-    for diagnosis in &plan.diagnoses {
-        diagnosis_lines.push(Line::from(vec![
-            Span::styled(
-                format!(" {} ", severity_label(diagnosis.severity)),
-                severity_badge(diagnosis.severity),
-            ),
-            Span::raw(" "),
-            Span::styled(diagnosis.title.clone(), Style::default().fg(palette().text)),
-        ]));
-    }
-    if plan.diagnoses.is_empty() {
-        diagnosis_lines.push(Line::styled(
-            "No defensible sustained diagnosis.",
-            Style::default().fg(palette().muted),
-        ));
-    }
-    frame.render_widget(
-        Paragraph::new(diagnosis_lines)
-            .wrap(Wrap { trim: false })
-            .style(Style::default().fg(palette().text).bg(palette().surface))
-            .block(accent_panel(" ◈ SYNTHESIS ", palette().alt)),
-        sections[0],
-    );
-    let actions = plan
-        .actions
-        .iter()
-        .map(|action| {
-            ListItem::new(vec![
-                Line::from(vec![
-                    Span::styled(
-                        format!(" {:02} ", action.priority),
-                        Style::default()
-                            .fg(palette().bg)
-                            .bg(risk_color(action.risk))
-                            .bold(),
-                    ),
-                    Span::raw(" "),
-                    Span::styled(
-                        action.title.clone(),
-                        Style::default().fg(palette().text).bold(),
-                    ),
-                ]),
-                Line::from(vec![
-                    Span::styled(
-                        format!("  {:?}", action.category).to_ascii_uppercase(),
-                        Style::default().fg(palette().alt),
-                    ),
-                    Span::styled(
-                        format!(" · {:?} RISK", action.risk).to_ascii_uppercase(),
-                        Style::default().fg(risk_color(action.risk)),
-                    ),
-                    Span::styled(
-                        if action.requires_confirmation {
-                            " · CONFIRM"
-                        } else {
-                            " · READ-ONLY"
-                        },
-                        Style::default().fg(palette().muted),
-                    ),
-                ]),
-            ])
-        })
-        .collect::<Vec<_>>();
-    frame.render_stateful_widget(
-        List::new(actions)
-            .highlight_style(row_highlight_style())
-            .highlight_symbol("▌ ")
-            .block(accent_panel(" ⟐ ORDERED ACTION QUEUE ", palette().ok)),
-        sections[1],
-        &mut app.plan_action_state,
-    );
-}
-
-fn render_plan_action(
-    frame: &mut Frame<'_>,
-    plan: &OptimizationPlan,
-    action: Option<&PlanAction>,
-    area: Rect,
-) {
-    let Some(action) = action else {
-        frame.render_widget(
-            Paragraph::new("The analyzer found no evidence-backed action to recommend.")
-                .style(Style::default().fg(palette().muted).bg(palette().surface))
-                .block(accent_panel(" ⟐ INTEGRATION DETAIL ", palette().ok)),
-            area,
-        );
-        return;
-    };
-    let mut lines = vec![
-        Line::from(vec![
-            Span::styled(
-                format!(" PRIORITY {} ", action.priority),
-                Style::default()
-                    .fg(palette().bg)
-                    .bg(risk_color(action.risk))
-                    .bold(),
-            ),
-            Span::styled(
-                format!("  {:?} RISK", action.risk).to_ascii_uppercase(),
-                Style::default().fg(risk_color(action.risk)).bold(),
-            ),
-        ]),
-        Line::styled(
-            action.title.clone(),
-            Style::default().fg(palette().text).bold(),
-        ),
-        detail_line("Target", action.target.clone()),
-        Line::raw(""),
-        Line::styled("WHY", Style::default().fg(palette().alt).bold()),
-        Line::raw(action.reason.clone()),
-        Line::raw(""),
-        Line::styled("STEPS", Style::default().fg(palette().info).bold()),
-    ];
-    for (index, step) in action.steps.iter().enumerate() {
-        lines.push(Line::from(vec![
-            Span::styled(
-                format!(" {}. {:?} ", index + 1, step.kind).to_ascii_uppercase(),
-                Style::default()
-                    .fg(palette().bg)
-                    .bg(if step.mutates_system {
-                        palette().warn
-                    } else {
-                        palette().info
-                    })
-                    .bold(),
-            ),
-            Span::raw(" "),
-            Span::styled(
-                step.description.clone(),
-                Style::default().fg(palette().text),
-            ),
-        ]));
-        if let Some(command) = &step.command {
-            lines.push(Line::styled(
-                format!("    PS> {command}"),
-                Style::default().fg(palette().ok),
-            ));
-        }
-        if let Some(prompt) = &step.confirmation_prompt {
-            lines.push(Line::styled(
-                format!("    CONFIRM: {prompt}"),
-                Style::default().fg(palette().warn),
-            ));
-        }
-    }
-    lines.push(Line::raw(""));
-    lines.push(Line::styled(
-        "VALIDATE",
-        Style::default().fg(palette().ok).bold(),
-    ));
-    for item in &action.validation {
-        lines.push(Line::raw(format!("  ✓ {item}")));
-    }
-    if !action.rollback.is_empty() {
-        lines.push(Line::raw(""));
-        lines.push(Line::styled(
-            "ROLLBACK",
-            Style::default().fg(palette().warn).bold(),
-        ));
-        for item in &action.rollback {
-            lines.push(Line::raw(format!("  ↶ {item}")));
-        }
-    }
-    lines.push(Line::raw(""));
-    lines.push(Line::styled(
-        format!("EVIDENCE  {}", action.evidence_refs.join(" · ")),
-        Style::default().fg(palette().faint),
-    ));
-    lines.push(Line::styled(
-        format!("PLAN  {} / {}", plan.plan_id, plan.context_id),
-        Style::default().fg(palette().faint),
-    ));
-    frame.render_widget(
-        Paragraph::new(lines)
-            .wrap(Wrap { trim: false })
-            .style(Style::default().fg(palette().text).bg(palette().surface))
-            .block(accent_panel(
-                " ⟐ INTEGRATION DETAIL · DISPLAY ONLY ",
-                palette().ok,
-            )),
         area,
     );
 }
@@ -6929,7 +6627,10 @@ const HELP_GLOBAL: [(&str, &str); 13] = [
     ("mouse wheel", "scroll the active view"),
     ("m", "toggle motion effects"),
     ("t", "cycle presentation profile"),
-    ("u", "download and install a newer release when the header shows one"),
+    (
+        "u",
+        "download and install a newer release when the header shows one",
+    ),
     (
         "f",
         "rate how the machine feels (g good / a acceptable / s sluggish) — tunes what is worth interrupting you for, under the current load only",
@@ -7132,7 +6833,11 @@ fn render_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
                 }),
             ),
         ])
-    } else if app.snapshot.as_ref().is_some_and(|snapshot| snapshot.learning) {
+    } else if app
+        .snapshot
+        .as_ref()
+        .is_some_and(|snapshot| snapshot.learning)
+    {
         let percent = app
             .snapshot
             .as_ref()
@@ -9111,7 +8816,10 @@ mod tests {
         // the steady remainder of the tracked set.
         assert!(text.contains("WATCHLIST"));
         assert!(text.contains("· steady"));
-        assert!(text.contains("Discord.exe"), "steady process on the watchlist");
+        assert!(
+            text.contains("Discord.exe"),
+            "steady process on the watchlist"
+        );
         // NOTICES compress to one printed line per finding, tags intact.
         assert!(text.contains("NOTICES"));
         assert!(text.contains("[CRITICAL]"));
@@ -9175,7 +8883,11 @@ mod tests {
         assert!(band[1].starts_with(|glyph: char| glyph != '\u{2800}' && glyph != ' '));
         assert!(band[0].ends_with(|glyph: char| glyph != '\u{2800}' && glyph != ' '));
         assert_eq!(band[0].chars().next(), Some('\u{2800}'), "top-left empty");
-        assert_eq!(band[1].chars().last(), Some('\u{2800}'), "bottom-right empty");
+        assert_eq!(
+            band[1].chars().last(),
+            Some('\u{2800}'),
+            "bottom-right empty"
+        );
         // Exactly one dotted line: each dot column carries a single dot.
         let dots = band
             .iter()
@@ -9186,7 +8898,11 @@ mod tests {
         // A flat series prints a mid-height dotted rule, not a floor hug.
         let flat = braille_spark(&[5.0; 20], 6, 1);
         assert_eq!(flat.len(), 1);
-        assert!(flat[0].chars().all(|glyph| glyph == '\u{2812}'), "{}", flat[0]);
+        assert!(
+            flat[0].chars().all(|glyph| glyph == '\u{2812}'),
+            "{}",
+            flat[0]
+        );
         // Empty input renders blank rows rather than panicking.
         assert_eq!(braille_spark(&[], 4, 2), vec!["    ", "    "]);
     }
@@ -10087,15 +9803,24 @@ mod tests {
 
         let text = buffer_text(render(&mut app).buffer());
         assert!(text.contains("Sustained pressure"));
-        assert!(!text.contains("Filed-away growth"), "default view hides archived");
+        assert!(
+            !text.contains("Filed-away growth"),
+            "default view hides archived"
+        );
         assert!(text.contains("z archive"), "panel title advertises z");
         assert!(text.contains("v view"), "footer advertises the view cycle");
 
         app.cycle_alert_view();
         let text = buffer_text(render(&mut app).buffer());
         assert!(text.contains("Filed-away growth"));
-        assert!(!text.contains("Sustained pressure"), "archive view shows only archived");
-        assert!(text.contains("· archived"), "panel title carries the filter lamp");
+        assert!(
+            !text.contains("Sustained pressure"),
+            "archive view shows only archived"
+        );
+        assert!(
+            text.contains("· archived"),
+            "panel title carries the filter lamp"
+        );
         assert!(text.contains("z recover"));
         // The evidence pane states the orthogonal lifecycle · archive state.
         assert!(text.contains("active · archived"));
@@ -10189,6 +9914,7 @@ mod tests {
             demand: None,
             heavy_minutes_trailing_hour: None,
             launch_capture: Default::default(),
+            network_health: Default::default(),
         });
         app
     }
@@ -10569,7 +10295,7 @@ mod tests {
             _ => current,
         };
         let start_ws = |name: &str, current: u64| match name {
-            "node.exe" => 300 * 1024 * 1024,   // riser: +400 MB
+            "node.exe" => 300 * 1024 * 1024,    // riser: +400 MB
             "Spotify.exe" => 800 * 1024 * 1024, // easer: -320 MB
             _ => current,
         };
@@ -10603,9 +10329,12 @@ mod tests {
             point.disk_latency_ms = 0.6 + 1.4 * (phase * 0.8).cos().abs();
             // The ledger MARKET strip charts every resource: give the I/O,
             // network, and interrupt channels believable drift too.
-            point.disk_read_bytes_per_sec = (7.0 + 6.0 * (phase * 0.7).sin().abs()) * 1024.0 * 1024.0;
-            point.disk_write_bytes_per_sec = (2.0 + 2.0 * (phase * 1.3).sin().abs()) * 1024.0 * 1024.0;
-            point.network_bytes_per_sec = (1.2 + 1.6 * (phase * 0.45).sin().abs()) * 1024.0 * 1024.0;
+            point.disk_read_bytes_per_sec =
+                (7.0 + 6.0 * (phase * 0.7).sin().abs()) * 1024.0 * 1024.0;
+            point.disk_write_bytes_per_sec =
+                (2.0 + 2.0 * (phase * 1.3).sin().abs()) * 1024.0 * 1024.0;
+            point.network_bytes_per_sec =
+                (1.2 + 1.6 * (phase * 0.45).sin().abs()) * 1024.0 * 1024.0;
             point.interrupt_rate = 15_000.0 + 4_000.0 * (phase * 0.6).sin().abs();
             point.dpc_rate = 40.0 + 30.0 * (phase * 0.9).cos().abs();
             app.live_history.push_back(point.clone());

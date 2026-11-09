@@ -1,19 +1,23 @@
 use crate::{client::PipeClient, format};
 use anyhow::{Context, Result, bail};
-use pcpulse_service::models::{Alert, Severity};
+use crossbeam_channel::{Receiver, RecvTimeoutError, bounded};
+use pcpulse_service::{
+    config::Settings,
+    models::{Alert, NotificationState, Severity, Snapshot},
+};
 use std::{
     collections::HashSet,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::atomic::{AtomicBool, Ordering},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use windows::{
     Win32::{
-        Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM},
-        System::LibraryLoader::GetModuleHandleW,
+        Foundation::{
+            CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE, HINSTANCE, HWND, LPARAM,
+            LRESULT, WPARAM,
+        },
+        System::{LibraryLoader::GetModuleHandleW, Threading::CreateMutexW},
         UI::{
             Shell::{
                 NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_ERROR, NIIF_INFO, NIIF_WARNING,
@@ -24,7 +28,7 @@ use windows::{
                 GetMessageW, GetSystemMetrics, HICON, HWND_MESSAGE, IDI_INFORMATION, IMAGE_ICON,
                 LR_DEFAULTCOLOR, LoadIconW, LoadImageW, MSG, PostQuitMessage, RegisterClassW,
                 SM_CXSMICON, SM_CYSMICON, TranslateMessage, WINDOW_EX_STYLE, WM_APP, WM_CLOSE,
-                WM_DESTROY, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_RBUTTONUP, WNDCLASSW, WS_OVERLAPPED,
+                WM_DESTROY, WM_LBUTTONDBLCLK, WM_RBUTTONUP, WNDCLASSW, WS_OVERLAPPED,
             },
         },
     },
@@ -38,8 +42,32 @@ const ICON_ID: u32 = 1;
 const TRAY_ICON_RESOURCE_ID: usize = 1;
 const CALLBACK_MESSAGE: u32 = WM_APP + 42;
 static EXITING: AtomicBool = AtomicBool::new(false);
+const POLL_INTERVAL: Duration = Duration::from_secs(5);
+
+struct TrayInstance(HANDLE);
+
+impl Drop for TrayInstance {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = CloseHandle(self.0);
+        }
+    }
+}
+
+fn claim_instance(name: PCWSTR) -> Result<Option<TrayInstance>> {
+    let handle =
+        unsafe { CreateMutexW(None, false, name) }.context("create tray instance mutex")?;
+    let already_running = unsafe { GetLastError() } == ERROR_ALREADY_EXISTS;
+    let instance = TrayInstance(handle);
+    Ok((!already_running).then_some(instance))
+}
 
 pub fn run() -> Result<()> {
+    // Keep one helper per Windows session, including simultaneous startup
+    // and TUI self-heal. The OS releases the marker even after a crash.
+    let Some(_instance) = claim_instance(w!("Local\\PcPulse.Notifications"))? else {
+        return Ok(());
+    };
     EXITING.store(false, Ordering::Release);
     let module = unsafe { GetModuleHandleW(None) }.context("GetModuleHandleW failed")?;
     let instance = HINSTANCE(module.0);
@@ -76,12 +104,11 @@ pub fn run() -> Result<()> {
     .context("CreateWindowExW failed")?;
     add_icon(window)?;
 
-    let stopping = Arc::new(AtomicBool::new(false));
-    let worker_stop = Arc::clone(&stopping);
+    let (stop_tx, stop_rx) = bounded(1);
     let window_address = window.0 as usize;
     let worker = thread::Builder::new()
         .name("pcpulse-notifications".into())
-        .spawn(move || poll_alerts(HWND(window_address as *mut std::ffi::c_void), worker_stop))?;
+        .spawn(move || poll_alerts(HWND(window_address as *mut std::ffi::c_void), stop_rx))?;
 
     let mut message = MSG::default();
     while unsafe { GetMessageW(&mut message, None, 0, 0) }.as_bool() {
@@ -90,7 +117,7 @@ pub fn run() -> Result<()> {
             DispatchMessageW(&message);
         }
     }
-    stopping.store(true, Ordering::Release);
+    let _ = stop_tx.send(());
     let _ = worker.join();
     delete_icon(window);
     Ok(())
@@ -104,7 +131,9 @@ unsafe extern "system" fn window_proc(
 ) -> LRESULT {
     match message {
         CALLBACK_MESSAGE => match lparam.0 as u32 {
-            WM_LBUTTONUP | WM_LBUTTONDBLCLK => {
+            // A double-click also emits two button-up messages. Launching
+            // on both used to open three complete TUI clients for one gesture.
+            WM_LBUTTONDBLCLK => {
                 open_tui();
                 LRESULT(0)
             }
@@ -178,24 +207,16 @@ fn base_icon_data(window: HWND) -> NOTIFYICONDATAW {
     }
 }
 
-fn poll_alerts(window: HWND, stopping: Arc<AtomicBool>) {
+fn poll_alerts(window: HWND, stopping: Receiver<()>) {
     let client = PipeClient;
+    let mut poller = NotificationPoller::new();
     let mut seen = HashSet::new();
     let mut initialized = false;
     let mut failures = 0_u32;
-    let mut notifications_enabled = true;
-    let mut settings_counter = 0_u32;
-    while !stopping.load(Ordering::Acquire) && !EXITING.load(Ordering::Acquire) {
-        if settings_counter == 0 {
-            if let Ok(settings) = client.settings() {
-                notifications_enabled = settings.notifications_enabled;
-            }
-            settings_counter = 15;
-        }
-        settings_counter = settings_counter.saturating_sub(1);
-        match client.snapshot() {
-            Ok(snapshot) => {
-                if failures >= 3 && notifications_enabled {
+    while !EXITING.load(Ordering::Acquire) {
+        match poller.poll(&client, Instant::now()) {
+            Ok(state) => {
+                if failures >= 3 && state.notifications_enabled {
                     show_balloon(
                         window,
                         "PC Pulse collector reconnected",
@@ -204,9 +225,8 @@ fn poll_alerts(window: HWND, stopping: Arc<AtomicBool>) {
                     );
                 }
                 failures = 0;
-                let pending =
-                    pending_notifications(&snapshot.active_alerts, &mut seen, initialized);
-                if notifications_enabled {
+                let pending = pending_notifications(&state.active_alerts, &mut seen, initialized);
+                if state.notifications_enabled {
                     for alert in pending {
                         notify_alert(window, alert);
                     }
@@ -215,7 +235,7 @@ fn poll_alerts(window: HWND, stopping: Arc<AtomicBool>) {
             }
             Err(_) => {
                 failures = failures.saturating_add(1);
-                if failures == 3 && notifications_enabled {
+                if failures == 3 && poller.notifications_enabled {
                     show_balloon(
                         window,
                         "PC Pulse collector is offline",
@@ -225,12 +245,76 @@ fn poll_alerts(window: HWND, stopping: Arc<AtomicBool>) {
                 }
             }
         }
-        for _ in 0..20 {
-            if stopping.load(Ordering::Acquire) || EXITING.load(Ordering::Acquire) {
-                return;
-            }
-            thread::sleep(Duration::from_millis(100));
+        // One interruptible wait, instead of waking ten times per second.
+        match stopping.recv_timeout(POLL_INTERVAL) {
+            Err(RecvTimeoutError::Timeout) => {}
+            Ok(()) | Err(RecvTimeoutError::Disconnected) => return,
         }
+    }
+}
+
+trait NotificationSource {
+    fn notification_state(&self) -> Result<NotificationState>;
+    fn snapshot(&self) -> Result<Snapshot>;
+    fn settings(&self) -> Result<Settings>;
+}
+
+impl NotificationSource for PipeClient {
+    fn notification_state(&self) -> Result<NotificationState> {
+        PipeClient::notification_state(self)
+    }
+    fn snapshot(&self) -> Result<Snapshot> {
+        PipeClient::snapshot(self)
+    }
+    fn settings(&self) -> Result<Settings> {
+        PipeClient::settings(self)
+    }
+}
+
+struct NotificationPoller {
+    legacy: bool,
+    notifications_enabled: bool,
+    next_settings: Option<Instant>,
+}
+
+impl NotificationPoller {
+    fn new() -> Self {
+        Self {
+            legacy: false,
+            notifications_enabled: true,
+            next_settings: None,
+        }
+    }
+
+    fn poll(
+        &mut self,
+        client: &impl NotificationSource,
+        now: Instant,
+    ) -> Result<NotificationState> {
+        if !self.legacy {
+            match client.notification_state() {
+                Ok(state) => {
+                    self.notifications_enabled = state.notifications_enabled;
+                    return Ok(state);
+                }
+                Err(error) if format!("{error:#}").contains("(invalidRequest)") => {
+                    self.legacy = true
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        // Compatibility is negotiated once. A transient failure must never
+        // cause a full process-table request on a modern collector.
+        if self.next_settings.is_none_or(|deadline| now >= deadline) {
+            if let Ok(settings) = client.settings() {
+                self.notifications_enabled = settings.notifications_enabled;
+            }
+            self.next_settings = Some(now + Duration::from_secs(30));
+        }
+        Ok(NotificationState {
+            active_alerts: client.snapshot()?.active_alerts,
+            notifications_enabled: self.notifications_enabled,
+        })
     }
 }
 
@@ -299,8 +383,9 @@ fn pending_notifications<'a>(
         // reopens pops a second balloon. It takes 512+ distinct notified
         // incidents in one tray session to reach, and a duplicate balloon is
         // a better failure than unbounded memory.
-        let live: HashSet<&str> = active.iter().map(|alert| alert.id.as_str()).collect();
-        seen.retain(|(id, _)| live.contains(id.as_str()));
+        let live: HashSet<NotificationKey> = active.iter().map(notification_key).collect();
+        // Old generations of a still-active incident also have to expire.
+        seen.retain(|key| live.contains(key));
     }
     pending
 }
@@ -392,6 +477,103 @@ fn wide(value: &str) -> Vec<u16> {
 mod tests {
     use super::*;
     use pcpulse_service::models::{AlertQuality, IncidentState};
+    use std::cell::Cell;
+
+    #[derive(Default)]
+    struct PollSource {
+        compact_calls: Cell<u32>,
+        snapshot_calls: Cell<u32>,
+        settings_calls: Cell<u32>,
+        compact_error: Option<&'static str>,
+    }
+
+    impl NotificationSource for PollSource {
+        fn notification_state(&self) -> Result<NotificationState> {
+            self.compact_calls.set(self.compact_calls.get() + 1);
+            if let Some(message) = self.compact_error {
+                bail!(message);
+            }
+            Ok(NotificationState {
+                active_alerts: Vec::new(),
+                notifications_enabled: false,
+            })
+        }
+        fn snapshot(&self) -> Result<Snapshot> {
+            self.snapshot_calls.set(self.snapshot_calls.get() + 1);
+            Ok(Snapshot::default())
+        }
+        fn settings(&self) -> Result<Settings> {
+            self.settings_calls.set(self.settings_calls.get() + 1);
+            Ok(Settings {
+                notifications_enabled: false,
+                ..Settings::default()
+            })
+        }
+    }
+
+    #[test]
+    fn modern_tray_polls_never_request_process_tables_or_separate_settings() {
+        let source = PollSource::default();
+        let mut poller = NotificationPoller::new();
+        for _ in 0..10 {
+            assert!(
+                !poller
+                    .poll(&source, Instant::now())
+                    .unwrap()
+                    .notifications_enabled
+            );
+        }
+        assert_eq!(source.compact_calls.get(), 10);
+        assert_eq!(source.snapshot_calls.get(), 0);
+        assert_eq!(source.settings_calls.get(), 0);
+    }
+
+    #[test]
+    fn old_collectors_negotiate_fallback_once_and_cache_settings() {
+        let source = PollSource {
+            compact_error: Some("unknown command (invalidRequest)"),
+            ..PollSource::default()
+        };
+        let mut poller = NotificationPoller::new();
+        let start = Instant::now();
+        for second in [0, 5, 30] {
+            assert!(
+                !poller
+                    .poll(&source, start + Duration::from_secs(second))
+                    .unwrap()
+                    .notifications_enabled
+            );
+        }
+        assert_eq!(source.compact_calls.get(), 1);
+        assert_eq!(source.snapshot_calls.get(), 3);
+        assert_eq!(source.settings_calls.get(), 2);
+    }
+
+    #[test]
+    fn transient_tray_errors_do_not_fall_back_to_expensive_snapshots() {
+        let source = PollSource {
+            compact_error: Some("pipe unavailable"),
+            ..PollSource::default()
+        };
+        let mut poller = NotificationPoller::new();
+        assert!(poller.poll(&source, Instant::now()).is_err());
+        assert!(poller.poll(&source, Instant::now()).is_err());
+        assert_eq!(source.compact_calls.get(), 2);
+        assert_eq!(source.snapshot_calls.get(), 0);
+        assert_eq!(source.settings_calls.get(), 0);
+    }
+
+    #[test]
+    fn tray_instance_marker_rejects_duplicates_and_releases_on_exit() {
+        let name = wide(&format!(
+            "Local\\PcPulse.Test.Notifications.{}",
+            std::process::id()
+        ));
+        let first = claim_instance(PCWSTR(name.as_ptr())).unwrap().unwrap();
+        assert!(claim_instance(PCWSTR(name.as_ptr())).unwrap().is_none());
+        drop(first);
+        assert!(claim_instance(PCWSTR(name.as_ptr())).unwrap().is_some());
+    }
 
     fn alert(id: &str) -> Alert {
         Alert {
@@ -505,6 +687,18 @@ mod tests {
                 1
             );
             assert!(seen.len() <= SEEN_CAP + 1, "memory must stay bounded");
+        }
+    }
+
+    #[test]
+    fn repeated_generations_of_one_live_incident_do_not_grow_memory_forever() {
+        let mut seen = HashSet::new();
+        let mut active = vec![alert("recurring")];
+        for generation in 0..(SEEN_CAP as u32 * 3) {
+            active[0].notify_generation = generation;
+            assert_eq!(pending_notifications(&active, &mut seen, true).len(), 1);
+            assert!(seen.len() <= SEEN_CAP);
+            assert!(pending_notifications(&active, &mut seen, true).is_empty());
         }
     }
 
