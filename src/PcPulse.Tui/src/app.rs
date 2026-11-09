@@ -5896,8 +5896,8 @@ mod tests {
     /// deletes itself when the test ends. Under `cfg(test)` the cache root
     /// is a `%TEMP%` directory rather than `%LOCALAPPDATA%\PcPulse\
     /// backgrounds` (see `clipconvert::backgrounds_dir`), so a test run
-    /// never touches the real profile — and with this guard it leaves
-    /// nothing behind in `%TEMP%` either.
+    /// never touches the real profile. This guard removes its own files;
+    /// the shared cache directory must outlive overlapping fixture writers.
     struct Scratch {
         source: std::path::PathBuf,
         cache: Option<std::path::PathBuf>,
@@ -5916,11 +5916,9 @@ mod tests {
             let _ = std::fs::remove_file(&self.source);
             if let Some(cache) = &self.cache {
                 let _ = std::fs::remove_file(cache);
-                // Best effort, and only ever succeeds for the last test out:
-                // an empty scratch cache root is worth removing too.
-                if let Some(parent) = cache.parent() {
-                    let _ = std::fs::remove_dir(parent);
-                }
+                // An empty directory does not mean no other test is using it:
+                // another writer may have selected its path but not opened
+                // the temporary file yet. A fixture does not own this root.
             }
         }
     }
@@ -5954,6 +5952,31 @@ mod tests {
         writer.finish().unwrap();
         scratch.cache = Some(cache);
         scratch
+    }
+
+    #[test]
+    fn background_fixture_cleanup_preserves_a_pending_cache_writer() {
+        // Reproduce the parallel-test interleaving without relying on timing:
+        // another writer has selected a path in the cache, but has not opened
+        // its temporary file when the last completed fixture is dropped.
+        let mut finished = scratch_source("cache-cleanup-race");
+        let cache_root = finished.source.with_extension("backgrounds");
+        std::fs::create_dir(&cache_root).unwrap();
+        let completed_cache = cache_root.join("completed.pulseclip");
+        std::fs::write(&completed_cache, b"fixture owned by the completed test").unwrap();
+        finished.cache = Some(completed_cache);
+        let pending_cache = cache_root.join("pending.pulseclip");
+
+        drop(finished);
+
+        let mut writer = crate::pulseclip::ClipWriter::create(&pending_cache, 4, 2, 30.0)
+            .expect("dropping one fixture must not remove another writer's cache directory");
+        writer.push_frame(&[0; 4 * 2 * 3]).unwrap();
+        writer.finish().unwrap();
+        // This directory belongs only to this test, so it can be removed once
+        // its one writer has finished. Other background fixtures share a root.
+        std::fs::remove_file(pending_cache).unwrap();
+        std::fs::remove_dir(cache_root).unwrap();
     }
 
     /// Pump `drain_events` until the conversion worker's message lands.
